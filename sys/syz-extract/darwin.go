@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -22,12 +23,29 @@ func (*darwin) prepareArch(arch *Arch) error {
 }
 
 func (*darwin) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error) {
+	clangArch := arch.target.KernelArch
+	if clangArch == "amd64" {
+		clangArch = "x86_64"
+	}
+	sdkPath, err := exec.Command("xcrun", "--show-sdk-path").Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("xcrun --show-sdk-path failed: %v", err)
+	}
+	resourceDir, err := exec.Command("clang", "-print-resource-dir").Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("clang -print-resource-dir failed: %v", err)
+	}
 	args := []string{
+		"-arch", clangArch,
 		"-nostdinc",
+		"-isystem", filepath.Join(strings.TrimSpace(string(resourceDir)), "include"),
+		"-isystem", filepath.Join(strings.TrimSpace(string(sdkPath)), "usr", "include"),
 		"-DPRIVATE",
 		"-DPF",
 		"-I", filepath.Join(arch.sourceDir, "bsd"),
 		"-I", filepath.Join(arch.sourceDir, "bsd", "sys"),
+		"-I", filepath.Join(arch.sourceDir, "bsd", "net"),
+		"-I", filepath.Join(arch.sourceDir, "libkern"),
 		"-I", filepath.Join(arch.sourceDir, "osfmk"),
 	}
 	for _, incdir := range info.Incdirs {
