@@ -178,6 +178,7 @@ func New(cfg *RemoteConfig) (Server, error) {
 			MemoryDump: cfg.MemoryDump,
 			Sandbox:    sandbox,
 			SandboxArg: cfg.SandboxArg,
+			KcovDevice: cfg.KextCoverage.KcovDevice,
 		},
 		Stats:  cfg.Stats,
 		VMArch: cfg.TargetVMArch,

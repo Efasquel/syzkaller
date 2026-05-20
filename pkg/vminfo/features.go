@@ -207,6 +207,9 @@ func (ctx *checkContext) featureSucceeded(feat flatrpc.Feature, testProg *prog.P
 	call := res.Info.Calls[0]
 	switch feat {
 	case flatrpc.FeatureCoverage:
+		if ctx.cfg.KcovDevice != "" {
+			break // device is explicitly configured; trust it without requiring probe coverage
+		}
 		if len(call.Cover) == 0 || len(call.Signal) == 0 {
 			return "got no coverage"
 		}

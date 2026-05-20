@@ -128,12 +128,4 @@ static void cover_collect(cover_t* cov)
 	cov->size = num;
 	cov->data_offset = sizeof(uint64);
 	cov->pc_offset = 0;
-
-	// If no coverage was collected, inject a fake PC so syzkaller's
-	// feature probing doesn't conclude that coverage is broken.
-	if (cov->size == 0) {
-		uint64* pcs = (uint64*)(cov->data + sizeof(uint64));
-		pcs[0] = 0xffffffff00000001;
-		cov->size = 1;
-	}
 }

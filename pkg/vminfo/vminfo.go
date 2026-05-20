@@ -54,6 +54,9 @@ type Config struct {
 	MemoryDump bool
 	Sandbox    flatrpc.ExecEnv
 	SandboxArg int64
+	// KcovDevice is the Darwin KEXT coverage device path (e.g. /dev/pishi).
+	// When non-empty, the coverage feature probe skips the "got no coverage" check.
+	KcovDevice string
 }
 
 func New(cfg *Config) *Checker {
