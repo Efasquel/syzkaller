@@ -71,7 +71,7 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
 const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
 const int kCoverFd = kOutPipeFd - kMaxThreads;
 const int kExtraCoverFd = kCoverFd - 1;
-const int kMaxArgs = 9;
+const int kMaxArgs = 10;
 const int kCoverSize = 512 << 10;
 const int kFailStatus = 67;
 
@@ -338,6 +338,7 @@ static const uint64 arg_csum_chunk_data = 0;
 static const uint64 arg_csum_chunk_const = 1;
 
 typedef intptr_t(SYSCALLAPI* syscall_t)(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
+typedef intptr_t(SYSCALLAPI* iokitcall_t)(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
 
 struct call_t {
 	const char* name;
@@ -381,7 +382,7 @@ struct cover_t {
 	bool enabled;
 };
 
-struct thread_t {
+struct syz_thread_t {
 	int id;
 	bool created;
 	event_t ready;
@@ -401,10 +402,10 @@ struct thread_t {
 	bool soft_fail_state;
 };
 
-static thread_t threads[kMaxThreads];
-static thread_t* last_scheduled;
+static syz_thread_t threads[kMaxThreads];
+static syz_thread_t* last_scheduled;
 // Threads use this variable to access information about themselves.
-static __thread struct thread_t* current_thread;
+static __thread struct syz_thread_t* current_thread;
 
 static cover_t extra_cov;
 
@@ -427,6 +428,8 @@ struct handshake_req {
 	uint64 syscall_timeout_ms;
 	uint64 program_timeout_ms;
 	uint64 slowdown_scale;
+	uint32 kext_id;
+	char kcov_device[256]; // empty string = no Pishi or KextFuzz, fall back to ksancov
 };
 
 struct execute_req {
@@ -468,14 +471,14 @@ struct feature_t {
 	const char* (*setup)();
 };
 
-static thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint8* pos, call_props_t call_props);
-static void handle_completion(thread_t* th);
-static void copyout_call_results(thread_t* th);
-static void write_call_output(thread_t* th, bool finished);
+static syz_thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint8* pos, call_props_t call_props);
+static void handle_completion(syz_thread_t* th);
+static void copyout_call_results(syz_thread_t* th);
+static void write_call_output(syz_thread_t* th, bool finished);
 static void write_extra_output();
-static void execute_call(thread_t* th);
-static void thread_create(thread_t* th, int id, bool need_coverage);
-static void thread_mmap_cover(thread_t* th);
+static void execute_call(syz_thread_t* th);
+static void thread_create(syz_thread_t* th, int id, bool need_coverage);
+static void thread_mmap_cover(syz_thread_t* th);
 static void* worker_thread(void* arg);
 static uint64 read_input(uint8** input_posp, bool peek = false);
 static uint64 read_arg(uint8** input_posp);
@@ -734,9 +737,14 @@ static void mmap_input()
 {
 	uint32* mmap_at = input_base_address();
 	int flags = MAP_SHARED;
+
+	// If we map at a specific address, ensure it's not overlapping with anything else.
+#if GOOS_darwin // MAP_FIXED_EXCLUSIVE does not exist on darwin + let macOS choose the address
+	mmap_at = 0;
+#else
 	if (mmap_at != 0)
-		// If we map at a specific address, ensure it's not overlapping with anything else.
 		flags = flags | MAP_FIXED_EXCLUSIVE;
+#endif
 	void* result = mmap(mmap_at, kMaxInput, PROT_READ, flags, kInFd, 0);
 	if (result == MAP_FAILED)
 		fail("mmap of input file failed");
@@ -769,6 +777,9 @@ static void mmap_output(uint32 size)
 	if (size % SYZ_PAGE_SIZE != 0)
 		failmsg("trying to mmap output area that is not divisible by page size", "page=%d,area=%d", SYZ_PAGE_SIZE, size);
 	uint32* mmap_at = output_base_address();
+#if GOOS_darwin
+	mmap_at = 0;
+#endif
 	int flags = MAP_SHARED;
 	if (mmap_at == NULL) {
 		// We map at an address chosen by the kernel, so if there was any previous mapping, just unmap it.
@@ -848,6 +859,10 @@ void parse_handshake(const handshake_req& req)
 	flag_wifi = (bool)(req.flags & rpc::ExecEnv::EnableWifi);
 	flag_delay_kcov_mmap = (bool)(req.flags & rpc::ExecEnv::DelayKcovMmap);
 	flag_nic_vf = (bool)(req.flags & rpc::ExecEnv::EnableNicVF);
+#if GOOS_darwin
+	kext_id_g = req.kext_id;
+	strncpy(kcov_device_g, req.kcov_device, sizeof(kcov_device_g) - 1);
+#endif
 }
 
 void receive_execute()
@@ -872,6 +887,10 @@ void parse_execute(const execute_req& req)
 	flag_threaded = req.exec_flags & (uint64)rpc::ExecFlag::Threaded;
 	all_call_signal = req.all_call_signal;
 	all_extra_signal = req.all_extra_signal;
+
+#if GOOS_darwin
+	flag_threaded = false;
+#endif
 
 	debug("[%llums] exec opts: reqid=%llu type=%llu procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
 	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
@@ -1092,8 +1111,8 @@ void execute_one()
 			args[i] = read_arg(&input_pos);
 		for (uint64 i = num_args; i < kMaxArgs; i++)
 			args[i] = 0;
-		thread_t* th = schedule_call(call_index++, call_num, copyout_index,
-					     num_args, args, input_pos, call_props);
+		syz_thread_t* th = schedule_call(call_index++, call_num, copyout_index,
+						 num_args, args, input_pos, call_props);
 
 		if (call_props.async && flag_threaded) {
 			// Don't wait for an async call to finish. We'll wait at the end.
@@ -1137,7 +1156,7 @@ void execute_one()
 		while (running > 0 && current_time_ms() <= wait_end) {
 			sleep_ms(1 * slowdown_scale);
 			for (int i = 0; i < kMaxThreads; i++) {
-				thread_t* th = &threads[i];
+				syz_thread_t* th = &threads[i];
 				if (th->executing && event_isset(&th->done))
 					handle_completion(th);
 			}
@@ -1145,7 +1164,7 @@ void execute_one()
 		// Write output coverage for unfinished calls.
 		if (running > 0) {
 			for (int i = 0; i < kMaxThreads; i++) {
-				thread_t* th = &threads[i];
+				syz_thread_t* th = &threads[i];
 				if (th->executing) {
 					if (cover_collection_required())
 						cover_collect(&th->cov);
@@ -1174,12 +1193,12 @@ void execute_one()
 	}
 }
 
-thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint8* pos, call_props_t call_props)
+syz_thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint8* pos, call_props_t call_props)
 {
 	// Find a spare thread to execute the call.
 	int i = 0;
 	for (; i < kMaxThreads; i++) {
-		thread_t* th = &threads[i];
+		syz_thread_t* th = &threads[i];
 		if (!th->created)
 			thread_create(th, i, cover_collection_required());
 		if (event_isset(&th->done)) {
@@ -1190,7 +1209,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	}
 	if (i == kMaxThreads)
 		exitf("out of threads");
-	thread_t* th = &threads[i];
+	syz_thread_t* th = &threads[i];
 	if (event_isset(&th->ready) || !event_isset(&th->done) || th->executing)
 		exitf("bad thread state in schedule: ready=%d done=%d executing=%d",
 		      event_isset(&th->ready), event_isset(&th->done), th->executing);
@@ -1314,7 +1333,7 @@ bool coverage_filter(uint64 pc)
 	return cover_filter->Contains(pc);
 }
 
-void handle_completion(thread_t* th)
+void handle_completion(syz_thread_t* th)
 {
 	if (event_isset(&th->ready) || !event_isset(&th->done) || !th->executing)
 		exitf("bad thread state in completion: ready=%d done=%d executing=%d",
@@ -1331,7 +1350,7 @@ void handle_completion(thread_t* th)
 		fprintf(stderr, "running=%d completed=%d flag_threaded=%d current=%d\n",
 			running, completed, flag_threaded, th->id);
 		for (int i = 0; i < kMaxThreads; i++) {
-			thread_t* th1 = &threads[i];
+			syz_thread_t* th1 = &threads[i];
 			fprintf(stderr, "th #%2d: created=%d executing=%d"
 					" ready=%d done=%d call_index=%d res=%lld reserrno=%d\n",
 				i, th1->created, th1->executing,
@@ -1342,7 +1361,7 @@ void handle_completion(thread_t* th)
 	}
 }
 
-void copyout_call_results(thread_t* th)
+void copyout_call_results(syz_thread_t* th)
 {
 	if (th->copyout_index != no_copyout) {
 		if (th->copyout_index >= kMaxCommands)
@@ -1424,7 +1443,7 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		      slot + 1, index, error, static_cast<unsigned>(flags), call.data_size - start_size);
 }
 
-void write_call_output(thread_t* th, bool finished)
+void write_call_output(syz_thread_t* th, bool finished)
 {
 	uint32 reserrno = ENOSYS;
 	rpc::CallFlag flags = rpc::CallFlag::Executed;
@@ -1493,7 +1512,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 	return fbb.GetBufferSpan();
 }
 
-void thread_create(thread_t* th, int id, bool need_coverage)
+void thread_create(syz_thread_t* th, int id, bool need_coverage)
 {
 	th->created = true;
 	th->id = id;
@@ -1512,7 +1531,7 @@ void thread_create(thread_t* th, int id, bool need_coverage)
 		thread_start(worker_thread, th);
 }
 
-void thread_mmap_cover(thread_t* th)
+void thread_mmap_cover(syz_thread_t* th)
 {
 	if (th->cov.data != NULL)
 		return;
@@ -1522,7 +1541,7 @@ void thread_mmap_cover(thread_t* th)
 
 void* worker_thread(void* arg)
 {
-	thread_t* th = (thread_t*)arg;
+	syz_thread_t* th = (syz_thread_t*)arg;
 	current_thread = th;
 	for (bool first = true;; first = false) {
 		event_wait(&th->ready);
@@ -1537,7 +1556,7 @@ void* worker_thread(void* arg)
 	return 0;
 }
 
-void execute_call(thread_t* th)
+void execute_call(syz_thread_t* th)
 {
 	const call_t* call = &syscalls[th->call_num];
 	debug("#%d [%llums] -> %s(",

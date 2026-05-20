@@ -64,6 +64,10 @@ table ConnectReplyRaw {
 	features		:Feature;
 	// Fuzzer reads these files inside of the VM and returns contents in InfoRequest.files.
 	files			:[string];
+	// Darwin KEXT coverage: device path (empty = use ksancov fallback).
+	kcov_device		:string;
+	// Darwin KEXT coverage: KEXT bundle ID (default: 1).
+	kext_id			:int32;
 }
 
 table InfoRequestRaw {

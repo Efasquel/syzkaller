@@ -50,6 +50,8 @@ type Config struct {
 	DebugTimeouts bool
 	Procs         int
 	Slowdown      int
+	KcovDevice    string
+	KextID        int
 	pcBase        uint64
 	localModules  []*vminfo.KernelModule
 
@@ -188,6 +190,8 @@ func New(cfg *RemoteConfig) (Server, error) {
 		PrintMachineCheck: true,
 		Procs:             cfg.Procs,
 		Slowdown:          cfg.Timeouts.Slowdown,
+		KcovDevice:        cfg.KextCoverage.KcovDevice,
+		KextID:            cfg.KextCoverage.KextID,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager), nil
@@ -556,8 +560,10 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec: MakeLastExecuting(prog.MaxPids, 6),
 		stats:    serv.runnerStats,
-		procs:    serv.cfg.Procs,
-		updInfo:  updInfo,
+		procs:      serv.cfg.Procs,
+		kcovDevice: serv.cfg.KcovDevice,
+		kextID:     int32(serv.cfg.KextID),
+		updInfo:    updInfo,
 		resultCh: make(chan error, 1),
 	}
 	serv.mu.Lock()

@@ -2,7 +2,14 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 #include <arpa/inet.h>
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#include <machine/endian.h>
+#define le32toh(x) OSSwapLittleToHostInt32(x)
+#define htole32(x) OSSwapHostToLittleInt32(x)
+#else
 #include <endian.h>
+#endif
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>

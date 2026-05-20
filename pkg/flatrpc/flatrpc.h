@@ -1043,6 +1043,8 @@ struct ConnectReplyRawT : public ::flatbuffers::NativeTable {
   std::vector<std::string> race_frames{};
   rpc::Feature features = static_cast<rpc::Feature>(0);
   std::vector<std::string> files{};
+  std::string kcov_device{};
+  int32_t kext_id = 0;
 };
 
 struct ConnectReplyRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
@@ -1060,7 +1062,9 @@ struct ConnectReplyRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_LEAK_FRAMES = 20,
     VT_RACE_FRAMES = 22,
     VT_FEATURES = 24,
-    VT_FILES = 26
+    VT_FILES = 26,
+    VT_KCOV_DEVICE = 28,
+    VT_KEXT_ID = 30
   };
   bool debug() const {
     return GetField<uint8_t>(VT_DEBUG, 0) != 0;
@@ -1098,6 +1102,12 @@ struct ConnectReplyRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *files() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *>(VT_FILES);
   }
+  const ::flatbuffers::String *kcov_device() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_KCOV_DEVICE);
+  }
+  int32_t kext_id() const {
+    return GetField<int32_t>(VT_KEXT_ID, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<uint8_t>(verifier, VT_DEBUG, 1) &&
@@ -1118,6 +1128,9 @@ struct ConnectReplyRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_FILES) &&
            verifier.VerifyVector(files()) &&
            verifier.VerifyVectorOfStrings(files()) &&
+           VerifyOffset(verifier, VT_KCOV_DEVICE) &&
+           verifier.VerifyString(kcov_device()) &&
+           VerifyField<int32_t>(verifier, VT_KEXT_ID, 4) &&
            verifier.EndTable();
   }
   ConnectReplyRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -1165,6 +1178,12 @@ struct ConnectReplyRawBuilder {
   void add_files(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> files) {
     fbb_.AddOffset(ConnectReplyRaw::VT_FILES, files);
   }
+  void add_kcov_device(::flatbuffers::Offset<::flatbuffers::String> kcov_device) {
+    fbb_.AddOffset(ConnectReplyRaw::VT_KCOV_DEVICE, kcov_device);
+  }
+  void add_kext_id(int32_t kext_id) {
+    fbb_.AddElement<int32_t>(ConnectReplyRaw::VT_KEXT_ID, kext_id, 0);
+  }
   explicit ConnectReplyRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -1189,9 +1208,13 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRaw(
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> leak_frames = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> race_frames = 0,
     rpc::Feature features = static_cast<rpc::Feature>(0),
-    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> files = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> files = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> kcov_device = 0,
+    int32_t kext_id = 0) {
   ConnectReplyRawBuilder builder_(_fbb);
   builder_.add_features(features);
+  builder_.add_kext_id(kext_id);
+  builder_.add_kcov_device(kcov_device);
   builder_.add_files(files);
   builder_.add_race_frames(race_frames);
   builder_.add_leak_frames(leak_frames);
@@ -1219,10 +1242,13 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRawDirect(
     const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *leak_frames = nullptr,
     const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *race_frames = nullptr,
     rpc::Feature features = static_cast<rpc::Feature>(0),
-    const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *files = nullptr) {
+    const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *files = nullptr,
+    const char *kcov_device = nullptr,
+    int32_t kext_id = 0) {
   auto leak_frames__ = leak_frames ? _fbb.CreateVector<::flatbuffers::Offset<::flatbuffers::String>>(*leak_frames) : 0;
   auto race_frames__ = race_frames ? _fbb.CreateVector<::flatbuffers::Offset<::flatbuffers::String>>(*race_frames) : 0;
   auto files__ = files ? _fbb.CreateVector<::flatbuffers::Offset<::flatbuffers::String>>(*files) : 0;
+  auto kcov_device__ = kcov_device ? _fbb.CreateString(kcov_device) : 0;
   return rpc::CreateConnectReplyRaw(
       _fbb,
       debug,
@@ -1236,7 +1262,9 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRawDirect(
       leak_frames__,
       race_frames__,
       features,
-      files__);
+      files__,
+      kcov_device__,
+      kext_id);
 }
 
 ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRaw(::flatbuffers::FlatBufferBuilder &_fbb, const ConnectReplyRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -3059,6 +3087,8 @@ inline void ConnectReplyRaw::UnPackTo(ConnectReplyRawT *_o, const ::flatbuffers:
   { auto _e = race_frames(); if (_e) { _o->race_frames.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->race_frames[_i] = _e->Get(_i)->str(); } } else { _o->race_frames.resize(0); } }
   { auto _e = features(); _o->features = _e; }
   { auto _e = files(); if (_e) { _o->files.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->files[_i] = _e->Get(_i)->str(); } } else { _o->files.resize(0); } }
+  { auto _e = kcov_device(); if (_e) _o->kcov_device = _e->str(); }
+  { auto _e = kext_id(); _o->kext_id = _e; }
 }
 
 inline ::flatbuffers::Offset<ConnectReplyRaw> ConnectReplyRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const ConnectReplyRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3081,6 +3111,8 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRaw(::flatbuffer
   auto _race_frames = _o->race_frames.size() ? _fbb.CreateVectorOfStrings(_o->race_frames) : 0;
   auto _features = _o->features;
   auto _files = _o->files.size() ? _fbb.CreateVectorOfStrings(_o->files) : 0;
+  auto _kcov_device = _o->kcov_device.empty() ? 0 : _fbb.CreateString(_o->kcov_device);
+  auto _kext_id = _o->kext_id;
   return rpc::CreateConnectReplyRaw(
       _fbb,
       _debug,
@@ -3094,7 +3126,9 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRaw(::flatbuffer
       _leak_frames,
       _race_frames,
       _features,
-      _files);
+      _files,
+      _kcov_device,
+      _kext_id);
 }
 
 inline InfoRequestRawT::InfoRequestRawT(const InfoRequestRawT &o)

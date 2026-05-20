@@ -93,6 +93,8 @@ public:
 	uint32 slowdown = 0;
 	uint32 syscall_timeout_ms = 0;
 	uint32 program_timeout_ms = 0;
+	std::string kcov_device;
+	uint32 kext_id = 0;
 
 private:
 	friend std::ostream& operator<<(std::ostream& ss, const ProcOpts& opts)
@@ -386,7 +388,9 @@ private:
 		    .syscall_timeout_ms = opts_.syscall_timeout_ms,
 		    .program_timeout_ms = ProgramTimeoutMs(),
 		    .slowdown_scale = opts_.slowdown,
+		    .kext_id = opts_.kext_id,
 		};
+		strncpy(req.kcov_device, opts_.kcov_device.c_str(), sizeof(req.kcov_device) - 1);
 		if (write(req_pipe_, &req, sizeof(req)) != sizeof(req)) {
 			debug("request pipe write failed (errno=%d)\n", errno);
 			Restart();
@@ -721,6 +725,8 @@ private:
 		proc_opts_.slowdown = conn_reply.slowdown;
 		proc_opts_.syscall_timeout_ms = conn_reply.syscall_timeout_ms;
 		proc_opts_.program_timeout_ms = conn_reply.program_timeout_ms;
+		proc_opts_.kcov_device = conn_reply.kcov_device;
+		proc_opts_.kext_id = static_cast<uint32>(conn_reply.kext_id);
 		if (conn_reply.cover)
 			max_signal_.emplace();
 

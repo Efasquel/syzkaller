@@ -480,6 +480,10 @@ static uint16 csum_inet_digest(struct csum_inet* csum)
 }
 #endif
 
+#if GOOS_darwin
+#include "common_darwin.h"
+#endif
+
 #if GOOS_freebsd || GOOS_darwin || GOOS_netbsd
 #include "common_bsd.h"
 #elif GOOS_openbsd

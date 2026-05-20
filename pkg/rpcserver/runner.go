@@ -28,6 +28,8 @@ type Runner struct {
 	id            int
 	source        *queue.Distributor
 	procs         int
+	kcovDevice    string
+	kextID        int32
 	cover         bool
 	coverEdges    bool
 	filterSignal  bool
@@ -102,8 +104,10 @@ func (runner *Runner) Handshake(conn *flatrpc.Conn, cfg *handshakeConfig) (hands
 		ProgramTimeoutMs: int32(cfg.Timeouts.Program / time.Millisecond),
 		LeakFrames:       cfg.LeakFrames,
 		RaceFrames:       cfg.RaceFrames,
-		Files:            cfg.Files,
-		Features:         cfg.Features,
+		Files:      cfg.Files,
+		Features:   cfg.Features,
+		KcovDevice: runner.kcovDevice,
+		KextId:     runner.kextID,
 	}
 	if err := flatrpc.Send(conn, connectReply); err != nil {
 		return handshakeResult{}, err

@@ -200,6 +200,9 @@ func Complete(cfg *Config) error {
 	if err := cfg.completeFocusAreas(); err != nil {
 		return err
 	}
+	if cfg.KextCoverage.KextID == 0 {
+		cfg.KextCoverage.KextID = 1
+	}
 	cfg.initTimeouts()
 	cfg.VMLess = cfg.Type == "none"
 

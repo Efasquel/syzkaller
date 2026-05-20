@@ -154,6 +154,11 @@ type Config struct {
 	// Disabled by default as it slows down fuzzing.
 	RawCover bool `json:"raw_cover"`
 
+	// KEXT coverage configuration (Darwin only).
+	// If KextCoverage.KcovDevice is set, Pishi or KextFuzz is used for coverage collection;
+	// otherwise the executor falls back to ksancov.
+	KextCoverage KextCoverageConfig `json:"kext_coverage,omitempty"`
+
 	// Reproduce, localize and minimize crashers (default: true).
 	Reproduce bool `json:"reproduce"`
 
@@ -233,6 +238,15 @@ type Config struct {
 
 	// Implementation details beyond this point. Filled after parsing.
 	Derived `json:"-"`
+}
+
+// KextCoverageConfig holds Darwin-specific coverage settings for KEXT fuzzing.
+type KextCoverageConfig struct {
+	// KcovDevice is the Pishi or KextFuzz KEXT coverage device path (e.g. "/dev/pishi" or "/dev/kextfuzz").
+	// Empty means neither Pishi nor KextFuzz is configured; the executor falls back to ksancov.
+	KcovDevice string `json:"kcov_device,omitempty"`
+	// KextID is the KEXT bundle ID passed to Pishi for coverage collection (default: 1). KextFuzz does not require it.
+	KextID int `json:"kext_id,omitempty"`
 }
 
 // These options are not guaranteed to be backward/forward compatible and

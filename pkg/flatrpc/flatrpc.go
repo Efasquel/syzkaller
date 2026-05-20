@@ -3,8 +3,9 @@
 package flatrpc
 
 import (
-	flatbuffers "github.com/google/flatbuffers/go"
 	"strconv"
+
+	flatbuffers "github.com/google/flatbuffers/go"
 )
 
 type Const uint64
@@ -751,6 +752,8 @@ type ConnectReplyRawT struct {
 	RaceFrames       []string `json:"race_frames"`
 	Features         Feature  `json:"features"`
 	Files            []string `json:"files"`
+	KcovDevice       string   `json:"kcov_device"`
+	KextId           int32    `json:"kext_id"`
 }
 
 func (t *ConnectReplyRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -796,6 +799,10 @@ func (t *ConnectReplyRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffse
 		}
 		filesOffset = builder.EndVector(filesLength)
 	}
+	kcovDeviceOffset := flatbuffers.UOffsetT(0)
+	if t.KcovDevice != "" {
+		kcovDeviceOffset = builder.CreateString(t.KcovDevice)
+	}
 	ConnectReplyRawStart(builder)
 	ConnectReplyRawAddDebug(builder, t.Debug)
 	ConnectReplyRawAddCover(builder, t.Cover)
@@ -809,6 +816,8 @@ func (t *ConnectReplyRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffse
 	ConnectReplyRawAddRaceFrames(builder, raceFramesOffset)
 	ConnectReplyRawAddFeatures(builder, t.Features)
 	ConnectReplyRawAddFiles(builder, filesOffset)
+	ConnectReplyRawAddKcovDevice(builder, kcovDeviceOffset)
+	ConnectReplyRawAddKextId(builder, t.KextId)
 	return ConnectReplyRawEnd(builder)
 }
 
@@ -837,6 +846,8 @@ func (rcv *ConnectReplyRaw) UnPackTo(t *ConnectReplyRawT) {
 	for j := 0; j < filesLength; j++ {
 		t.Files[j] = string(rcv.Files(j))
 	}
+	t.KcovDevice = string(rcv.KcovDevice())
+	t.KextId = rcv.KextId()
 }
 
 func (rcv *ConnectReplyRaw) UnPack() *ConnectReplyRawT {
@@ -1042,8 +1053,28 @@ func (rcv *ConnectReplyRaw) FilesLength() int {
 	return 0
 }
 
+func (rcv *ConnectReplyRaw) KcovDevice() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(28))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *ConnectReplyRaw) KextId() int32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(30))
+	if o != 0 {
+		return rcv._tab.GetInt32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *ConnectReplyRaw) MutateKextId(n int32) bool {
+	return rcv._tab.MutateInt32Slot(30, n)
+}
+
 func ConnectReplyRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(12)
+	builder.StartObject(14)
 }
 func ConnectReplyRawAddDebug(builder *flatbuffers.Builder, debug bool) {
 	builder.PrependBoolSlot(0, debug, false)
@@ -1089,6 +1120,12 @@ func ConnectReplyRawAddFiles(builder *flatbuffers.Builder, files flatbuffers.UOf
 }
 func ConnectReplyRawStartFilesVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(4, numElems, 4)
+}
+func ConnectReplyRawAddKcovDevice(builder *flatbuffers.Builder, kcovDevice flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(12, flatbuffers.UOffsetT(kcovDevice), 0)
+}
+func ConnectReplyRawAddKextId(builder *flatbuffers.Builder, kextId int32) {
+	builder.PrependInt32Slot(13, kextId, 0)
 }
 func ConnectReplyRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()
