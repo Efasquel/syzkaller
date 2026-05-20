@@ -83,6 +83,7 @@ type Manager struct {
 	reportGenerator *manager.ReportGeneratorWrapper
 	fresh           bool
 	coverFilters    manager.CoverageFilters
+	coverLog 		*os.File
 
 	dash *dashapi.Dashboard
 	// This is specifically separated from dash, so that we can keep dash = nil when
@@ -305,6 +306,16 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		CrashStore: mgr.crashStore,
 	}
 
+	if path := os.Getenv("SYZ_COVER_LOG"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			log.Errorf("failed to open SYZ_COVER_LOG=%q: %v", path, err)
+		} else {
+			mgr.coverLog = f
+			log.Logf(0, "logging new coverage PCs to %s", path)
+    }
+}
+
 	mgr.initStats()
 	if mgr.mode.LoadCorpus {
 		go mgr.preloadCorpus()
@@ -367,6 +378,18 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		osutil.HandleInterrupts(vm.Shutdown)
 	}
 	if mgr.vmPool == nil {
+		if _, err := mgr.CoverageFilter(mgr.cfg.LocalModules); err != nil {
+			log.Logf(0, "failed to set up coverage filter: %v", err)
+		}
+		if mgr.cfg.HTTP != "" {
+		go func() {
+			err := mgr.http.Serve(ctx)
+			if err != nil {
+				log.Fatalf("failed to serve HTTP: %v", err)
+			}
+		}()
+		}
+
 		log.Logf(0, "no VMs started (type=none)")
 		log.Logf(0, "you are supposed to start syz-executor manually as:")
 		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.serv.Port())
@@ -1040,6 +1063,13 @@ func (mgr *Manager) corpusInputHandler(updates <-chan corpus.NewItemEvent) {
 				}
 			}
 			mgr.statCoverFiltered.Add(filtered)
+		}
+		// Log newly discovered PCs to the cover log file, if enabled
+		if mgr.coverLog != nil && len(update.NewCover) != 0 {
+			for _, pc := range update.NewCover {
+				fmt.Fprintf(mgr.coverLog, "0x%x\n", pc);
+			}
+			mgr.coverLog.Sync()
 		}
 		if update.Exists {
 			// We only save new progs into the corpus.db file.

@@ -35,16 +35,12 @@ public:
 					fail("posix_spawn_file_actions_addclose failed");
 			}
 		}
-		for (int i = max_fd + 1; i < kFdLimit; i++) {
-			if (posix_spawn_file_actions_addclose(&actions, i))
-				fail("posix_spawn_file_actions_addclose failed");
-		}
 
 		posix_spawnattr_t attr;
 		if (posix_spawnattr_init(&attr))
 			fail("posix_spawnattr_init failed");
 		// Create new process group so that we can kill all processes in the group.
-		if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP))
+		if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
 			fail("posix_spawnattr_setflags failed");
 
 		const char* child_envp[] = {

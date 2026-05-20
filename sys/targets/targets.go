@@ -415,6 +415,24 @@ var List = map[string]map[string]*Target{
 			},
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
+		ARM64: {
+			PtrSize: 8,
+			PageSize: 0x4000,
+			DataOffset: 0x400000000,
+			// DataOffset: 0x200000000,
+			CCompiler: "clang",
+			CFlags: []string{
+				"-m64",
+				"-Wall",
+				"-stdlib=libc++",
+				"-framework", "IOKit",
+				// FIXME(HerrSpace): syscall and sprintf were marked as deprecated on macos
+				"-Wno-deprecated-declarations",
+			},
+			KernelArch: "arm64",
+			KernelHeaderArch: "arm64",
+			NeedSyscallDefine: dontNeedSyscallDefine,
+		},
 	},
 	NetBSD: {
 		AMD64: {
@@ -541,7 +559,7 @@ var oses = map[string]osCommon{
 		// banging bytes in the shmem there and don't use structs like on the
 		// go side.
 		ExecutorUsesForkServer: false,
-		KernelObject:           "kernel.kasan",
+		KernelObject:           "kernel.kasan.t8112",
 		// Note: We need a real g++ here, not the symlink to clang++ common on
 		// macOS systems. Homebrews gcc package suffixes these with the gcc
 		// version to avoid conflicting with the macOS symlink. Currently -11.

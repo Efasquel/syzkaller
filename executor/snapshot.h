@@ -210,7 +210,7 @@ static void SnapshotStart()
 	// as we won't need to do that duplicate work again and again.
 	flag_threaded = true;
 	for (size_t i = 0; i < kThreadsPopulate; i++) {
-		thread_t* th = &threads[i];
+		syz_thread_t* th = &threads[i];
 		thread_create(th, i, flag_coverage);
 		if (flag_coverage)
 			PopulateMemory(th->cov.data, kCoveragePopulate);

@@ -1,0 +1,10 @@
+include <sys/types.h>
+include <sys/mman.h>
+
+resource io_connect_t[int64]
+
+syz_IOServiceOpen(name ptr[in, string], typ int32, port ptr[out, io_connect_t])
+syz_IOServiceClose(port io_connect_t)
+# syz_IOConnectCallMethod(port io_connect_t, selector int32, input buffer[in], inputCnt len[input], inputStruct buffer[in], inputStructCnt len[inputStruct], output buffer[out], outputCnt ptr[in, len[output, int32]], outputStruct buffer[out], outputStructCnt ptr[in, len[outputStruct, int64]])
+syz_IOConnectCallMethod(port io_connect_t, selector int32, input ptr[in, array[int64]], inputCnt len[input], inputStruct buffer[in], inputStructCnt len[inputStruct], output ptr[in, array[int64]], outputCnt ptr[inout, len[output, int32]], outputStruct buffer[out], outputStructCnt ptr[inout, len[outputStruct, int64]])
+syz_IOConnectCallAsyncMethod(port io_connect_t, selector int32, input ptr[in, array[int64]], inputCnt len[input], inputStruct buffer[in], inputStructCnt len[inputStruct], output ptr[in, array[int64]], outputCnt ptr[inout, len[output, int32]], outputStruct buffer[out], outputStructCnt ptr[inout, len[outputStruct, int64]])

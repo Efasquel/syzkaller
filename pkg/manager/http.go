@@ -948,7 +948,10 @@ func (serv *HTTPServer) collectDiffCrashes() (patchedOnly, both, inProgress *UID
 }
 
 func (serv *HTTPServer) allDiffCrashes() []UIDiffBug {
-	repros := serv.ReproLoop.Reproducing()
+	var repros map[string]bool
+	if serv.ReproLoop !=nil {
+		repros = serv.ReproLoop.Reproducing()
+	}
 	var list []UIDiffBug
 	for _, bug := range serv.DiffStore.List() {
 		list = append(list, UIDiffBug{
@@ -972,7 +975,10 @@ func (serv *HTTPServer) collectCrashes(workdir string) ([]UICrashType, error) {
 	if err != nil {
 		return nil, err
 	}
-	repros := serv.ReproLoop.Reproducing()
+	var repros map[string]bool
+	if serv.ReproLoop !=nil {
+		repros = serv.ReproLoop.Reproducing()
+	}
 	var ret []UICrashType
 	for _, info := range list {
 		ret = append(ret, makeUICrashType(info, serv.StartTime, repros))
