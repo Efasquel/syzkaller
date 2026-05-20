@@ -306,15 +306,15 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		CrashStore: mgr.crashStore,
 	}
 
-	if path := os.Getenv("SYZ_COVER_LOG"); path != "" {
+	if path := cfg.KextCoverage.CoverLog; path != "" {
 		f, err := os.Create(path)
 		if err != nil {
-			log.Errorf("failed to open SYZ_COVER_LOG=%q: %v", path, err)
+			log.Errorf("failed to open cover_log=%q: %v", path, err)
 		} else {
 			mgr.coverLog = f
 			log.Logf(0, "logging new coverage PCs to %s", path)
-    }
-}
+		}
+	}
 
 	mgr.initStats()
 	if mgr.mode.LoadCorpus {

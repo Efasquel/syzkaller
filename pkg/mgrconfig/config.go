@@ -247,6 +247,8 @@ type KextCoverageConfig struct {
 	KcovDevice string `json:"kcov_device,omitempty"`
 	// KextID is the KEXT bundle ID passed to Pishi for coverage collection (default: 1). KextFuzz does not require it.
 	KextID int `json:"kext_id,omitempty"`
+	// CoverLog is an optional path to a file where new coverage PCs are appended.
+	CoverLog string `json:"cover_log,omitempty"`
 }
 
 // These options are not guaranteed to be backward/forward compatible and
