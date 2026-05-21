@@ -47,8 +47,8 @@ func (w *ReportGeneratorWrapper) Get() (*cover.ReportGenerator, error) {
 func (w *ReportGeneratorWrapper) Init(modules []*vminfo.KernelModule) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.initialized {
-		panic("Init() called twice")
+	if w.initialized && len(w.modules) > 0{
+		return
 	}
 	w.initialized = true
 	w.modules = modules
