@@ -147,6 +147,11 @@ func Complete(cfg *Config) error {
 		return err
 	}
 	cfg.Workdir = osutil.Abs(cfg.Workdir)
+	if cfg.LogFile != "" {
+		if !filepath.IsAbs(cfg.LogFile) {
+			cfg.LogFile = filepath.Join(cfg.Workdir, cfg.LogFile)
+		}
+	}
 	if cfg.WorkdirTemplate != "" {
 		cfg.WorkdirTemplate = osutil.Abs(cfg.WorkdirTemplate)
 		if _, err := os.ReadDir(cfg.WorkdirTemplate); err != nil {

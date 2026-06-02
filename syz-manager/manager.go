@@ -271,6 +271,13 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	}
 
 	osutil.MkdirAll(cfg.Workdir)
+	logFile := cfg.LogFile
+	if logFile == "" {
+		logFile = filepath.Join(cfg.Workdir, "results/manager.log")
+	}
+	if err := log.SetLogFile(logFile); err != nil {
+		log.Errorf("failed to open log file: %v", err)
+	}
 
 	reporter, err := report.NewReporter(cfg)
 	if err != nil {
