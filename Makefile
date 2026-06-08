@@ -100,7 +100,7 @@ endif
 
 .PHONY: all clean host target \
 	manager executor kfuzztest ci hub agent \
-	execprog mutate prog2c trace2syz repro upgrade db \
+	execprog ring-repro mutate prog2c trace2syz repro upgrade db \
 	usbgen symbolize cover kconf syz-build crush \
 	bin/syz-extract bin/syz-fmt \
 	extract generate generate_go generate_rpc generate_sys \
@@ -113,7 +113,7 @@ endif
 
 all: host target
 host: manager repro mutate prog2c db upgrade
-target: execprog executor check_syzos
+target: execprog ring-repro executor check_syzos
 
 executor: descriptions
 ifeq ($(TARGETOS),fuchsia)
@@ -160,6 +160,9 @@ manager: descriptions
 
 execprog: descriptions
 	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-execprog$(EXE) github.com/google/syzkaller/tools/syz-execprog
+
+ring-repro: descriptions
+	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-ring-repro$(EXE) github.com/google/syzkaller/tools/syz-ring-repro
 
 ci: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-ci github.com/google/syzkaller/syz-ci
