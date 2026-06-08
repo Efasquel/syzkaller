@@ -28,6 +28,12 @@ type Config struct {
 	// Parent directories are created automatically if they do not exist.
 	// Defaults to <workdir>/manager.log if not set.
 	LogFile string `json:"log_file,omitempty"`
+	// Number of most-recent test programs preserved on disk across kernel panics.
+	// Files are written to <workdir>/ring_buffer/slot_NNNN.syz with an fsync after
+	// each write so they survive an abrupt shutdown. Only active when type is "none"
+	// (VM-less); with VMs the built-in reproduction loop handles crash capture.
+	// Set to 0 (default) to disable.
+	RingBufferSize int `json:"ring_buffer_size,omitempty"`
 	// Refers to a directory. Optional.
 	// Each VM will get a recursive copy of the files that are present in workdir_template.
 	// VM config can then use these private copies as needed. The copy directory

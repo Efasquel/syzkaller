@@ -46,6 +46,7 @@ type Runner struct {
 	executing     map[int64]bool
 	hanged        map[int64]bool
 	lastExec      *LastExecuting
+	ringBuf       *RingBuffer
 	updInfo       dispatcher.UpdateInfo
 	resultCh      chan error
 
@@ -348,6 +349,9 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 		},
 	}
 	runner.requests[id] = req
+	if req.Type == flatrpc.RequestTypeProgram {
+		runner.ringBuf.WriteSync(int(id), req.Prog.Serialize())
+	}
 	return flatrpc.Send(runner.conn, msg)
 }
 

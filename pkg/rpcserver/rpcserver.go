@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -50,9 +51,12 @@ type Config struct {
 	DebugTimeouts bool
 	Procs         int
 	Slowdown      int
-	KcovDevice    string
-	KextID        int
-	pcBase        uint64
+	KcovDevice     string
+	KextID         int
+	Workdir        string
+	LogFile        string
+	RingBufferSize int
+	pcBase         uint64
 	localModules  []*vminfo.KernelModule
 
 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
@@ -93,6 +97,7 @@ type server struct {
 	sysTarget *targets.Target
 	timeouts  targets.Timeouts
 	checker   *vminfo.Checker
+	ringBuf   *RingBuffer
 
 	infoOnce         sync.Once
 	checkDone        atomic.Bool
@@ -167,7 +172,20 @@ func New(cfg *RemoteConfig) (Server, error) {
 	if !cfg.MemoryDump {
 		features &= ^flatrpc.FeatureMemoryDump
 	}
-	return newImpl(&Config{
+	// The ring buffer is only useful in VM-less mode: with VMs the manager survives
+	// a kernel panic (it runs on the host) and the built-in reproduction loop handles
+	// crash capture automatically.
+	var ringBuf *RingBuffer
+	if cfg.VMLess {
+		ringBuf, err = NewRingBuffer(
+			filepath.Join(cfg.Workdir, "ring_buffer"),
+			cfg.RingBufferSize,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("ring buffer: %w", err)
+		}
+	}
+	serv := newImpl(&Config{
 		Config: vminfo.Config{
 			Target:     cfg.Target,
 			VMType:     cfg.Type,
@@ -193,9 +211,14 @@ func New(cfg *RemoteConfig) (Server, error) {
 		Slowdown:          cfg.Timeouts.Slowdown,
 		KcovDevice:        cfg.KextCoverage.KcovDevice,
 		KextID:            cfg.KextCoverage.KextID,
+		Workdir:           cfg.Workdir,
+		LogFile:           cfg.LogFile,
+		RingBufferSize:    cfg.RingBufferSize,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
-	}, cfg.Manager), nil
+	}, cfg.Manager)
+	serv.ringBuf = ringBuf
+	return serv, nil
 }
 
 func newImpl(cfg *Config, mgr Manager) *server {
@@ -231,6 +254,7 @@ func newImpl(cfg *Config, mgr Manager) *server {
 }
 
 func (serv *server) Close() error {
+	serv.ringBuf.Close()
 	return serv.serv.Close()
 }
 
@@ -530,6 +554,26 @@ func (serv *server) printMachineCheck(checkFilesInfo []*flatrpc.FileInfo, enable
 	if hasFileErrors {
 		fmt.Fprintf(buf, "\n")
 	}
+	logFile := serv.cfg.LogFile
+	if logFile == "" {
+		logFile = "default"
+	}
+	kcovDevice := serv.cfg.KcovDevice
+	if kcovDevice == "" {
+		kcovDevice = "not configured"
+	} else if serv.cfg.KextID != 0 {
+		kcovDevice = fmt.Sprintf("%v (kext id: %v)", kcovDevice, serv.cfg.KextID)
+	}
+	ringBuf := "disabled"
+	if serv.cfg.RingBufferSize > 0 {
+		ringBuf = fmt.Sprintf("enabled (%v slots)", serv.cfg.RingBufferSize)
+	}
+	fmt.Fprintf(buf, "%-24v: %v\n", "workdir", serv.cfg.Workdir)
+	fmt.Fprintf(buf, "%-24v: %v\n", "log file", logFile)
+	fmt.Fprintf(buf, "%-24v: %v\n", "kcov device", kcovDevice)
+	fmt.Fprintf(buf, "%-24v: %v\n", "ring buffer", ringBuf)
+	fmt.Fprintf(buf, "\n")
+
 	var lines []string
 	lines = append(lines, fmt.Sprintf("%-24v: %v/%v\n", "syscalls",
 		len(enabledCalls), len(serv.cfg.Target.Syscalls)))
@@ -560,6 +604,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		hanged:        make(map[int64]bool),
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec: MakeLastExecuting(prog.MaxPids, 6),
+		ringBuf:  serv.ringBuf,
 		stats:    serv.runnerStats,
 		procs:      serv.cfg.Procs,
 		kcovDevice: serv.cfg.KcovDevice,
