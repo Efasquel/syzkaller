@@ -52,6 +52,8 @@ var (
 		"(e.g. 5 selects from n-5); -1 = oldest available")
 	flagTo = flag.Int("to", 0, "end of range, as an offset back from the most recent program n "+
 		"(e.g. 1 selects up to n-1); 0 = most recent")
+	flagMerge = flag.String("merge", "", "concatenate the selected programs into a single program, write it "+
+		"to this file, and exit without executing")
 )
 
 func main() {
@@ -92,6 +94,13 @@ func main() {
 			marker = " <-- most recent (likely culprit)"
 		}
 		log.Logf(0, "  [order %d] %s id=%d%s", i+1, e.slot, e.id, marker)
+	}
+
+	if *flagMerge != "" {
+		if err := mergeEntries(target, entries, *flagMerge); err != nil {
+			tool.Failf("merge failed: %v", err)
+		}
+		return
 	}
 
 	sandbox, err := flatrpc.SandboxToFlags(*flagSandbox)
@@ -213,6 +222,32 @@ func selectRange(entries []slotEntry) ([]slotEntry, error) {
 	lo := n - 1 - fromOff
 	hi := n - 1 - toOff
 	return entries[lo : hi+1], nil
+}
+
+// mergeEntries concatenates the calls of all selected programs (in oldest ->
+// newest order) into a single program and writes it to outFile. Resource
+// variables are renumbered across the whole sequence by Serialize, so a plain
+// append of the calls is sufficient. The result is a self-contained reproducer
+// candidate that can be replayed, minimized, or fed to syz-prog2c/syz-repro.
+func mergeEntries(target *prog.Target, entries []slotEntry, outFile string) error {
+	merged := &prog.Prog{Target: target}
+	for _, e := range entries {
+		merged.Calls = append(merged.Calls, e.prog.Calls...)
+	}
+	data := merged.Serialize()
+	// Round-trip to make sure the concatenation produced a valid program.
+	if _, err := target.Deserialize(data, prog.NonStrict); err != nil {
+		return fmt.Errorf("merged program is invalid: %v", err)
+	}
+	if len(merged.Calls) > prog.MaxCalls {
+		log.Logf(0, "warning: merged program has %d calls, exceeding prog.MaxCalls=%d; "+
+			"the executor may refuse it until it is minimized", len(merged.Calls), prog.MaxCalls)
+	}
+	if err := os.WriteFile(outFile, data, 0644); err != nil {
+		return err
+	}
+	log.Logf(0, "merged %d programs (%d calls total) into %s", len(entries), len(merged.Calls), outFile)
+	return nil
 }
 
 func loadRingBuffer(target *prog.Target, dir string) ([]slotEntry, error) {
