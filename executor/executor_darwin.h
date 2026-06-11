@@ -11,7 +11,7 @@ struct fuzzer_buf_desc {
 };
 
 #define FUZZER_IOCTL_MAP _IOWR('K', 8, struct fuzzer_buf_desc)
-#define FUZZER_IOCTL_START _IOW('K', 10, uint32_t)
+#define FUZZER_IOCTL_START _IOW('K', 10, uint16_t)
 #define FUZZER_IOCTL_STOP _IO('K', 20)
 #define FUZZER_IOCTL_UNMAP _IO('K', 30)
 
@@ -22,8 +22,6 @@ static uint32_t kext_id_g = 1;
 
 static fuzzer_buf_desc mc = {0};
 static int kcov_fd = -1;
-static uint64_t call_count = 0;
-static uint64_t zero_cov_count = 0;
 
 static void os_init(int argc, char** argv, void* data, size_t data_size)
 {
@@ -120,10 +118,6 @@ static void cover_collect(cover_t* cov)
 	uint64 num = __atomic_load_n((uint64_t*)cov->data, __ATOMIC_RELAXED);
 	if (num > kCoverSize / sizeof(uint64_t))
 		num = kCoverSize / sizeof(uint64_t);
-
-	call_count++;
-	if (num == 0)
-		zero_cov_count++;
 
 	cov->size = num;
 	cov->data_offset = sizeof(uint64);
