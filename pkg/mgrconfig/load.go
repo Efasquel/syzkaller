@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/config"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
@@ -207,6 +208,13 @@ func Complete(cfg *Config) error {
 	}
 	if cfg.KextCoverage.KextID == 0 {
 		cfg.KextCoverage.KextID = 1
+	}
+	// On Darwin, kernel-extension coverage is collected by a Pishi/KextFuzz device;
+	// without it the executor cannot collect coverage and the /cover page will be
+	// empty. Warn loudly but keep running, since a run may proceed without coverage.
+	if cfg.Cover && cfg.TargetOS == targets.Darwin && cfg.KextCoverage.KcovDevice == "" {
+		log.Logf(0, "WARNING: cover is enabled on Darwin but kext_coverage.kcov_device is not set; "+
+			"kext coverage requires Pishi/KextFuzz (e.g. \"/dev/pishi\") and will be unavailable until configured")
 	}
 	cfg.initTimeouts()
 	cfg.VMLess = cfg.Type == "none"

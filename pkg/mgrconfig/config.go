@@ -52,6 +52,10 @@ type Config struct {
 	// Directory with kernel object files (e.g. `vmlinux` for linux)
 	// (used for report symbolization, coverage reports and in tree modules finding, optional).
 	KernelObj string `json:"kernel_obj"`
+	// Name of the main kernel object file located inside the KernelObj directory.
+	// Overrides the target default (e.g. "vmlinux" for linux, "kernel.kasan.t8112"
+	// for darwin); useful to point at a specific Boot Kernel Collection file name.
+	KernelObjFile string `json:"kernel_obj_file,omitempty"`
 	// Directories with out-of-tree kernel module object files for coverage report generation (optional).
 	// KernelObj is also scanned for in-tree kernel modules and does not need to be duplicated here.
 	// Note: the modules need to be unstripped and contain debug info.
