@@ -1274,6 +1274,7 @@ struct InfoRequestRawT : public ::flatbuffers::NativeTable {
   std::string error{};
   std::vector<std::unique_ptr<rpc::FeatureInfoRawT>> features{};
   std::vector<std::unique_ptr<rpc::FileInfoRawT>> files{};
+  uint64_t kaslr_runtime_addr = 0;
   InfoRequestRawT() = default;
   InfoRequestRawT(const InfoRequestRawT &o);
   InfoRequestRawT(InfoRequestRawT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -1286,7 +1287,8 @@ struct InfoRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
     VT_ERROR = 4,
     VT_FEATURES = 6,
-    VT_FILES = 8
+    VT_FILES = 8,
+    VT_KASLR_RUNTIME_ADDR = 10
   };
   const ::flatbuffers::String *error() const {
     return GetPointer<const ::flatbuffers::String *>(VT_ERROR);
@@ -1296,6 +1298,9 @@ struct InfoRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   }
   const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::FileInfoRaw>> *files() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::FileInfoRaw>> *>(VT_FILES);
+  }
+  uint64_t kaslr_runtime_addr() const {
+    return GetField<uint64_t>(VT_KASLR_RUNTIME_ADDR, 0);
   }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -1307,6 +1312,7 @@ struct InfoRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_FILES) &&
            verifier.VerifyVector(files()) &&
            verifier.VerifyVectorOfTables(files()) &&
+           VerifyField<uint64_t>(verifier, VT_KASLR_RUNTIME_ADDR, 8) &&
            verifier.EndTable();
   }
   InfoRequestRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -1327,6 +1333,9 @@ struct InfoRequestRawBuilder {
   void add_files(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::FileInfoRaw>>> files) {
     fbb_.AddOffset(InfoRequestRaw::VT_FILES, files);
   }
+  void add_kaslr_runtime_addr(uint64_t kaslr_runtime_addr) {
+    fbb_.AddElement<uint64_t>(InfoRequestRaw::VT_KASLR_RUNTIME_ADDR, kaslr_runtime_addr, 0);
+  }
   explicit InfoRequestRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -1342,8 +1351,10 @@ inline ::flatbuffers::Offset<InfoRequestRaw> CreateInfoRequestRaw(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     ::flatbuffers::Offset<::flatbuffers::String> error = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::FeatureInfoRaw>>> features = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::FileInfoRaw>>> files = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::FileInfoRaw>>> files = 0,
+    uint64_t kaslr_runtime_addr = 0) {
   InfoRequestRawBuilder builder_(_fbb);
+  builder_.add_kaslr_runtime_addr(kaslr_runtime_addr);
   builder_.add_files(files);
   builder_.add_features(features);
   builder_.add_error(error);
@@ -1354,7 +1365,8 @@ inline ::flatbuffers::Offset<InfoRequestRaw> CreateInfoRequestRawDirect(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     const char *error = nullptr,
     const std::vector<::flatbuffers::Offset<rpc::FeatureInfoRaw>> *features = nullptr,
-    const std::vector<::flatbuffers::Offset<rpc::FileInfoRaw>> *files = nullptr) {
+    const std::vector<::flatbuffers::Offset<rpc::FileInfoRaw>> *files = nullptr,
+    uint64_t kaslr_runtime_addr = 0) {
   auto error__ = error ? _fbb.CreateString(error) : 0;
   auto features__ = features ? _fbb.CreateVector<::flatbuffers::Offset<rpc::FeatureInfoRaw>>(*features) : 0;
   auto files__ = files ? _fbb.CreateVector<::flatbuffers::Offset<rpc::FileInfoRaw>>(*files) : 0;
@@ -1362,7 +1374,8 @@ inline ::flatbuffers::Offset<InfoRequestRaw> CreateInfoRequestRawDirect(
       _fbb,
       error__,
       features__,
-      files__);
+      files__,
+      kaslr_runtime_addr);
 }
 
 ::flatbuffers::Offset<InfoRequestRaw> CreateInfoRequestRaw(::flatbuffers::FlatBufferBuilder &_fbb, const InfoRequestRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -3132,7 +3145,8 @@ inline ::flatbuffers::Offset<ConnectReplyRaw> CreateConnectReplyRaw(::flatbuffer
 }
 
 inline InfoRequestRawT::InfoRequestRawT(const InfoRequestRawT &o)
-      : error(o.error) {
+      : error(o.error),
+        kaslr_runtime_addr(o.kaslr_runtime_addr) {
   features.reserve(o.features.size());
   for (const auto &features_ : o.features) { features.emplace_back((features_) ? new rpc::FeatureInfoRawT(*features_) : nullptr); }
   files.reserve(o.files.size());
@@ -3143,6 +3157,7 @@ inline InfoRequestRawT &InfoRequestRawT::operator=(InfoRequestRawT o) FLATBUFFER
   std::swap(error, o.error);
   std::swap(features, o.features);
   std::swap(files, o.files);
+  std::swap(kaslr_runtime_addr, o.kaslr_runtime_addr);
   return *this;
 }
 
@@ -3158,6 +3173,7 @@ inline void InfoRequestRaw::UnPackTo(InfoRequestRawT *_o, const ::flatbuffers::r
   { auto _e = error(); if (_e) _o->error = _e->str(); }
   { auto _e = features(); if (_e) { _o->features.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->features[_i]) { _e->Get(_i)->UnPackTo(_o->features[_i].get(), _resolver); } else { _o->features[_i] = std::unique_ptr<rpc::FeatureInfoRawT>(_e->Get(_i)->UnPack(_resolver)); }; } } else { _o->features.resize(0); } }
   { auto _e = files(); if (_e) { _o->files.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->files[_i]) { _e->Get(_i)->UnPackTo(_o->files[_i].get(), _resolver); } else { _o->files[_i] = std::unique_ptr<rpc::FileInfoRawT>(_e->Get(_i)->UnPack(_resolver)); }; } } else { _o->files.resize(0); } }
+  { auto _e = kaslr_runtime_addr(); _o->kaslr_runtime_addr = _e; }
 }
 
 inline ::flatbuffers::Offset<InfoRequestRaw> InfoRequestRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const InfoRequestRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3171,11 +3187,13 @@ inline ::flatbuffers::Offset<InfoRequestRaw> CreateInfoRequestRaw(::flatbuffers:
   auto _error = _o->error.empty() ? 0 : _fbb.CreateString(_o->error);
   auto _features = _o->features.size() ? _fbb.CreateVector<::flatbuffers::Offset<rpc::FeatureInfoRaw>> (_o->features.size(), [](size_t i, _VectorArgs *__va) { return CreateFeatureInfoRaw(*__va->__fbb, __va->__o->features[i].get(), __va->__rehasher); }, &_va ) : 0;
   auto _files = _o->files.size() ? _fbb.CreateVector<::flatbuffers::Offset<rpc::FileInfoRaw>> (_o->files.size(), [](size_t i, _VectorArgs *__va) { return CreateFileInfoRaw(*__va->__fbb, __va->__o->files[i].get(), __va->__rehasher); }, &_va ) : 0;
+  auto _kaslr_runtime_addr = _o->kaslr_runtime_addr;
   return rpc::CreateInfoRequestRaw(
       _fbb,
       _error,
       _features,
-      _files);
+      _files,
+      _kaslr_runtime_addr);
 }
 
 inline InfoReplyRawT *InfoReplyRaw::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {

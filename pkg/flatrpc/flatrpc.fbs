@@ -74,6 +74,9 @@ table InfoRequestRaw {
 	error			:string;
 	features		:[FeatureInfoRaw];
 	files			:[FileInfoRaw];
+	// Darwin/Pishi: KASLR-slid, PAC-stripped runtime address of _sanitizer_cov_trace_pc.
+	// 0 means unknown (no KEXT coverage device, or the KASLR ioctl failed).
+	kaslr_runtime_addr	:uint64;
 }
 
 table InfoReplyRaw {

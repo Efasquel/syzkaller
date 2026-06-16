@@ -1132,9 +1132,10 @@ func ConnectReplyRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 }
 
 type InfoRequestRawT struct {
-	Error    string             `json:"error"`
-	Features []*FeatureInfoRawT `json:"features"`
-	Files    []*FileInfoRawT    `json:"files"`
+	Error            string             `json:"error"`
+	Features         []*FeatureInfoRawT `json:"features"`
+	Files            []*FileInfoRawT    `json:"files"`
+	KaslrRuntimeAddr uint64             `json:"kaslr_runtime_addr"`
 }
 
 func (t *InfoRequestRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -1175,6 +1176,7 @@ func (t *InfoRequestRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffset
 	InfoRequestRawAddError(builder, errorOffset)
 	InfoRequestRawAddFeatures(builder, featuresOffset)
 	InfoRequestRawAddFiles(builder, filesOffset)
+	InfoRequestRawAddKaslrRuntimeAddr(builder, t.KaslrRuntimeAddr)
 	return InfoRequestRawEnd(builder)
 }
 
@@ -1194,6 +1196,7 @@ func (rcv *InfoRequestRaw) UnPackTo(t *InfoRequestRawT) {
 		rcv.Files(&x, j)
 		t.Files[j] = x.UnPack()
 	}
+	t.KaslrRuntimeAddr = rcv.KaslrRuntimeAddr()
 }
 
 func (rcv *InfoRequestRaw) UnPack() *InfoRequestRawT {
@@ -1288,8 +1291,20 @@ func (rcv *InfoRequestRaw) FilesLength() int {
 	return 0
 }
 
+func (rcv *InfoRequestRaw) KaslrRuntimeAddr() uint64 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(10))
+	if o != 0 {
+		return rcv._tab.GetUint64(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *InfoRequestRaw) MutateKaslrRuntimeAddr(n uint64) bool {
+	return rcv._tab.MutateUint64Slot(10, n)
+}
+
 func InfoRequestRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(3)
+	builder.StartObject(4)
 }
 func InfoRequestRawAddError(builder *flatbuffers.Builder, error flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(error), 0)
@@ -1305,6 +1320,9 @@ func InfoRequestRawAddFiles(builder *flatbuffers.Builder, files flatbuffers.UOff
 }
 func InfoRequestRawStartFilesVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(4, numElems, 4)
+}
+func InfoRequestRawAddKaslrRuntimeAddr(builder *flatbuffers.Builder, kaslrRuntimeAddr uint64) {
+	builder.PrependUint64Slot(3, kaslrRuntimeAddr, 0)
 }
 func InfoRequestRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()
