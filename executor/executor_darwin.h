@@ -14,6 +14,40 @@ struct fuzzer_buf_desc {
 #define FUZZER_IOCTL_START _IOW('K', 10, uint16_t)
 #define FUZZER_IOCTL_STOP _IO('K', 20)
 #define FUZZER_IOCTL_UNMAP _IO('K', 30)
+#define FUZZER_IOCTL_KASLR _IOR('K', 60, uint64_t)
+
+// On arm64e the kext returns a PAC-signed function pointer: the upper bits hold
+// the signature, the real VA lives in bits 47:0. Drop the signature and
+// sign-extend bit 47 to rebuild the canonical kernel address.
+static uint64_t strip_pac(uint64_t ptr)
+{
+	uint64_t va = ptr & 0x0000ffffffffffffULL;
+	if (va & (1ULL << 47))
+		va |= 0xffff000000000000ULL;
+	return va;
+}
+
+// Reads the runtime address of _sanitizer_cov_trace_pc from the helper kext.
+// Returns 0 (and leaves no trace beyond a debug line) on any failure, so the
+// handshake never fails just because the slide could not be determined.
+static uint64_t read_kaslr_runtime_addr(const char* device)
+{
+	if (device == NULL || device[0] == '\0')
+		return 0;
+	int fd = open(device, O_RDWR);
+	if (fd == -1) {
+		debug("kaslr: open of %s failed\n", device);
+		return 0;
+	}
+	uint64_t addr = 0;
+	if (ioctl(fd, FUZZER_IOCTL_KASLR, &addr) == -1) {
+		debug("kaslr: FUZZER_IOCTL_KASLR failed\n");
+		close(fd);
+		return 0;
+	}
+	close(fd);
+	return strip_pac(addr);
+}
 
 // Written by parse_handshake() before cover_open() is called.
 // Empty kcov_device_g means no coverage device is configured.

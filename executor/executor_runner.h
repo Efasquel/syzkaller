@@ -733,6 +733,14 @@ private:
 		// Handshake stage 2: share information requested by the manager.
 		rpc::InfoRequestRawT info_req;
 		info_req.files = ReadFiles(conn_reply.files);
+#if GOOS_darwin
+		// When KEXT coverage is configured, report the KASLR-slid
+		// runtime address of _sanitizer_cov_trace_pc so the manager can
+		// compute the kernel slide for symbolization. 0 = unknown.
+		info_req.kaslr_runtime_addr = read_kaslr_runtime_addr(conn_reply.kcov_device.c_str());
+		debug("kaslr: runtime addr of _sanitizer_cov_trace_pc = 0x%llx\n",
+		      static_cast<unsigned long long>(info_req.kaslr_runtime_addr));
+#endif
 
 		// This does any one-time setup for the requested features on the machine.
 		// Note: this can be called multiple times and must be idempotent.
