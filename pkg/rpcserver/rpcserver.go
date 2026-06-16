@@ -48,16 +48,16 @@ type Config struct {
 	FilterSignal      bool
 	PrintMachineCheck bool
 	// Abort early on syz-executor not replying to requests and print extra debugging information.
-	DebugTimeouts bool
-	Procs         int
-	Slowdown      int
+	DebugTimeouts  bool
+	Procs          int
+	Slowdown       int
 	KcovDevice     string
 	KextID         int
 	Workdir        string
 	LogFile        string
 	RingBufferSize int
 	pcBase         uint64
-	localModules  []*vminfo.KernelModule
+	localModules   []*vminfo.KernelModule
 
 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
 	machineCheckStarted chan struct{}
@@ -107,6 +107,12 @@ type server struct {
 	setupFeatures    flatrpc.Feature
 	canonicalModules *cover.Canonicalizer
 	coverFilter      []uint64
+
+	// Darwin KASLR: static (unslid) address of the slide anchor symbol in the
+	// Boot Kernel Collection, read once and reused across per-instance handshakes.
+	kaslrStaticOnce sync.Once
+	kaslrStaticAddr uint64
+	kaslrStaticErr  error
 
 	mu            sync.Mutex
 	runners       map[int]*Runner
@@ -395,6 +401,50 @@ func (serv *server) handleRunnerConn(ctx context.Context, runner *Runner, conn *
 	return serv.connectionLoop(ctx, runner)
 }
 
+func (serv *server) applyDarwinSlide(runtimeAddr uint64) []*vminfo.KernelModule {
+	if runtimeAddr == 0 {
+		log.Logf(0, "darwin kaslr: executor reported no runtime address for %s; "+
+			"assuming zero slide (set kext_coverage.kcov_device and check Pishi)",
+			backend.DarwinKaslrAnchor)
+		return serv.cfg.localModules
+	}
+	// Always surface the slid kernel address once Pishi reports it, even if we
+	// can't derive the slide below: it's the anchor for symbolizing a crash by hand.
+	log.Logf(0, "darwin kaslr: %s runtime address = 0x%x", backend.DarwinKaslrAnchor, runtimeAddr)
+
+	var kernel *vminfo.KernelModule
+	for _, m := range serv.cfg.localModules {
+		if m.Name == "" {
+			kernel = m
+			break
+		}
+	}
+	if kernel == nil {
+		log.Logf(0, "darwin kaslr: no kernel module to anchor the slide on; slide not computed")
+		return serv.cfg.localModules
+	}
+	serv.kaslrStaticOnce.Do(func() {
+		serv.kaslrStaticAddr, serv.kaslrStaticErr =
+			backend.MachoStaticSymbolAddr(kernel.Path, backend.DarwinKaslrAnchor)
+	})
+	if serv.kaslrStaticErr != nil {
+		log.Logf(0, "darwin kaslr: failed to read static address of %s from %s: %v; slide not computed",
+			backend.DarwinKaslrAnchor, kernel.Path, serv.kaslrStaticErr)
+		return serv.cfg.localModules
+	}
+	slide := runtimeAddr - serv.kaslrStaticAddr
+	log.Logf(0, "darwin kaslr: static=0x%x slide=0x%x", serv.kaslrStaticAddr, slide)
+	out := make([]*vminfo.KernelModule, len(serv.cfg.localModules))
+	for i, m := range serv.cfg.localModules {
+		cp := *m
+		if cp.Name == "" {
+			cp.Addr = slide
+		}
+		out[i] = &cp
+	}
+	return out
+}
+
 func (serv *server) handleMachineInfo(infoReq *flatrpc.InfoRequestRawT) (handshakeResult, error) {
 	modules, machineInfo, err := serv.checker.MachineInfo(infoReq.Files)
 	if err != nil {
@@ -403,7 +453,11 @@ func (serv *server) handleMachineInfo(infoReq *flatrpc.InfoRequestRawT) (handsha
 			infoReq.Error = err.Error()
 		}
 	}
-	modules = backend.FixModules(serv.cfg.localModules, modules, serv.cfg.pcBase)
+	if serv.target.OS == targets.Darwin {
+		modules = serv.applyDarwinSlide(infoReq.KaslrRuntimeAddr)
+	} else {
+		modules = backend.FixModules(serv.cfg.localModules, modules, serv.cfg.pcBase)
+	}
 	if infoReq.Error != "" {
 		log.Logf(0, "machine check failed: %v", infoReq.Error)
 		serv.checkFailures++
@@ -603,14 +657,14 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		executing:     make(map[int64]bool),
 		hanged:        make(map[int64]bool),
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
-		lastExec: MakeLastExecuting(prog.MaxPids, 6),
-		ringBuf:  serv.ringBuf,
-		stats:    serv.runnerStats,
+		lastExec:   MakeLastExecuting(prog.MaxPids, 6),
+		ringBuf:    serv.ringBuf,
+		stats:      serv.runnerStats,
 		procs:      serv.cfg.Procs,
 		kcovDevice: serv.cfg.KcovDevice,
 		kextID:     int32(serv.cfg.KextID),
 		updInfo:    updInfo,
-		resultCh: make(chan error, 1),
+		resultCh:   make(chan error, 1),
 	}
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
