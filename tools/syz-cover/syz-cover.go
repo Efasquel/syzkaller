@@ -104,7 +104,7 @@ func toolFileCover() {
 }
 
 func initModules(cfg *mgrconfig.Config) []*vminfo.KernelModule {
-	modules, err := backend.DiscoverModules(cfg.SysTarget, cfg.KernelObj, cfg.ModuleObj)
+	modules, err := backend.DiscoverModules(cfg.SysTarget, cfg.KernelObj, cfg.KernelObjFile, cfg.ModuleObj)
 	if err != nil {
 		tool.Fail(err)
 	}

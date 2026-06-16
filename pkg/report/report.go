@@ -94,7 +94,7 @@ func NewReporter(cfg *mgrconfig.Config) (*Reporter, error) {
 	var localModules []*vminfo.KernelModule
 	if cfg.KernelObj != "" {
 		var err error
-		localModules, err = backend.DiscoverModules(cfg.SysTarget, cfg.KernelObj, cfg.ModuleObj)
+		localModules, err = backend.DiscoverModules(cfg.SysTarget, cfg.KernelObj, cfg.KernelObjFile, cfg.ModuleObj)
 		if err != nil {
 			return nil, err
 		}

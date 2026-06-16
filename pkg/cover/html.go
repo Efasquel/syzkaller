@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 type HandlerParams struct {
@@ -90,6 +91,12 @@ func (rg *ReportGenerator) DoHTML(w io.Writer, params HandlerParams) error {
 		if err == nil {
 			contents = fileContents(file, lines, haveProgs)
 			fileOpenErr = nil
+		} else if rg.target.OS == targets.Darwin {
+			// Darwin kexts are prebuilt and ship no DWARF/source (see the Mach-O
+			// backend), so source bodies are never available. Render the
+			// function-level summary with a placeholder instead of failing.
+			contents = "Source not available (prebuilt kext, no DWARF); " +
+				"function- and basic-block-level coverage only."
 		} else {
 			// We ignore individual errors of opening/locating source files
 			// because there is a number of reasons when/why it can happen.
@@ -105,7 +112,8 @@ func (rg *ReportGenerator) DoHTML(w io.Writer, params HandlerParams) error {
 		d.Contents = append(d.Contents, template.HTML(contents))
 		f.Index = len(d.Contents) - 1
 	}
-	if fileOpenErr != nil {
+	// On Darwin we never have source, so don't fail when nothing opened.
+	if fileOpenErr != nil && rg.target.OS != targets.Darwin {
 		return fileOpenErr
 	}
 	for _, prog := range progs {

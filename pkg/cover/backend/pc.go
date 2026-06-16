@@ -14,6 +14,11 @@ func PreviousInstructionPC(target *targets.Target, vm string, pc uint64) uint64 
 		// gVisor coverage returns real PCs that don't need adjustment.
 		return pc
 	}
+	if target.OS == targets.Darwin {
+		// Pishi records the exact basic-block PC (the value its trampoline passes to
+		// _sanitizer_cov_trace_pc), not a call return address, so no adjustment.
+		return pc
+	}
 	offset := instructionLen(target.Arch)
 	pc -= offset
 	// THUMB instructions are 2 or 4 bytes with low bit set.
@@ -26,6 +31,10 @@ func PreviousInstructionPC(target *targets.Target, vm string, pc uint64) uint64 
 
 func NextInstructionPC(target *targets.Target, vm string, pc uint64) uint64 {
 	if vm == targets.GVisor {
+		return pc
+	}
+	if target.OS == targets.Darwin {
+		// Inverse of PreviousInstructionPC: Pishi PCs need no adjustment.
 		return pc
 	}
 	offset := instructionLen(target.Arch)

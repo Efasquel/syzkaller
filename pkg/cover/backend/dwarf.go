@@ -194,7 +194,10 @@ func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
 			}
 			binC <- binResult{symbols: result.Symbols, coverPoints: result.CoverPoints, ranges: ranges, units: units}
 		}()
-		if isKcovBrokenInCompiler(params.getCompilerVersion(module.Path)) {
+		// getCompilerVersion is optional (e.g. Mach-O has no equivalent);
+		// when absent, assume kcov is not broken.
+		if params.getCompilerVersion != nil &&
+			isKcovBrokenInCompiler(params.getCompilerVersion(module.Path)) {
 			preciseCoverage = false
 		}
 	}

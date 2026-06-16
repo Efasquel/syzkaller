@@ -54,6 +54,11 @@ var (
 		"(e.g. 1 selects up to n-1); 0 = most recent")
 	flagMerge = flag.String("merge", "", "concatenate the selected programs into a single program, write it "+
 		"to this file, and exit without executing")
+	flagCoverFile = flag.String("coverfile", "", "append newly seen coverage PCs to this file, fsync'd after "+
+		"every program so they survive a kernel panic; PCs are written raw (0x%x), matching syz-manager's cover_log")
+	flagKcovDevice = flag.String("kcov_device", "", "Darwin KEXT coverage device for Pishi/KextFuzz (e.g. "+
+		"/dev/pishi); required for -coverfile, the executor opens it via ioctl to collect coverage")
+	flagKextID = flag.Int("kext_id", 1, "KEXT bundle id passed to Pishi via FUZZER_IOCTL_START (ignored by KextFuzz)")
 )
 
 func main() {
@@ -124,6 +129,22 @@ func main() {
 			SandboxArg: int64(*flagSandboxArg),
 		},
 	}
+	collectCover := *flagCoverFile != ""
+	if collectCover {
+		if *flagKcovDevice == "" {
+			tool.Failf("-coverfile requires -kcov_device (e.g. /dev/pishi) so the executor can collect coverage")
+		}
+		ctx.defaultOpts.ExecFlags |= flatrpc.ExecFlagCollectCover
+		f, err := os.Create(*flagCoverFile)
+		if err != nil {
+			tool.Failf("failed to create cover file %s: %v", *flagCoverFile, err)
+		}
+		defer f.Close()
+		ctx.coverFile = f
+		ctx.coverSeen = make(map[uint64]bool)
+		log.Logf(0, "logging coverage PCs from %s (kext id %d) to %s",
+			*flagKcovDevice, *flagKextID, *flagCoverFile)
+	}
 
 	cfg := &rpcserver.LocalConfig{
 		Config: rpcserver.Config{
@@ -132,11 +153,15 @@ func main() {
 				VMType:     "none",
 				Features:   flatrpc.AllFeatures,
 				Debug:      *flagDebug,
+				Cover:      collectCover,
 				Sandbox:    sandbox,
 				SandboxArg: int64(*flagSandboxArg),
+				KcovDevice: *flagKcovDevice,
 			},
-			Procs:    *flagProcs,
-			Slowdown: *flagSlowdown,
+			Procs:      *flagProcs,
+			Slowdown:   *flagSlowdown,
+			KcovDevice: *flagKcovDevice,
+			KextID:     *flagKextID,
 		},
 		Executor:         *flagExecutor,
 		HandleInterrupts: true,
@@ -163,6 +188,13 @@ type Context struct {
 	mu          sync.Mutex
 	pos         int
 	completed   atomic.Uint64
+
+	// Coverage logging. coverFile is fsync'd after every program so the
+	// coverage of the programs that ran just before a kernel panic is not lost
+	// (this tool runs VM-less, so a panic takes the whole machine down).
+	coverMu   sync.Mutex
+	coverFile *os.File
+	coverSeen map[uint64]bool
 }
 
 func (ctx *Context) machineChecked(features flatrpc.Feature, _ map[*prog.Syscall]bool) queue.Source {
@@ -187,12 +219,44 @@ func (ctx *Context) Next() *queue.Request {
 	return req
 }
 
-func (ctx *Context) onDone(_ *queue.Request, _ *queue.Result) bool {
+func (ctx *Context) onDone(_ *queue.Request, res *queue.Result) bool {
+	if ctx.coverFile != nil && res != nil && res.Info != nil {
+		ctx.writeCover(res.Info)
+	}
 	completed := int(ctx.completed.Add(1))
 	if ctx.repeat > 0 && completed >= len(ctx.entries)*ctx.repeat {
 		ctx.done()
 	}
 	return true
+}
+
+// writeCover appends the newly seen coverage PCs from one program to coverFile
+// and fsyncs them to stable storage before the next (possibly crashing) program
+// runs. PCs are emitted raw (no PreviousInstructionPC adjustment): on Darwin the
+// executor already returns full kernel/KEXT PCs from Pishi/KextFuzz, and they are
+// canonicalized host-side, so this matches syz-manager's cover_log format.
+func (ctx *Context) writeCover(info *flatrpc.ProgInfo) {
+	collect := func(call *flatrpc.CallInfo) {
+		if call == nil {
+			return
+		}
+		for _, pc := range call.Cover {
+			if ctx.coverSeen[pc] {
+				continue
+			}
+			ctx.coverSeen[pc] = true
+			fmt.Fprintf(ctx.coverFile, "0x%x\n", pc)
+		}
+	}
+	ctx.coverMu.Lock()
+	defer ctx.coverMu.Unlock()
+	for _, call := range info.Calls {
+		collect(call)
+	}
+	collect(info.Extra)
+	if err := ctx.coverFile.Sync(); err != nil {
+		log.Logf(0, "failed to fsync cover file: %v", err)
+	}
 }
 
 // selectRange narrows entries (sorted oldest -> newest, so the last element is

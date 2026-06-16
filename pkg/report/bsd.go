@@ -26,7 +26,18 @@ func ctorBSD(cfg *config, oopses []*oops, symbolizeRes []*regexp.Regexp) (report
 	var symbols map[string][]symbolizer.Symbol
 	kernelObject := ""
 	if cfg.kernelDirs.Obj != "" {
-		kernelObject = filepath.Join(cfg.kernelDirs.Obj, cfg.target.KernelObject)
+		// Prefer the main kernel object path discovered by DiscoverModules, which
+		// honors the configurable kernel_obj_file name (e.g. a Darwin Boot Kernel
+		// Collection); fall back to the target's default file name otherwise.
+		for _, mod := range cfg.kernelModules {
+			if mod.Name == "" {
+				kernelObject = mod.Path
+				break
+			}
+		}
+		if kernelObject == "" {
+			kernelObject = filepath.Join(cfg.kernelDirs.Obj, cfg.target.KernelObject)
+		}
 		var err error
 		symbols, err = symbolizer.ReadTextSymbols(kernelObject)
 		if err != nil {

@@ -16,12 +16,22 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 )
 
-func DiscoverModules(target *targets.Target, objDir string, moduleObj []string) (
+func DiscoverModules(target *targets.Target, objDir, objFile string, moduleObj []string) (
 	[]*vminfo.KernelModule, error) {
-	module := &vminfo.KernelModule{
-		Path: filepath.Join(objDir, target.KernelObject),
+	// objFile overrides the target's default kernel object file name (e.g. a
+	// specific Boot Kernel Collection file on Darwin).
+	if objFile == "" {
+		objFile = target.KernelObject
 	}
-	textRange, err := elfReadTextSecRange(module)
+	module := &vminfo.KernelModule{
+		Path: filepath.Join(objDir, objFile),
+	}
+	readTextSecRange := elfReadTextSecRange
+	if target.OS == targets.Darwin {
+		// The Darwin kernel object is a Mach-O Boot Kernel Collection.
+		readTextSecRange = machoReadTextSecRange
+	}
+	textRange, err := readTextSecRange(module)
 	if err != nil {
 		return nil, err
 	}
