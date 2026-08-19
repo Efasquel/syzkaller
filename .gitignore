@@ -29,3 +29,12 @@ executor/syscalls.h
 
 .gemini/
 gha-creds-*.json
+
+# fuzz-session.py registry
+/sessions/
+
+# fuzz-campaign.py runtime state + launchd logs (defs under campaigns/ are kept)
+/campaigns/.state/
+
+# notes
+.notes/
