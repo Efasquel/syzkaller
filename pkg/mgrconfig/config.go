@@ -34,6 +34,17 @@ type Config struct {
 	// (VM-less); with VMs the built-in reproduction loop handles crash capture.
 	// Set to 0 (default) to disable.
 	RingBufferSize int `json:"ring_buffer_size,omitempty"`
+	// Process name to run the executor under. Some IOKit drivers only accept
+	// clients whose process name matches an expected userspace program, so the
+	// runner is launched from a copy of syz-executor renamed to this. Darwin
+	// derives the name from the executed file, but how much of it survives
+	// depends on which API the driver calls: p_comm keeps 16 bytes and is read
+	// by proc_selfname *and* the kernel proc_name() KPI (the common IOKit access
+	// check); proc_best_name/libproc keep ~31; proc_pidpath sees the full path.
+	// 16 bytes is the only length safe for every API. Only used when type is "none",
+	// where executors are launched externally rather than by the manager.
+	// Empty (default) runs syz-executor under its own name.
+	ExecutorName string `json:"executor_name,omitempty"`
 	// Refers to a directory. Optional.
 	// Each VM will get a recursive copy of the files that are present in workdir_template.
 	// VM config can then use these private copies as needed. The copy directory

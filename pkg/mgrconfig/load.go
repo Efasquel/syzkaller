@@ -153,6 +153,9 @@ func Complete(cfg *Config) error {
 			cfg.LogFile = filepath.Join(cfg.Workdir, cfg.LogFile)
 		}
 	}
+	if cfg.KextCoverage.CoverLog != "" && !filepath.IsAbs(cfg.KextCoverage.CoverLog) {
+		cfg.KextCoverage.CoverLog = filepath.Join(cfg.Workdir, cfg.KextCoverage.CoverLog)
+	}
 	if cfg.WorkdirTemplate != "" {
 		cfg.WorkdirTemplate = osutil.Abs(cfg.WorkdirTemplate)
 		if _, err := os.ReadDir(cfg.WorkdirTemplate); err != nil {
