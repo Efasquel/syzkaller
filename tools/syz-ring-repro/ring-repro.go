@@ -17,11 +17,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	stdlog "log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -54,6 +56,31 @@ var (
 		"(e.g. 1 selects up to n-1); 0 = most recent")
 	flagMerge = flag.String("merge", "", "concatenate the selected programs into a single program, write it "+
 		"to this file, and exit without executing")
+	flagStatic = flag.Bool("static", false, "when merging, statically drop calls that are inert by the "+
+		"IOKit/MIG contract (calls on unproduced/closed connections, double closes) before writing; "+
+		"this shrinks the trace so the on-device bisection triggers fewer reboots")
+	flagMinimizeConn = flag.Bool("minimize-conn", false, "reduce a program to its minimal crashing set of "+
+		"connections, on device: the positional arg is a merged/reduced program file (not a ring dir). Test "+
+		"subsets of the connections (each an open + its methods + close) to find the smallest that still "+
+		"crashes, checkpointing to <dir>/conn_state.json (crash-safe across reboots) and writing the culprit "+
+		"reproducer to <dir>/culprit.syz")
+	flagMinimizeCalls = flag.Bool("minimize-calls", false, "reduce a program to its minimal crashing set of "+
+		"IOConnectCallMethod calls, on device, keeping every open and close (an open produces the handle later "+
+		"calls need; a close can be the bug). Meant to run after -minimize-conn on the resulting culprit. "+
+		"Checkpoints to <dir>/call_state.json and writes the reduced reproducer to <dir>/culprit.syz")
+	flagEmitCulprit = flag.Bool("emit-culprit", false, "offline: read the checkpoint written by a prior "+
+		"-minimize-conn run (the positional arg is the same program file) and write the smallest known crashing "+
+		"subset to <dir>/culprit.syz, then exit. Runs nothing on device and never modifies conn_state.json. "+
+		"Exits non-zero if no crashing subset has been recorded yet, so a campaign can branch on it")
+	flagState = flag.String("state", "", "path to the connection-minimization checkpoint used by -minimize-conn "+
+		"and -emit-culprit; defaults to conn_state.json alongside the program file. The program file is still "+
+		"required (the checkpoint stores only masks; building the culprit needs the program to resolve them)")
+	flagCulprit = flag.String("culprit", "", "path to write the minimal reproducer produced by -minimize-conn "+
+		"and -emit-culprit; defaults to culprit.syz alongside the program file")
+	flagMaxK = flag.Int("max_k", 3, "with -minimize-conn, the largest culprit size searched by enumeration "+
+		"before falling back to ddmin halving. Enumeration costs sum(C(n,k)) cheap probes but crashes "+
+		"(and so reboots) only once, on the answer; halving crashes on nearly every reduction step. "+
+		"Raise it when reboots are slow relative to a probe, lower it when there are many connections")
 	flagCoverFile = flag.String("coverfile", "", "append newly seen coverage PCs to this file, fsync'd after "+
 		"every program so they survive a kernel panic; PCs are written raw (0x%x), matching syz-manager's cover_log")
 	flagKcovDevice = flag.String("kcov_device", "", "Darwin KEXT coverage device for Pishi/KextFuzz (e.g. "+
@@ -68,6 +95,12 @@ func main() {
 	}
 	defer tool.Init()()
 
+	// Drop the "YYYY/MM/DD HH:MM:SS" prefix from log lines: this tool's output is
+	// a one-shot triage report (merge / static-reduce / minimize), not a
+	// time-series, so the timestamps are noise. pkg/log prints via the stdlib
+	// logger, so clearing its flags here suffices without touching pkg/log.
+	stdlog.SetFlags(0)
+
 	if len(flag.Args()) != 1 {
 		flag.Usage()
 		os.Exit(1)
@@ -77,6 +110,27 @@ func main() {
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
 		tool.Fail(err)
+	}
+
+	// Connection-minimization and offline culprit emission both take a single
+	// program file, not a ring buffer dir.
+	if *flagEmitCulprit {
+		if err := runEmitCulprit(target, dir); err != nil {
+			tool.Failf("emit-culprit failed: %v", err)
+		}
+		return
+	}
+	if *flagMinimizeConn {
+		if err := runConnMinimize(target, dir); err != nil {
+			tool.Failf("minimize-conn failed: %v", err)
+		}
+		return
+	}
+	if *flagMinimizeCalls {
+		if err := runMinimizeCalls(target, dir); err != nil {
+			tool.Failf("minimize-calls failed: %v", err)
+		}
+		return
 	}
 
 	entries, err := loadRingBuffer(target, dir)
@@ -102,7 +156,7 @@ func main() {
 	}
 
 	if *flagMerge != "" {
-		if err := mergeEntries(target, entries, *flagMerge); err != nil {
+		if err := mergeEntries(target, entries, *flagMerge, *flagStatic); err != nil {
 			tool.Failf("merge failed: %v", err)
 		}
 		return
@@ -293,15 +347,53 @@ func selectRange(entries []slotEntry) ([]slotEntry, error) {
 // variables are renumbered across the whole sequence by Serialize, so a plain
 // append of the calls is sufficient. The result is a self-contained reproducer
 // candidate that can be replayed, minimized, or fed to syz-prog2c/syz-repro.
-func mergeEntries(target *prog.Target, entries []slotEntry, outFile string) error {
+func mergeEntries(target *prog.Target, entries []slotEntry, outFile string, static bool) error {
 	merged := &prog.Prog{Target: target}
+	start := 0
 	for _, e := range entries {
+		n := len(e.prog.Calls)
 		merged.Calls = append(merged.Calls, e.prog.Calls...)
+		// Show where each slot lands in the merged, 0-based call numbering so a
+		// dropped "call #N" below can be traced back to its source slot.
+		log.Logf(0, "  %s (id=%d): merged calls #%d..#%d", e.slot, e.id, start, start+n-1)
+		start += n
+	}
+	log.Logf(0, "\n")
+	// Round-trip to make sure the concatenation produced a valid program.
+	if _, err := target.Deserialize(merged.Serialize(), prog.NonStrict); err != nil {
+		return fmt.Errorf("merged program is invalid: %v", err)
+	}
+	total := len(merged.Calls)
+	if static {
+		// Serialize once (one line per call) so each drop can show the exact
+		// call text. Indices are 0-based into this merged (pre-reduction) program.
+		lines := strings.Split(string(merged.Serialize()), "\n")
+		reduced, removals := staticReduce(merged)
+		for _, r := range removals {
+			text := ""
+			if r.index < len(lines) {
+				text = strings.TrimSpace(lines[r.index])
+			}
+			log.Logf(0, "  static-reduce: DROP call #%d — %s", r.index, r.reason)
+			parts := strings.SplitN(text, ",", 3)
+
+			switch len(parts) {
+			case 1:
+				text = parts[0]
+			case 2:
+				text = parts[0] + "," + parts[1]
+			default:
+				text = parts[0] + "," + parts[1] + ", ...)"
+			}
+			log.Logf(0, "      └─ %s", text)
+		}
+		log.Logf(0, "\nstatic-reduce: removed %d/%d calls", len(removals), total)
+		merged = reduced
 	}
 	data := merged.Serialize()
-	// Round-trip to make sure the concatenation produced a valid program.
+	// Validate the final program that is actually written.
 	if _, err := target.Deserialize(data, prog.NonStrict); err != nil {
-		return fmt.Errorf("merged program is invalid: %v", err)
+		return fmt.Errorf("reduced program is invalid: %v", err)
 	}
 	if len(merged.Calls) > prog.MaxCalls {
 		log.Logf(0, "warning: merged program has %d calls, exceeding prog.MaxCalls=%d; "+
