@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,8 +107,14 @@ func runConnMinimize(target *prog.Target, progFile string) error {
 	if err != nil {
 		return fmt.Errorf("%w in %s", err, progFile)
 	}
-	return minimize(target, p, resolveStatePath(progFile, "conn_state.json"),
-		resolveCulpritPath(progFile), red)
+	culpritPath := resolveCulpritPath(progFile)
+	if err := minimize(target, p, resolveStatePath(progFile, "conn_state.json"),
+		culpritPath, red); err != nil {
+		return err
+	}
+	// minimize returns only when the culprit is written (a crashing probe reboots
+	// the box and kills the process mid-search), so it is safe to translate now.
+	return maybeEmitJSON(target, culpritPath)
 }
 
 // minimize searches the reduction on device for the smallest subset of units
@@ -123,7 +130,17 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		"then bisect if that isn't enough.", *flagMaxK, projectedProbes(red.n, *flagMaxK))
 	log.Logf(0, "Checkpoint: %s", statePath)
 
-	state := loadDdState(statePath, red.n, progHash(p), red.label)
+	// When a target signature + confirm command are supplied, gate the reboot-as-
+	// crash recovery on a matching panic report, so a second bug that fires during
+	// a probe is not misattributed to that subset (see gate.go).
+	var gate *crashGate
+	if *flagTargetSig != "" && *flagConfirmCmd != "" {
+		gate = &crashGate{targetSig: *flagTargetSig, confirmCmd: strings.Fields(*flagConfirmCmd)}
+		log.Logf(0, "Crash gating ON: only reboots confirmed as signature %s count as a repro",
+			*flagTargetSig)
+	}
+
+	state := loadDdState(statePath, red.n, progHash(p), red.label, gate)
 	logDdState(state)
 	// culprit.syz is only written when the search completes. Any file left from an
 	// earlier run describes a different (or abandoned) reduction, and a stale one
@@ -153,6 +170,7 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		// the box, and this fsync'd record is the only trace that survives to the
 		// next boot, where it is recovered as a crash.
 		state.Attempting = key
+		state.AttemptingAt = gateNow()
 		if err := saveDdState(statePath, state); err != nil {
 			tool.Failf("checkpoint: %v", err)
 		}
@@ -164,6 +182,7 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		// Reaching here means no kernel panic: this subset did not reproduce.
 		state.Memo[key] = false
 		state.Attempting = ""
+		state.AttemptingAt = 0
 		state.CleanMs += time.Since(probeStart).Milliseconds()
 		state.CleanProbes++
 		if err := saveDdState(statePath, state); err != nil {
@@ -214,6 +233,7 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 		log.Logf(0, "Re-checking culprit %v on its own, as the first program this boot ...", units)
 	}
 	state.Verifying = key
+	state.VerifyingAt = gateNow()
 	if err := saveDdState(statePath, state); err != nil {
 		tool.Failf("checkpoint: %v", err)
 	}
@@ -222,6 +242,7 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 	}
 	// Still here, so the culprit did not reproduce in isolation.
 	state.Verifying = ""
+	state.VerifyingAt = 0
 	state.VerifyFailed = append(state.VerifyFailed, key)
 	if err := saveDdState(statePath, state); err != nil {
 		tool.Failf("checkpoint: %v", err)

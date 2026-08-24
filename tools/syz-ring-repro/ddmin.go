@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -193,6 +194,12 @@ type ddState struct {
 	// VerifyFailed are masks that crashed during the search but did not crash on
 	// re-check. Recorded so verification is attempted once and cannot loop.
 	VerifyFailed []string `json:"verify_failed,omitempty"`
+	// AttemptingAt / VerifyingAt are the wall-clock epochs the in-flight
+	// Attempting / Verifying subset started running, so a crash gate can scope its
+	// panic-report scan to reports produced by that subset's reboot. Zero when
+	// nothing is pending, and on pre-gating checkpoints (which then bypass gating).
+	AttemptingAt float64 `json:"attempting_at,omitempty"`
+	VerifyingAt  float64 `json:"verifying_at,omitempty"`
 }
 
 // meanProbeMs is the average clean-probe cost measured so far, or 0 if nothing
@@ -260,7 +267,14 @@ func progHash(p *prog.Prog) string {
 //     panic (see atomicWriteJSON). Its Attempting mask is the crash the lost
 //     write existed to record, so it is recovered the same way. Without this,
 //     any checkpoint written before the fsync-the-directory fix is unreadable.
-func loadDdState(path string, nUnits int, hash, kind string) *ddState {
+// The optional gate (variadic so existing callers stay 4-arg) filters reboots
+// that reproduced a different bug than the target out of the recovered memo; a
+// nil/absent gate recovers every reboot as a crash, the original behavior.
+func loadDdState(path string, nUnits int, hash, kind string, gates ...*crashGate) *ddState {
+	var gate *crashGate
+	if len(gates) > 0 {
+		gate = gates[0]
+	}
 	fresh := &ddState{Kind: kind, NUnits: nUnits, ProgHash: hash, Memo: map[string]bool{}}
 	s := readDdState(path)
 	// A recorded kind that disagrees with a caller-asserted kind is a mismatch;
@@ -287,13 +301,13 @@ func loadDdState(path string, nUnits int, hash, kind string) *ddState {
 			delete(s.Memo, key)
 		}
 	}
-	s.recoverAttempt(s.Attempting, nUnits)
-	s.recoverVerify(s.Verifying, nUnits)
+	s.recoverAttempt(s.Attempting, s.AttemptingAt, nUnits, gate)
+	s.recoverVerify(s.Verifying, s.VerifyingAt, nUnits, gate)
 	// A lost rename leaves the pending checkpoint stranded in the temp file.
 	if tmp := readDdState(path + ".tmp"); tmp != nil && tmp.NUnits == nUnits && tmp.ProgHash == hash {
 		if newer(path+".tmp", path) {
-			s.recoverAttempt(tmp.Attempting, nUnits)
-			s.recoverVerify(tmp.Verifying, nUnits)
+			s.recoverAttempt(tmp.Attempting, tmp.AttemptingAt, nUnits, gate)
+			s.recoverVerify(tmp.Verifying, tmp.VerifyingAt, nUnits, gate)
 		}
 	}
 	return s
@@ -301,10 +315,20 @@ func loadDdState(path string, nUnits int, hash, kind string) *ddState {
 
 // recoverVerify records an in-flight verification as confirmed: the box went
 // down while re-running that subset on its own, which is exactly what the
-// re-check was looking for.
-func (s *ddState) recoverVerify(key string, nConns int) {
+// re-check was looking for. When gated, a reboot that produced a DIFFERENT bug's
+// report means the culprit did not cleanly reproduce the target, so verification
+// fails (recorded once) rather than confirming.
+func (s *ddState) recoverVerify(key string, at float64, nConns int, gate *crashGate) {
 	s.Verifying = ""
 	if !validMask(key, nConns) {
+		return
+	}
+	if gate.verdict(at) == gateOther {
+		if !slices.Contains(s.VerifyFailed, key) {
+			s.VerifyFailed = append(s.VerifyFailed, key)
+		}
+		log.Logf(0, "crash-gate: verification reboot for %s was a DIFFERENT crash than the "+
+			"target — verification failed", key)
 		return
 	}
 	s.VerifiedCrash = key
@@ -321,12 +345,20 @@ func validMask(key string, nConns int) bool {
 }
 
 // recoverAttempt records an in-flight mask as a crash: reaching load time with a
-// mask still pending means the box went down while testing it. It does not log —
-// loadDdState is also the read path for offline -emit-culprit, where per-mask
-// recovery chatter is noise; callers that want a summary call logDdState.
-func (s *ddState) recoverAttempt(key string, nConns int) {
+// mask still pending means the box went down while testing it. When gated, a
+// reboot whose report fingerprints to a DIFFERENT bug is recorded as a non-repro
+// (Memo=false) instead, so the search never minimizes toward the wrong crash.
+// It does not log per-mask (loadDdState is also the read path for offline
+// -emit-culprit), except when the gate positively filters a reboot.
+func (s *ddState) recoverAttempt(key string, at float64, nConns int, gate *crashGate) {
 	s.Attempting = ""
 	if !validMask(key, nConns) {
+		return
+	}
+	if gate.verdict(at) == gateOther {
+		s.Memo[key] = false
+		log.Logf(0, "crash-gate: reboot while testing %s was a DIFFERENT crash than the target "+
+			"— not counting it as a repro", key)
 		return
 	}
 	s.Memo[key] = true

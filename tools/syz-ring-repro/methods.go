@@ -95,6 +95,11 @@ func runMinimizeCalls(target *prog.Target, progFile string) error {
 		log.Logf(0, "Only one method call here, so there is nothing to pare down — it is "+
 			"essential. This run just re-checks it crashes on its own.")
 	}
-	return minimize(target, p, resolveStatePath(progFile, "call_state.json"),
-		resolveCulpritPath(progFile), red)
+	culpritPath := resolveCulpritPath(progFile)
+	if err := minimize(target, p, resolveStatePath(progFile, "call_state.json"),
+		culpritPath, red); err != nil {
+		return err
+	}
+	// See runConnMinimize: minimize returns only once the culprit is written.
+	return maybeEmitJSON(target, culpritPath)
 }

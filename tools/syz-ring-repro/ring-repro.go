@@ -77,6 +77,22 @@ var (
 		"required (the checkpoint stores only masks; building the culprit needs the program to resolve them)")
 	flagCulprit = flag.String("culprit", "", "path to write the minimal reproducer produced by -minimize-conn "+
 		"and -emit-culprit; defaults to culprit.syz alongside the program file")
+	flagEmitJSON = flag.Bool("emit-json", false, "read a minimized culprit and write the list of "+
+		"IOConnectCallMethod syscall names to disable (JSON) to <dir>/syscalls.json. Alone it is an offline mode "+
+		"reading the positional culprit; combined with -minimize-conn/-minimize-calls/-emit-culprit it emits the "+
+		"list right after that mode writes the culprit, so one command minimizes and translates. Feeds "+
+		"syz-manager's disable_syscalls — a name-level list, so it disables a generic call's every selector at "+
+		"once (single-selector suppression would need an executor guard, out of scope)")
+	flagJSONOut = flag.String("json-out", "", "path to write the -emit-json list; defaults to "+
+		"syscalls.json alongside the program file")
+	flagTargetSig = flag.String("target_sig", "", "with -minimize-*, the crash signature the predicate must "+
+		"confirm before counting a reboot as a repro. Requires -confirm_cmd. When unset, any reboot counts "+
+		"(original behavior); when set, a reboot whose panic report fingerprints to a DIFFERENT bug is not "+
+		"attributed to the subset — so a second bug firing during a probe cannot misdirect the search")
+	flagConfirmCmd = flag.String("confirm_cmd", "", "command that classifies a reboot for -target_sig. Invoked "+
+		"as <confirm_cmd> <target_sig> <since_epoch>; it should print 'match' / 'none' (both counted as the "+
+		"target crash) or 'other <sig>' (a different bug — not counted). Typically "+
+		"'python3 scripts/crash_fingerprint.py match-since --dir <panic-dir>'")
 	flagMaxK = flag.Int("max_k", 3, "with -minimize-conn, the largest culprit size searched by enumeration "+
 		"before falling back to ddmin halving. Enumeration costs sum(C(n,k)) cheap probes but crashes "+
 		"(and so reboots) only once, on the answer; halving crashes on nearly every reduction step. "+
@@ -118,8 +134,14 @@ func main() {
 		if err := runEmitCulprit(target, dir); err != nil {
 			tool.Failf("emit-culprit failed: %v", err)
 		}
+		// -emit-json may ride along: translate the culprit just written.
+		if err := maybeEmitJSON(target, resolveCulpritPath(dir)); err != nil {
+			tool.Failf("emit-json failed: %v", err)
+		}
 		return
 	}
+	// -minimize-* honor -emit-json internally (they emit once the culprit is
+	// written), so a single command can minimize and translate.
 	if *flagMinimizeConn {
 		if err := runConnMinimize(target, dir); err != nil {
 			tool.Failf("minimize-conn failed: %v", err)
@@ -129,6 +151,14 @@ func main() {
 	if *flagMinimizeCalls {
 		if err := runMinimizeCalls(target, dir); err != nil {
 			tool.Failf("minimize-calls failed: %v", err)
+		}
+		return
+	}
+	// Standalone: -emit-json with no minimize/emit-culprit mode reads the
+	// positional culprit directly.
+	if *flagEmitJSON {
+		if err := runEmitSyscalls(target, dir); err != nil {
+			tool.Failf("emit-json failed: %v", err)
 		}
 		return
 	}
