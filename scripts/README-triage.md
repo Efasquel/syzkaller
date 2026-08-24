@@ -17,8 +17,11 @@ The tools:
 | tool | role |
 |---|---|
 | `bin/darwin_arm64/syz-ring-repro` | merge + minimize a ring buffer to `culprit.syz` |
+| `bin/darwin_arm64/syz-ring-repro -emit-json` | translate a `culprit.syz` into a `syscalls.json` list of names to disable |
 | `scripts/crash_fingerprint.py` | fingerprint a panic report; dedup across reboots |
 | `scripts/triage.py` | orchestrate merge → minimize → done, capturing panics |
+| `scripts/fuzz-campaign.py exclude` | bench the culprit's syscall(s) in the crashed config |
+| `scripts/fuzz-campaign.py include` | rotate benched syscalls back into the config (inverse of exclude) |
 
 ---
 
@@ -139,6 +142,104 @@ $RR -emit-culprit -state $D/conn_state.json -culprit $D/candidate.syz $D/merged.
 The state file stores only bitmasks, so the **program file is still required**
 (it resolves a mask back into calls). Use the same program the stage ran on.
 
+### Crash gating (don't minimize toward the wrong bug)
+
+The minimizer's crash signal is **reboot-as-crash**: a subset that panics the box
+is recovered as a repro on the next boot. On its own that counts *any* reboot —
+so a *second* bug that fires during a probe would be misattributed to that subset
+and the search would minimize toward the wrong crash.
+
+Gating fixes this. Give `syz-ring-repro` the target signature and a confirm
+command; after each reboot it checks whether a fresh panic report actually
+fingerprints to the target before counting it:
+
+```sh
+$RR -minimize-conn \
+    -target_sig <sig> \
+    -confirm_cmd "python3 scripts/crash_fingerprint.py match-since --dir /Library/Logs/DiagnosticReports" \
+    $D/merged.syz
+```
+
+`syz-ring-repro` appends `<target_sig> <since_epoch>` and reads the verdict:
+`match`/`none` count as the target crash (a genuine repro whose report we can't
+read is never dropped); `other <sig>` means a **different** bug rebooted, so that
+subset is recorded as a non-repro instead. Unset `-target_sig` = original
+behavior (any reboot counts). `triage.py` and the campaign coordinator pass these
+flags automatically once the target signature is known — the coordinator pins it
+up front (`--target-sig`), so gating is active from the first subset.
+
+### Bench the culprit's syscall, then rotate it back
+
+This is **not** permanent suppression. When one syscall is crash-dominating, you
+bench it (`exclude`) so coverage on the rest can build; once that coverage
+plateaus you rotate it back in (`include`) and bench the next one. Two steps:
+
+- **Translate** — `syz-ring-repro -emit-json` reads the culprit and writes a
+  `syscalls.json` list of the surviving `IOConnectCallMethod` names to disable
+  (an offline mode next to `-emit-culprit`; runs nothing on device). It lists
+  *names*: a per-selector variant (`...UserClient_5`) is disabled exactly, while
+  the generic variant (`...$AppleJPEGDriver`, whose selector is a fuzzable
+  argument) can only be disabled wholesale — it warns when that happens.
+- **Apply** — `fuzz-campaign.py exclude` / `include` own the *strategy* (which
+  config, when, how to resume) and edit `disable_syscalls`.
+
+```sh
+# bench the culprit's syscall so fuzzing can proceed on the rest:
+scripts/fuzz-campaign.py exclude <campaign> $D/culprit.syz [--config <cfg>] [--dry-run]
+#   runs syz-ring-repro -emit-json, then adds each name to disable_syscalls
+#   (no recompile). Exit 0. A generic call is disabled wholesale, with a warning.
+
+# rotate benched syscalls back in once their absence has paid off:
+scripts/fuzz-campaign.py include <campaign> <syscall...>   [--config <cfg>] [--dry-run]
+scripts/fuzz-campaign.py include <campaign> --all          # un-bench everything
+```
+
+To just produce the list without touching a config, run the mode directly:
+`bin/darwin_arm64/syz-ring-repro -emit-json $D/culprit.syz` (writes `$D/syscalls.json`).
+`-emit-json` also composes onto a minimize stage, so one command minimizes **and**
+translates — it emits the list the moment the culprit is written:
+
+```sh
+$RR -minimize-calls -emit-json $D/culprit.syz   # → culprit.syz + syscalls.json
+```
+
+`disable_syscalls` is applied by syz-manager *after* `enable_syscalls` and
+subtracts, so a name added there is benched whether the config enabled it by
+name or via a `*` glob.
+
+### Autonomous: the campaign drives the whole loop
+
+`fuzz-campaign.py` ties the stages together so the pipeline runs hands-off across
+reboots. It is a two-phase machine — **fuzzing** and **triaging** — both durable
+via its single launchd agent (one relaunch per crash-reboot):
+
+```
+fuzzing ──crash──▶ fingerprint the panic
+                     │ already-benched signature → resume fuzzing (same config)
+                     │ new signature ▼
+                  triaging ─── drive triage.py across reboots ──▶ culprit.syz
+                     │  bench it: -emit-json → exclude (disable_syscalls)
+                     │  record the signature so it is never re-triaged
+                     ▼
+                  resume fuzzing
+```
+
+On a new bug the campaign pauses fuzzing, stands up a triage job from the
+session's ring buffer, and on each boot advances it (`triage.py run`) until DONE;
+then it benches the culprit's syscall(s) in the crashed config and resumes. If
+triage can't reach a culprit within `triage_max_boots` advances, the campaign
+halts with a reason for a human to look. `status` shows the phase:
+
+```sh
+scripts/fuzz-campaign.py status <campaign>   # phase, triage job, benched sigs
+```
+
+Triage device flags (executor, ringrepro, kcov_device, kext_id, sandbox, max_k)
+come from an optional `"triage": { … }` object in the campaign definition JSON;
+omit it and triage uses its own defaults. **Rotation** (`include` a benched
+syscall back once coverage plateaus) is still manual — plateau detection is not
+wired yet.
+
 ### Fingerprint a panic by hand
 
 ```sh
@@ -157,6 +258,7 @@ Under `triage/<name>/`:
 | `merged.syz` | ring buffer merged + statically reduced |
 | `conn_state.json` / `call_state.json` | per-stage crash-safe checkpoints (bitmasks) |
 | `culprit.syz` | the minimal, verified reproducer |
+| `syscalls.json` | list of syscall names to disable, from the culprit (`-emit-json`) |
 | `signatures.json` | dedup ledger: one entry per distinct panic signature |
 | `reports/` | archived panic reports |
 
