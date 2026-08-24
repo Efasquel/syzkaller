@@ -225,6 +225,27 @@ def run_merge(st):
     save_job(st)
 
 
+def gate_args(st):
+    """syz-ring-repro crash-gate flags, when a target signature is known.
+
+    Gating requires the target signature, set either at job creation (--target-sig
+    from the coordinator) or by the first reconciled panic. Until then minimize
+    runs ungated (any reboot counts) — correct for the very first crash, which is
+    what establishes the target. The gate makes syz-ring-repro confirm each later
+    reboot against that signature (via crash_fingerprint.py match-since) so a
+    second bug firing during a probe cannot misdirect the search.
+    """
+    sig = st.get("target_signature")
+    if not sig:
+        return []
+    dirs = []
+    for d in PANIC_DIRS:
+        dirs += ["--dir", str(d)]
+    confirm = "%s %s match-since %s" % (
+        sys.executable, SCRIPT_DIR / "crash_fingerprint.py", " ".join(dirs))
+    return ["-target_sig", sig, "-confirm_cmd", confirm]
+
+
 def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     """Drive one on-device minimization stage to completion for this boot.
 
@@ -237,7 +258,7 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     state_json = job_dir(st) / state_name
     culprit = job_dir(st) / "culprit.syz"
     cmd = ringrepro_cmd(st, flag, "-state", str(state_json),
-                        "-culprit", str(culprit), str(prog))
+                        "-culprit", str(culprit), *gate_args(st), str(prog))
     log("%s: %s" % (stage, " ".join(cmd)))
     rc = subprocess.run(cmd).returncode
     # Reconcile any panic this run produced (it may have rebooted us on a prior
@@ -313,7 +334,8 @@ def _print_summary(st):
 
 # --- job authoring + inspection ----------------------------------------------
 def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
-            sandbox, max_k, os_name, arch, from_off, to_off, force):
+            sandbox, max_k, os_name, arch, from_off, to_off, force,
+            target_sig=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if state_path(name).exists() and not force:
         die("triage job %s already exists (use --force to overwrite)" % name)
@@ -348,7 +370,10 @@ def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
         "to": to_off,
         "stage": "MERGE",
         "panic_watermark": time.time(),   # ignore panics from before the job
-        "target_signature": None,
+        # A caller (the coordinator) can pin the target signature up front so the
+        # crash gate is active from the first subset; otherwise the first
+        # reconciled panic sets it.
+        "target_signature": target_sig,
         "incidents": [],
         "created_at": now_iso(),
     }
@@ -472,6 +497,8 @@ def main():
                    help="ring range start (offset back from newest); -1 = oldest")
     n.add_argument("--to", dest="to_off", type=int, default=0,
                    help="ring range end (offset back from newest); 0 = newest")
+    n.add_argument("--target-sig", dest="target_sig", default=None,
+                   help="pin the crash signature to gate minimization on (else the first panic sets it)")
     n.add_argument("--force", action="store_true")
 
     for cmd, helptext in (("run", "advance the job as far as this boot allows"),
@@ -486,7 +513,8 @@ def main():
     if args.cmd == "new":
         cmd_new(args.name, args.ring, args.executor, args.ringrepro,
                 args.kcov_device, args.kext_id, args.sandbox, args.max_k,
-                args.os_name, args.arch, args.from_off, args.to_off, args.force)
+                args.os_name, args.arch, args.from_off, args.to_off, args.force,
+                args.target_sig)
     elif args.cmd == "run":
         cmd_run(args.name)
     elif args.cmd == "status":

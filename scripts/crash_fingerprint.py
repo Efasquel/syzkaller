@@ -17,12 +17,19 @@ produce the same signature; different bugs do not.
 """
 
 import argparse
+import glob as globmod
 import hashlib
 import json
 import os
 import re
 import sys
 from datetime import datetime, timezone
+
+# For `match-since` (the syz-ring-repro crash gate): report globs + a grace
+# window so a report written a second or two before the recorded "since" (clock
+# skew across the crash-reboot) is still considered.
+MATCH_GLOBS = ("*.panic", "*.ips", "*.kernel.core.log")
+MATCH_SLACK_SECONDS = 2.0
 
 # --- PAC canonicalization ---------------------------------------------------
 CANONICAL_MASK = (1 << 56) - 1
@@ -336,6 +343,54 @@ def cmd_classify(args):
     sys.exit(0 if saw_new else 1)
 
 
+def cmd_match_since(args):
+    """Classify the reboots since a timestamp against a target signature.
+
+    The syz-ring-repro crash gate calls this after a subset's reboot to decide
+    whether that reboot reproduced the TARGET bug. Prints exactly one verdict and
+    always exits 0:
+        match          a report fingerprinting to <target> appeared
+        other <sig>    reports appeared, none matched -> a different bug
+        none           no fingerprintable report -> caller counts it as a crash
+
+    'match' and 'none' both let the caller count the reboot as the target crash;
+    only a positively-identified different bug ('other') is filtered out. Keeping
+    the bias here means a genuine repro whose report we could not read is never
+    dropped.
+    """
+    since = args.since - MATCH_SLACK_SECONDS
+    dirs = args.dir or ["/Library/Logs/DiagnosticReports"]
+    seen = {}
+    for d in dirs:
+        for g in MATCH_GLOBS:
+            for path in globmod.glob(os.path.join(d, g)):
+                name = os.path.basename(path)
+                if name.startswith("."):
+                    continue
+                try:
+                    mt = os.stat(path).st_mtime
+                except OSError:
+                    continue
+                if mt > since:
+                    seen[path] = mt
+
+    sigs = []
+    for path in sorted(seen, key=seen.get):
+        try:
+            fp = fingerprint(path)
+        except Exception:  # noqa: BLE001 - a bad report must not break the gate
+            continue
+        if fp.get("signature"):
+            sigs.append(fp["signature"])
+
+    if not sigs:
+        print("none")
+    elif args.target in sigs:
+        print("match")
+    else:
+        print("other %s" % sigs[-1])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -355,6 +410,13 @@ def main():
     pc.add_argument("--json", action="store_true")
     pc.add_argument("--dry-run", action="store_true", help="do not write the store")
     pc.set_defaults(func=cmd_classify)
+
+    pm = sub.add_parser("match-since",
+                        help="classify reboots since an epoch against a target signature (crash gate)")
+    pm.add_argument("target", help="target crash signature to confirm")
+    pm.add_argument("since", type=float, help="unix epoch; only reports newer than this count")
+    pm.add_argument("--dir", action="append", help="panic report dir (repeatable)")
+    pm.set_defaults(func=cmd_match_since)
 
     args = ap.parse_args()
     if not getattr(args, "func", None):

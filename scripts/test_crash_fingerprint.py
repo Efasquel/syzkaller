@@ -99,5 +99,57 @@ class Store(unittest.TestCase):
         self.assertEqual(store["signatures"]["bbb"]["count"], 1)
 
 
+class MatchSince(unittest.TestCase):
+    """The crash gate's match-since verdict (fingerprint stubbed by path)."""
+
+    def _run(self, tmp, files_by_sig, target, since):
+        # files_by_sig: {filename: (signature, mtime)}. Write each and map its
+        # path to that signature via a stubbed fingerprint.
+        from argparse import Namespace
+        from io import StringIO
+        from unittest import mock
+        import contextlib
+
+        path_sig = {}
+        for fname, (sig, mtime) in files_by_sig.items():
+            p = os.path.join(tmp, fname)
+            with open(p, "w") as f:
+                f.write("report")
+            os.utime(p, (mtime, mtime))
+            path_sig[os.path.abspath(p)] = sig
+
+        def fake_fp(path):
+            return {"signature": path_sig.get(os.path.abspath(path))}
+
+        out = StringIO()
+        args = Namespace(target=target, since=since, dir=[tmp])
+        with mock.patch.object(cf, "fingerprint", fake_fp), \
+             contextlib.redirect_stdout(out):
+            cf.cmd_match_since(args)
+        return out.getvalue().strip()
+
+    def test_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            v = self._run(d, {"a.panic": ("SIGT", 1000.0)}, target="SIGT", since=900.0)
+            self.assertEqual(v, "match")
+
+    def test_other(self):
+        with tempfile.TemporaryDirectory() as d:
+            v = self._run(d, {"a.panic": ("SIGX", 1000.0)}, target="SIGT", since=900.0)
+            self.assertEqual(v, "other SIGX")
+
+    def test_none_when_all_older(self):
+        with tempfile.TemporaryDirectory() as d:
+            # mtime well before since - slack => not considered.
+            v = self._run(d, {"a.panic": ("SIGT", 100.0)}, target="SIGT", since=900.0)
+            self.assertEqual(v, "none")
+
+    def test_slack_window_includes_just_before(self):
+        with tempfile.TemporaryDirectory() as d:
+            # 1s before since is within the 2s grace window => counted.
+            v = self._run(d, {"a.panic": ("SIGT", 899.0)}, target="SIGT", since=900.0)
+            self.assertEqual(v, "match")
+
+
 if __name__ == "__main__":
     unittest.main()
