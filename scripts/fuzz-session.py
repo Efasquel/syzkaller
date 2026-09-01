@@ -66,6 +66,10 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import timefmt  # noqa: E402
+from fsutil import hardlink_or_copy  # noqa: E402
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 CONFIG_DIR = REPO_ROOT / "config"
@@ -152,37 +156,112 @@ def warn(msg):
     print("warning: %s" % msg, file=sys.stderr)
 
 
+# now_iso and now_ts used to be two different clocks -- UTC-with-Z and local --
+# so one event was logged at 15:41:48Z and filed under 20260831-174148. They now
+# share timefmt's local clock and can no longer drift apart.
 def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return timefmt.now_iso()
 
 
 def now_ts():
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    return timefmt.now_ts()
 
 
 def _iso_epoch(iso):
-    """A registry UTC ISO string (now_iso format) -> epoch, or None."""
-    if not iso:
-        return None
-    try:
-        return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return None
+    """A registry timestamp -> epoch, or None. Tolerant of the legacy UTC 'Z'
+    form still present in older session records."""
+    return timefmt.to_epoch(iso)
 
 
 def _epoch_iso(epoch):
-    return datetime.fromtimestamp(epoch).isoformat() if epoch else "unknown"
+    return timefmt.fmt_epoch(epoch, default="unknown")
 
 
-def pid_alive(pid):
+_BOOT_EPOCH = None
+
+
+def boot_epoch():
+    """Seconds-since-epoch of the current boot, or None if it can't be read.
+
+    Used to invalidate pids recorded before a reboot. On a box that panics and
+    reboots constantly, pid reuse is not a corner case: a session record written
+    before the panic names a pid the OS has since handed to something else.
+    """
+    global _BOOT_EPOCH
+    if _BOOT_EPOCH is None:
+        try:
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, timeout=5).stdout
+            m = re.search(r"sec\s*=\s*(\d+)", out)
+            _BOOT_EPOCH = int(m.group(1)) if m else False
+        except (OSError, ValueError, subprocess.SubprocessError):
+            _BOOT_EPOCH = False
+    return _BOOT_EPOCH or None
+
+
+def pid_alive(pid, rec_boot=None):
+    """Is `pid` live AND the same process we recorded?
+
+    `rec_boot` is the boot epoch stored alongside the pid. If it disagrees with
+    the current boot, the recorded process died in the panic and this pid now
+    belongs to someone else -- report it dead. Without that guard a stale record
+    reads as "running" after every panic-reboot, and the stop path would signal
+    (and killpg) whatever unrelated process inherited the number.
+    """
     if not pid:
         return False
+    if rec_boot is not None:
+        cur = boot_epoch()
+        if cur is not None and int(rec_boot) != cur:
+            return False
     try:
         os.kill(int(pid), 0)
         return True
     except (OSError, ValueError):
         return False
+
+
+def pid_start_epoch(pid):
+    """When `pid`'s process actually started, or None if it can't be read."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=5).stdout.strip()
+        if not out:
+            return None
+        return datetime.strptime(out, "%a %b %d %H:%M:%S %Y").timestamp()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def state_pid_alive(state):
+    """pid_alive for a session record, with two identity guards.
+
+    boot_epoch catches the common case (the box panicked, rebooted, and the pid
+    was handed to something else). Records written before that field existed fall
+    back to comparing the process's real start time against the session's --
+    which also catches pid reuse *within* one boot, e.g. a long-lived registry
+    entry whose manager died hours ago.
+    """
+    state = state or {}
+    pid = state.get("pid")
+    if not pid_alive(pid, state.get("boot_epoch")):
+        return False
+    if state.get("boot_epoch") is not None:
+        return True
+    started = state.get("started_at")
+    proc_started = pid_start_epoch(pid)
+    if not started or proc_started is None:
+        return True                      # can't tell; don't invent a death
+    rec = timefmt.to_epoch(started)
+    if rec is None:
+        return True
+    # The record is written right after the spawn, so our manager's start time and
+    # started_at agree to within seconds. Compare in BOTH directions: pid reuse
+    # after a panic-reboot produces a process NEWER than the record, not older, so
+    # a one-sided ">= rec" test would wave it straight through.
+    return abs(proc_started - rec) <= 120
 
 
 def state_file(sid):
@@ -340,6 +419,48 @@ def session_exec_lifetime(workdir):
             total += int(last.group(1))
             seen = True
     return total if seen else ""
+
+
+# ---- panic report intake ----------------------------------------------------
+# A panic report is written by the OS into a directory the OS also rotates, and
+# it is evidence three different consumers want: the run's snapshot, the crash
+# bundle, and the bug dossier that becomes a vendor report. Copying it into each
+# triples ~1.5MB per report; referencing it from each leaves every consumer
+# pointing at a file macOS is free to delete.
+#
+# So: copy ONCE into workdir/reports/ (the intake), and hardlink from everywhere
+# else. A hardlink has no owner -- every name is equal and the data survives
+# until the last one goes -- so pruning or rotating any single location cannot
+# break the others, and the extra names cost no blocks.
+#
+# The one thing never linked is a kernel core (*.kernel.core.gz, ~220MB): those
+# exist to be reclaimed by prune_cores, and a link would keep the blocks alive
+# while the prune reported success. Cores stay referenced by path in manifests.
+# hardlink_or_copy lives in fsutil, shared with the bug registry.
+REPORTS_SUBDIR = "reports"
+
+
+def reports_intake(workdir):
+    return Path(workdir) / REPORTS_SUBDIR
+
+
+def intake_report(workdir, src):
+    """Bring one panic report under the workdir, out of the OS-rotated directory.
+
+    Idempotent, and read-only once taken: annotating a report in place would
+    retroactively change every snapshot that links it, so notes belong in a
+    sidecar. Returns the intake path (the copy every other consumer links to).
+    """
+    src = Path(src)
+    dst = reports_intake(workdir) / src.name
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        try:
+            os.chmod(dst, 0o444)
+        except OSError:
+            pass                     # read-only is a guard rail, not a requirement
+    return dst
 
 
 def artifacts_root(state):
@@ -584,7 +705,7 @@ def refresh_status(sid):
     state = load_state(sid)
     if not state:
         return None
-    if state.get("status") == "running" and not pid_alive(state.get("pid")):
+    if state.get("status") == "running" and not state_pid_alive(state):
         state["status"] = "crashed"
         state["stopped_at"] = now_iso()
         save_state(state)
@@ -616,11 +737,12 @@ def cmd_inspect(target):
     out = {
         "id": sid, "found": True,
         "status": state.get("status"),
-        "pid": state.get("pid"), "pid_alive": pid_alive(state.get("pid")),
+        "pid": state.get("pid"), "pid_alive": state_pid_alive(state),
         "config": state.get("config"), "workdir": workdir,
         "run_started": _epoch_iso(started) if started else None,
         "run_started_epoch": started,
         "exec_total": et if et != "" else None,
+        "coverage": int(stats["coverage"]) if stats.get("coverage") not in ("", None) else None,
         "rate": stats.get("rate") if stats.get("rate") != "" else None,
         "reports": [str(p) for p in reports],
         "panic_evidence": bool(panics),
@@ -734,7 +856,8 @@ def launch_executor(state, index, port):
         sys.stderr.write("".join(open(logf).readlines()[-10:]))
         die("failed to start executor %d" % index)
     state.setdefault("executors", []).append(
-        {"pid": proc.pid, "index": index, "scratch": str(scratch), "log": logf})
+        {"pid": proc.pid, "boot_epoch": boot_epoch(), "index": index,
+         "scratch": str(scratch), "log": logf})
     named = ""
     if binary != EXECUTOR_BIN:
         named = " as '%s'" % binary.name
@@ -773,7 +896,7 @@ def stop_executors(state):
     execs = state.get("executors", [])
     for e in execs:
         pid = e.get("pid")
-        if pid_alive(pid):
+        if pid_alive(pid, e.get("boot_epoch")):
             try:
                 os.killpg(os.getpgid(int(pid)), signal.SIGINT)
             except OSError:
@@ -784,35 +907,90 @@ def stop_executors(state):
     time.sleep(1)
     for e in execs:
         pid = e.get("pid")
-        if pid_alive(pid):
+        if pid_alive(pid, e.get("boot_epoch")):
             try:
                 os.kill(int(pid), signal.SIGKILL)
             except OSError:
                 pass
         scratch = e.get("scratch")
-        if scratch and Path(scratch).is_dir():
-            shutil.rmtree(scratch, ignore_errors=True)
+        if scratch:
+            retire_scratch(scratch)   # rename now, delete out of band
     if execs:
         print("  stopped %d executor(s)" % len(execs))
     state["executors"] = []
 
 
 def live_executors(state):
-    return [e for e in state.get("executors", []) if pid_alive(e.get("pid"))]
+    return [e for e in state.get("executors", [])
+            if pid_alive(e.get("pid"), e.get("boot_epoch"))]
+
+
+# A scratch dir holds one `syzkaller.XXXXXX` subdir PER EXECUTED PROGRAM, so a
+# long run leaves millions of them. Deleting that inline made `stop` take minutes
+# -- during which the manager was still running and the state file still said
+# "running", which reads as a hung stop. So retire by rename (O(1)) and delete
+# out of band.
+TRASH_PREFIX = "syz-trash-"
+
+
+def retire_scratch(path):
+    """Move a scratch dir aside instantly; return its trash path (or None).
+
+    os.rename within one filesystem is O(1) no matter how many entries are
+    inside, so the caller can update state and move on. Falls back to a blocking
+    delete only if the rename is impossible (e.g. cross-device).
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return None
+    trash = EXEC_SCRATCH_BASE / ("%s%s-%d" % (TRASH_PREFIX, path.name, int(time.time() * 1000)))
+    try:
+        os.rename(str(path), str(trash))
+        return trash
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        return None
+
+
+def reap_trash(background=True):
+    """Delete retired scratch dirs. Returns the number of trees handed off.
+
+    The speed win is the rename in retire_scratch, not this: measured on 20k
+    entries, `rm -rf` and shutil.rmtree are within a second of each other. `rm` is
+    used because it can be detached (start_new_session) and outlive this process,
+    which is what lets `stop` return immediately. An interrupted reap is harmless
+    -- the leftover trash dir is picked up by the next stop/clean.
+    """
+    trees = [d for d in EXEC_SCRATCH_BASE.glob("%s*" % TRASH_PREFIX) if d.is_dir()]
+    if not trees:
+        return 0
+    cmd = ["/bin/rm", "-rf"] + [str(d) for d in trees]
+    try:
+        if background:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        else:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        for d in trees:
+            shutil.rmtree(d, ignore_errors=True)
+    return len(trees)
 
 
 def clean_scratch(sid):
-    """Remove every executor scratch dir for a session id (glob on the id).
+    """Retire every executor scratch dir for a session id (glob on the id).
 
     Catches orphans left behind when executors are killed or a run is superseded
     without a clean stop. The trailing '-' in the glob keeps it from matching a
     different session whose id is a prefix of this one. Caller must ensure no
     tracked executor of this session is still using one of these dirs.
+
+    Renames rather than deletes; call reap_trash() to do the actual removal.
     """
     removed = 0
     for d in sorted(EXEC_SCRATCH_BASE.glob("syz-exec-%s-*" % sid)):
         if d.is_dir():
-            shutil.rmtree(d, ignore_errors=True)
+            retire_scratch(d)
             removed += 1
     return removed
 
@@ -1110,7 +1288,7 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
             if other == sid:
                 continue
             st = refresh_status(other)
-            if st and st.get("status") == "running" and pid_alive(st.get("pid")):
+            if st and st.get("status") == "running" and state_pid_alive(st):
                 die("session '%s' is already running (pid %s).\n"
                     "Only one session can run at a time: they would contend for the "
                     "kcov device (%s) and http %s.\n"
@@ -1206,7 +1384,8 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     exec_count = executors if executors is not None else DEFAULT_EXECUTORS
     state = {
         "id": sid, "config": str(cfg), "workdir": workdir, "http": http,
-        "status": "running", "pid": proc.pid, "bench": bench, "stdout": logf,
+        "status": "running", "pid": proc.pid, "boot_epoch": boot_epoch(),
+        "bench": bench, "stdout": logf,
         "started_at": now_iso(), "stopped_at": None, "run_count": run_count,
         "exec_count": exec_count, "executors": [],
     }
@@ -1241,12 +1420,15 @@ def stop_one(sid):
     if not state:
         die("no such session: %s" % sid)
     pid = state.get("pid")
-    if not pid_alive(pid):
+    boot = state.get("boot_epoch")   # a pid from a previous boot is not ours to kill
+    if not pid_alive(pid, boot):
         print("'%s' is not running" % sid)
         stop_executors(state)  # reap any orphaned executors + scratch dirs
         if state.get("status") == "running":
             state["status"] = "crashed"
         save_state(state)
+        clean_scratch(sid)
+        reap_trash()
         return
     # Stop executors first so they detach cleanly before the manager goes away.
     stop_executors(state)
@@ -1257,22 +1439,25 @@ def stop_one(sid):
     except OSError:
         pass
     waited = 0
-    while pid_alive(pid) and waited < STOP_TIMEOUT:
+    while pid_alive(pid, boot) and waited < STOP_TIMEOUT:
         time.sleep(1)
         waited += 1
-    if pid_alive(pid):
+    if pid_alive(pid, boot):
         warn("still alive after %ds; sending SIGTERM" % STOP_TIMEOUT)
         try:
             os.kill(int(pid), signal.SIGTERM)
         except OSError:
             pass
         time.sleep(2)
-    if pid_alive(pid):
+    if pid_alive(pid, boot):
         warn("still alive; sending SIGKILL")
         try:
             os.kill(int(pid), signal.SIGKILL)
         except OSError:
             pass
+    # Record the stop BEFORE any cleanup: the scratch trees are millions of
+    # entries, and a state file that still says "running" while a delete grinds
+    # away is exactly what makes a stop look hung.
     state["status"] = "stopped"
     state["stopped_at"] = now_iso()
     save_state(state)
@@ -1280,6 +1465,9 @@ def stop_one(sid):
     orphans = clean_scratch(sid)
     if orphans:
         print("  cleaned %d orphaned executor scratch dir(s)" % orphans)
+    trees = reap_trash()
+    if trees:
+        print("  deleting %d retired scratch tree(s) in the background" % trees)
     print("  stopped '%s'" % sid)
 
 
@@ -1315,7 +1503,7 @@ def cmd_resume(target, executors=None, allow_concurrent=False, force=False):
 def cmd_restart(target, executors=None, allow_concurrent=False, force=False):
     sid = resolve_id(target)
     state = load_state(sid)
-    if state and pid_alive(state.get("pid")):
+    if state and state_pid_alive(state):
         stop_one(sid)
     cmd_resume(sid, executors=executors, allow_concurrent=allow_concurrent,
                force=force)
@@ -1326,7 +1514,7 @@ def cmd_exec_start(target, count):
     state = refresh_status(sid)
     if not state:
         die("no such session: %s" % sid)
-    if state.get("status") != "running" or not pid_alive(state.get("pid")):
+    if state.get("status") != "running" or not state_pid_alive(state):
         die("session '%s' is not running; start it first" % sid)
     before = len(live_executors(state))
     start_executors(state, before + count)
@@ -1365,7 +1553,7 @@ def cmd_list():
         http = state.get("http", "")
         print(fmt_row((
             sid, state.get("status", "?"),
-            pid if pid_alive(pid) else "-",
+            pid if state_pid_alive(state) else "-",
             len(live_executors(state)),
             rl["exec total"] or m["exec total"] or "-", rl["rate"] or "-",
             rl["coverage"] or m["coverage"] or "-",
@@ -1415,7 +1603,7 @@ def status_lines(sid, rawcover=False):
     # interaction). Only query the live /rawcover when explicitly asked, since
     # its first hit triggers manager-side coverage init (logs + symbolization).
     bb = None
-    if rawcover and state.get("status") == "running" and pid_alive(state.get("pid")):
+    if rawcover and state.get("status") == "running" and state_pid_alive(state):
         n = rawcover_count(state.get("http"))
         if n is not None:
             bb = "%s (rawcover, live -- triggered manager cover init)" % n
@@ -1544,7 +1732,7 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
 
     copied, skipped = [], []
 
-    def grab(src, subdir=""):
+    def grab(src, subdir="", link=False):
         if not src:
             return
         src = Path(src)
@@ -1556,6 +1744,8 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
         try:
             if src.is_dir():
                 shutil.copytree(src, d / src.name, dirs_exist_ok=True)
+            elif link:
+                hardlink_or_copy(src, d / src.name)
             else:
                 shutil.copy2(src, d / src.name)
             copied.append(str(src))
@@ -1576,7 +1766,7 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     grab(cover_log_path(state), "cover")
     for arch in cover_log_archives(workdir):
         grab(arch, "cover")
-    if state.get("status") == "running" and pid_alive(state.get("pid")):
+    if state.get("status") == "running" and state_pid_alive(state):
         rc = rawcover_text(state.get("http"))
         if rc is not None:
             (dest / "cover").mkdir(parents=True, exist_ok=True)
@@ -1586,10 +1776,29 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     # Self-contained replay material (user opted in; may be large).
     grab(workdir / "corpus.db")
     grab(workdir / "ring_buffer")
+    # The grammar tree is already deduplicated by fingerprint (save_grammar keeps
+    # one directory per distinct description set), so linking it costs nothing
+    # and keeps the bundle self-contained.
     grab(workdir / "grammar")               # descriptions the run used (save_grammar)
 
+    # Panic reports: take them under the workdir once, then link. Previously each
+    # snapshot copied every report in its window -- 5.7MB of the 6.6MB bundle in a
+    # real run -- and cited files in an OS-rotated directory.
+    linked = 0
     for r in reports:
-        grab(r, "reports")
+        try:
+            kept = intake_report(workdir, r)
+        except OSError as e:
+            skipped.append("%s (%s)" % (r, e))
+            continue
+        d = dest / "reports"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            if hardlink_or_copy(kept, d / kept.name):
+                linked += 1
+            copied.append(str(r))
+        except OSError as e:
+            skipped.append("%s (%s)" % (r, e))
 
     # Manifest: status snapshot + what was gathered + a run-log tail.
     log = latest_run_log(workdir)
@@ -1632,7 +1841,9 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     (dest / "manifest.txt").write_text("\n".join(manifest) + "\n")
 
     print("%s  %s" % (style(kind, "bold"), dest))
-    print("  gathered  : %d item(s)" % len(copied))
+    print("  gathered  : %d item(s)%s"
+          % (len(copied),
+             "  (%d report(s) hardlinked, no extra disk)" % linked if linked else ""))
     print("  panic logs: %s" % (", ".join(panics) if panics else "none"))
     if reports and not panics:
         print("  other     : %s (context only, not panic evidence)"
@@ -1970,7 +2181,7 @@ def cmd_lint():
         if not st:
             continue
         running = st.get("status") == "running"
-        alive = pid_alive(st.get("pid"))
+        alive = state_pid_alive(st)
         if running and alive:
             live.add(sid)
         elif running and not alive:
@@ -2019,6 +2230,9 @@ def cmd_clean(target):
     if state and state.get("status") == "running":
         die("'%s' is running; its executor scratch is in use. Stop it first." % sid)
     n = clean_scratch(sid)
+    # An explicit `clean` should not return until the space is actually back, so
+    # reap in the foreground here (still `rm -rf`, not a Python walk).
+    reap_trash(background=False)
     print("removed %d executor scratch dir(s) for '%s'" % (n, sid))
 
 
@@ -2027,7 +2241,7 @@ def cmd_snapshot(target, label):
     state = load_state(sid)
     if not state:
         die("no such session: %s" % sid)
-    if state.get("status") == "running" and pid_alive(state.get("pid")):
+    if state.get("status") == "running" and state_pid_alive(state):
         warn("session is running; corpus.db may be captured mid-write. "
              "Stop it first for a guaranteed-consistent snapshot.")
     m = bench_metrics(latest_bench(state["workdir"]))
@@ -2061,7 +2275,7 @@ def cmd_restore(target, name):
     state = refresh_status(sid)
     if not state:
         die("no such session: %s" % sid)
-    if state.get("status") == "running" and pid_alive(state.get("pid")):
+    if state.get("status") == "running" and state_pid_alive(state):
         die("'%s' is running; stop it before restoring" % sid)
     workdir = state["workdir"]
     src = snapshot_root(workdir) / name
