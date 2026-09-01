@@ -5,6 +5,9 @@
 *.img
 workdir*
 
+# macOS
+.DS_Store
+
 bin/
 syz-cluster/bin/
 dashboard/app/config_prod.go
@@ -34,7 +37,13 @@ gha-creds-*.json
 /sessions/
 
 # fuzz-campaign.py runtime state + launchd logs (defs under campaigns/ are kept)
-/campaigns/.state/
+/campaigns/
+
+# triage.py runtime state
+/triage/
 
 # notes
 .notes/
+
+# test
+.test/
