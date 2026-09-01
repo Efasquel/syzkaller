@@ -30,9 +30,13 @@ Commands:
   install <name> / uninstall <name>   generate + (un)load the launchd plist
 """
 import argparse
+import atexit
 import fcntl
+import getpass
 import json
 import os
+import pwd
+import re
 import shutil
 import subprocess
 import sys
@@ -44,22 +48,39 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SESSION = SCRIPT_DIR / "fuzz-session.py"
 TRIAGE = SCRIPT_DIR / "triage.py"
+BUG_REGISTRY = SCRIPT_DIR / "bug_registry.py"
 CAMPAIGN_DIR = REPO_ROOT / "campaigns"
 STATE_DIR = CAMPAIGN_DIR / ".state"
+# The reportable bug inventory (bug_registry dossiers + registry.json). It is
+# deliberately NOT under a session's workdir: bug_registry dedups by bug_key
+# ("<driver>:<method>:<fault-class>"), and the same bug is re-found by every
+# config of that driver, by later campaigns, and after every rebuild. Per-workdir
+# storage would restart the counter each time and mint a fresh BUG-000N id for a
+# bug already filed -- destroying the dedup that is the point of the tool. (The
+# manual campaign's BUG-0001..0004 span seven separate sessions.) Session-scoped
+# evidence -- panic bundles, ring buffers, culprits -- does live in the workdir;
+# the dossiers cite it by path.
+BUGS_DIR = CAMPAIGN_DIR / "bugs"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
+import quarantine as qm  # noqa: E402
+import timefmt  # noqa: E402
+from tablefmt import tabulate  # noqa: E402
 
 # `syz-ring-repro -emit-json` translates a minimized culprit into the list of
 # IOConnectCallMethod syscall names to disable (JSON). Prefer the built binary;
 # fall back to `go run` so the step works in a dev tree with no bin/.
 RINGREPRO_BIN = Path(os.environ.get("SYZ_RINGREPRO", REPO_ROOT / "bin/darwin_arm64/syz-ring-repro"))
 
-# Where kernel cores/panics land; SYZ_PANIC_DIR mirrors fuzz-session.py so the
-# two agree. The *.gz cores are the ~220MB space hogs we prune.
+# Where kernel cores/panics land. These MUST match fuzz-session.py and triage.py
+# (same two dirs, same two env overrides), or the driver fingerprints a different
+# set of reports than the session that produced them. DiagnosticReports holds the
+# *.panic/*.ips; /private/var/tmp/kernel_panics holds the *.kernel.core.gz -- the
+# ~220MB space hogs prune_cores reclaims.
 PANIC_DIRS = [
     Path(os.environ.get("SYZ_PANIC_DIR", "/Library/Logs/DiagnosticReports")),
-    Path("/Library/Logs/DiagnosticReports/kernel_panics"),
+    Path(os.environ.get("SYZ_KERNEL_PANIC_DIR", "/private/var/tmp/kernel_panics")),
 ]
 CORE_GLOBS = ("*.kernel.core.gz", "*.kernel.core.log")
 
@@ -71,21 +92,198 @@ DEFAULTS = {
     "max_crashes": 20,          # total incidents before the breaker halts
     "min_free_gb": 20.0,        # halt if root disk drops below this
     "keep_cores": 3,            # cores retained after pruning
-    "crashloop_window_seconds": 120,   # a run shorter than this is a "fast" crash
-    "crashloop_limit": 5,       # this many consecutive fast crashes => halt
+    # The crash-loop breaker exists to catch a PATHOLOGICAL loop -- a config that
+    # cannot fuzz at all (manager dies on startup, corpus poisoned so the very
+    # first program re-panics) -- not productive fuzzing. On this target a healthy
+    # run panics the box every 30-110s, so the old 120s/5 pairing halted a working
+    # campaign within ten minutes of its first real bug. 20s is below anything that
+    # managed to execute programs; a startup failure dies in about a second.
+    "crashloop_window_seconds": 20,   # a run shorter than this never fuzzed anything
+    "crashloop_limit": 15,      # this many consecutive such crashes => halt
     "triage_max_boots": 40,     # give up (halt) if triage can't reach a culprit in this many advances
+    # Which clock --budget measures. "fuzz" charges only time the manager spent
+    # executing programs; "wall" also charges minimization and reboot overhead.
+    # The literature quotes 24h runs both ways, so both totals are always kept and
+    # this only picks which one the budget test reads.
+    "budget_clock": "fuzz",
+    # Cap on the launchd-captured log. One real campaign produced 7.0MB across
+    # 119,299 lines, of which 33,267 were per-probe minimizer chatter -- the
+    # coordinator's own decisions were unreadable inside it, and `tail -f` on the
+    # combined stream was useless exactly when it mattered.
+    "max_log_mb": 25.0,
+    # A gap between the driver's last save and the next boot is reboot overhead.
+    # Capped, because an unbounded gap is not overhead -- it is the rig sitting
+    # idle while you were asleep, and charging that would make the wall clock a
+    # measure of your schedule rather than the campaign's.
+    "max_boot_gap_seconds": 900.0,
 }
+
+BUDGET_CLOCKS = ("fuzz", "wall")
 
 
 # --- small utilities ---------------------------------------------------------
 def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Stored form: local time with its offset (2026-09-01T14:56:39+02:00).
+
+    Was UTC-with-Z, which read two hours off your wall clock in Paris summer
+    time and disagreed with the local stamps used for directory names."""
+    return timefmt.now_iso()
+
+
+# The driver's own decisions, separated from the subprocess output launchd
+# captures. Everything log() writes goes to BOTH: stdout (interleaved with
+# syz-ring-repro's per-probe chatter, useful for forensics) and this file (the
+# coordinator's narrative alone, which is what you actually want to `tail -f`).
+_coord_log = None
+
+
+def open_coord_log(name):
+    """Start mirroring log() into <name>.coordinator.log. Best effort."""
+    global _coord_log
+    path = STATE_DIR / ("%s.coordinator.log" % name)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        rotate_log(path, DEFAULTS["max_log_mb"], own_fd=True)
+        _coord_log = open(path, "a")
+        atexit.register(_close_coord_log)
+    except OSError:
+        _coord_log = None
+    return path
+
+
+def _close_coord_log():
+    global _coord_log
+    if _coord_log is not None:
+        try:
+            _coord_log.close()
+        except OSError:
+            pass
+        _coord_log = None
+
+
+def rotate_log(path, max_mb, own_fd=False):
+    """Keep a log under max_mb.
+
+    own_fd=True: we are the only writer, so rename to .1 (one generation kept).
+    own_fd=False: launchd holds the descriptor and renaming would leave it
+    appending to the rotated file forever, so truncate in place instead -- with
+    O_APPEND the next write lands at the new EOF.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= max_mb * 1024 * 1024:
+            return False
+        if own_fd:
+            path.replace(Path(str(path) + ".1"))
+        else:
+            os.truncate(str(path), 0)
+        return True
+    except OSError:
+        return False
 
 
 def log(msg):
     """Timestamped line to stdout -- launchd captures it to the campaign log."""
-    sys.stdout.write("%s  %s\n" % (now_iso(), msg))
+    line = "%s  %s\n" % (timefmt.stamp(), msg)
+    sys.stdout.write(line)
     sys.stdout.flush()
+    if _coord_log is not None:
+        try:
+            _coord_log.write(line)
+            _coord_log.flush()
+        except OSError:
+            pass
+
+
+# --- the brake ---------------------------------------------------------------
+# A file whose existence stops the campaign. It exists because every other stop
+# needs something to be working: `halt` needs a shell, the crash-loop breaker
+# needs the driver to be running, and neither survives a box that panics its way
+# through login. The brake is checked before anything else the driver does, and
+# it is a FILE so it can be set from macOS Recovery -- boot ⌘R, open Terminal,
+# and touch it on the mounted Data volume. Names are deliberately short and
+# uppercase: you may be typing this at 3am on a rescue keyboard.
+GLOBAL_BRAKE = REPO_ROOT / "STOP"
+
+
+def brake_paths(name):
+    """(global, per-campaign) brake file paths."""
+    return GLOBAL_BRAKE, STATE_DIR / ("%s.brake" % name)
+
+
+def brake_held(name):
+    """(path, reason) if a brake is set, else None. Any content is the reason,
+    so `echo "boot loop 03:12" > STOP` leaves a note from your past self."""
+    for p in brake_paths(name):
+        try:
+            if p.exists():
+                try:
+                    why = p.read_text().strip()[:500]
+                except OSError:
+                    why = ""
+                return str(p), why
+        except OSError:
+            continue
+    return None
+
+
+def recovery_hint():
+    """The brake path as it appears from macOS Recovery, where the Data volume is
+    mounted under /Volumes/<name> - Data rather than at /."""
+    vol = "Macintosh HD"
+    try:
+        out = subprocess.run(["diskutil", "info", "/"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+        m = re.search(r"Volume Name:\s*(.+)", out or "")
+        if m:
+            vol = m.group(1).strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return '/Volumes/%s - Data%s' % (vol, GLOBAL_BRAKE)
+
+
+def wall_seconds(s):
+    """Total time this campaign has been the rig's occupant: fuzzing, plus the
+    minimization it took to explain a crash, plus the reboots those crashes
+    cost. Excludes time halted or idle -- nothing accrues while no driver runs."""
+    return (s.get("active_seconds", 0.0) + s.get("triage_seconds", 0.0)
+            + s.get("overhead_seconds", 0.0))
+
+
+def budget_spent(s, d):
+    """The clock --budget is measured against (see DEFAULTS["budget_clock"])."""
+    return wall_seconds(s) if d.get("budget_clock") == "wall" else s.get("active_seconds", 0.0)
+
+
+def fmt_hms(sec):
+    sec = int(max(0.0, sec or 0.0))
+    return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
+
+
+# The per-config clocks above are a BUDGET, so they reset when a config's budget
+# is spent and the campaign advances. The lifetime totals below never reset, so
+# "how long did this campaign run?" survives every advance and every wrap. Losing
+# that is why a finished 2h run reported active_seconds 0.0.
+LIFETIME_CLOCKS = {"active_seconds": "total_active_seconds",
+                   "triage_seconds": "total_triage_seconds",
+                   "overhead_seconds": "total_overhead_seconds"}
+
+
+def roll_budget_clocks(s):
+    """Bank the current config's clocks into the lifetime totals, then zero them
+    for the next config. Call this instead of assigning active_seconds = 0."""
+    for cur, tot in LIFETIME_CLOCKS.items():
+        s[tot] = s.get(tot, 0.0) + s.get(cur, 0.0)
+        s[cur] = 0.0
+    s["run_active_base"] = 0.0
+
+
+def lifetime(s, key):
+    """A clock's campaign-lifetime value: banked totals plus the current config."""
+    return s.get(LIFETIME_CLOCKS[key], 0.0) + s.get(key, 0.0)
+
+
+def lifetime_wall(s):
+    return sum(lifetime(s, k) for k in LIFETIME_CLOCKS)
 
 
 def die(msg):
@@ -172,7 +370,13 @@ def load_def(name):
 def init_state(name):
     return {
         "name": name, "status": "running", "cursor": 0,
-        "active_seconds": 0.0, "session_id": None, "current_config": None,
+        # Three disjoint clocks; wall_seconds() is their sum. Keeping them apart
+        # is what lets a writeup say "24h fuzzing, 31h wall, of which 4h
+        # minimization" instead of picking one number and hiding the rest.
+        "active_seconds": 0.0,      # manager executing programs
+        "triage_seconds": 0.0,      # minimizing a culprit (not fuzzing)
+        "overhead_seconds": 0.0,    # observed panic-reboot gaps
+        "session_id": None, "current_config": None,
         "run_started": None, "last_exec_total": None,
         "crashes": 0, "hangs": 0, "consec_fast_crashes": 0,
         "incidents": [], "started_at": now_iso(), "updated_at": now_iso(),
@@ -181,8 +385,79 @@ def init_state(name):
         # the box to triage, benches the culprit, then resumes fuzzing.
         "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
         "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
-        "panic_sig_watermark": 0.0,
+        # Start the watermark at the newest report that already exists, so the
+        # campaign's first crash fingerprints one fresh panic instead of replaying
+        # every historical report in the dir (they are ~2MB each).
+        "panic_sig_watermark": _newest_report_mtime(),
     }
+
+
+def _is_dir(p):
+    """is_dir() that answers False instead of raising.
+
+    pathlib only swallows "not there" errors (ENOENT/ENOTDIR/...); EACCES
+    propagates. doctor probes paths that belong to other users by design, so
+    every probe here has to be permission-proof.
+    """
+    try:
+        return Path(p).is_dir()
+    except OSError:
+        return False
+
+
+def _exists(p):
+    try:
+        return Path(p).exists()
+    except OSError:
+        return False
+
+
+def _has_any(dpath, globs):
+    """Does dpath contain at least one entry matching any of `globs`?
+
+    NOT `any(dpath.glob(g) for g in globs)` -- glob returns a generator, which is
+    truthy whether or not it yields anything, so that form answers True for an
+    empty directory.
+    """
+    for g in globs:
+        try:
+            if next(iter(Path(dpath).glob(g)), None) is not None:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# Delimited by NON-hex bytes, not by newlines: in a Go binary the -ldflags -X
+# string sits between NULs, so line anchors never match.
+_REV_RE = re.compile(rb"[^0-9a-f]([0-9a-f]{40}\+?)[^0-9a-f]")
+
+
+def _binary_revision(path):
+    """The git revision the Makefile stamped into a Go binary, or None."""
+    try:
+        blob = Path(path).read_bytes()
+    except OSError:
+        return None
+    hits = {m.group(1).decode() for m in _REV_RE.finditer(blob)}
+    # Other 40-hex strings can occur; the dirty marker is what a locally built
+    # tree stamps, so prefer it and only fall back when there is exactly one.
+    dirty = sorted(h for h in hits if h.endswith("+"))
+    return dirty[0] if dirty else (sorted(hits)[0] if len(hits) == 1 else None)
+
+
+def _newest_report_mtime():
+    newest = 0.0
+    for dpath in PANIC_DIRS:
+        if not dpath.is_dir():
+            continue
+        for g in PANIC_REPORT_GLOBS:
+            for p in dpath.glob(g):
+                try:
+                    newest = max(newest, p.stat().st_mtime)
+                except OSError:
+                    pass
+    return newest
 
 
 # Fields added after a campaign's first run; backfill so old state files load.
@@ -190,6 +465,10 @@ COORDINATOR_DEFAULTS = {
     "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
     "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
     "panic_sig_watermark": 0.0,
+    # Clocks added after the first campaigns ran; absent in their state files.
+    "triage_seconds": 0.0, "overhead_seconds": 0.0,
+    "total_active_seconds": 0.0, "total_triage_seconds": 0.0,
+    "total_overhead_seconds": 0.0,
 }
 
 
@@ -257,6 +536,9 @@ def record_incident(s, d, kind, info):
     fast = (kind == "crash" and ran_for is not None
             and ran_for < d["crashloop_window_seconds"])
     s["consec_fast_crashes"] = s["consec_fast_crashes"] + 1 if fast else 0
+    if ran_for:
+        s["active_seconds"] = s.get("run_active_base", 0.0) + ran_for
+        s["run_active_base"] = s["active_seconds"]
     if kind == "crash":
         s["crashes"] += 1
     else:
@@ -381,7 +663,9 @@ def begin_triage(s, d, sig):
     s["triage_job"] = job
     s["triage_bug_sig"] = sig
     s["triage_boots"] = 0
-    log("NEW bug %s -> triaging as job %s (fuzzing paused)" % (sig, job))
+    # Not necessarily new -- the quarantine only sends confirmed recurrences and
+    # escapes here, so say what it is rather than implying a first sighting.
+    log("triaging %s as job %s (fuzzing paused)" % (sig, job))
     return True
 
 
@@ -403,6 +687,29 @@ def _bench_culprit(s, culprit):
         log("already benched in %s: %s" % (cfg.name, n))
 
 
+def route_triage_panics(st, campaign=None, config=None):
+    """Catalog the panics that minimization itself produced.
+
+    A subset that reproduces the bug panics the box, and triage.py files that
+    panic in the JOB's ledger -- nothing routed it to the bug inventory. For the
+    target signature that is merely redundant, but a DIFFERENT bug surfacing
+    during minimization was recorded only as a triage incident and never appeared
+    as a reportable bug at all. route_one dedups by report basename, so
+    re-routing something already filed is a no-op.
+    """
+    for inc in (st or {}).get("incidents", []):
+        rep = inc.get("report")
+        if not rep:
+            continue
+        for dpath in PANIC_DIRS:
+            cand = dpath / rep
+            if _exists(cand):
+                # Caused by the minimizer re-running a known-crashing subset, not
+                # found by fuzzing: filed as evidence, not counted as a sighting.
+                route_bug_registry(str(cand), campaign, config, origin="triage")
+                break
+
+
 def advance_triage(s, d):
     """One boot's worth of triage. On DONE: bench the culprit + resume fuzzing.
     Counts advances and halts the campaign if triage cannot reach a culprit."""
@@ -414,6 +721,7 @@ def advance_triage(s, d):
     # Count the advance BEFORE running triage: a crashing subset reboots the box
     # and kills us mid-run, and the launchd relaunch must not retry forever.
     s["triage_boots"] += 1
+    advance_started = time.time()
     if s["triage_boots"] > d["triage_max_boots"]:
         s["status"] = "halted"
         s["halt_reason"] = ("triage stuck on %s after %d boots (job %s)"
@@ -425,20 +733,46 @@ def advance_triage(s, d):
     log("triage advance %d/%d for job %s"
         % (s["triage_boots"], d["triage_max_boots"], job))
     triage("run", job)
+    # Charge this advance to the triage clock. A crashing subset reboots the box
+    # mid-run and we never get here -- that lost interval is reboot overhead, and
+    # reconcile_gap picks it up on the next boot.
+    s["triage_seconds"] = s.get("triage_seconds", 0.0) + (time.time() - advance_started)
 
     st = triage_state(job)
-    if not st or st.get("stage") != "DONE":
-        stage = st.get("stage") if st else "?"
+    route_triage_panics(st, s.get("name"), s.get("current_config"))
+    stage = st.get("stage") if st else "?"
+    if not st or stage not in ("DONE", "STUCK"):
         log("triage %s at stage %s; will advance again" % (job, stage))
         time.sleep(d["poll_seconds"])
         return
 
-    culprit = st.get("final_culprit")
-    if culprit and Path(culprit).exists():
-        _bench_culprit(s, culprit)
-    else:
-        log("triage %s DONE but no culprit file; benching skipped" % job)
+    # STUCK is a result, not a failure: minimization proved that no subset
+    # reproduces alone, so the bug needs accumulated state. Bench the culprit's
+    # selectors anyway -- quarantine exists to keep fuzzing productive, and the
+    # smallest sequence seen to crash is still the best evidence we have -- but
+    # say plainly that it is unproven, and record it as unverified so the dossier
+    # never presents a lead as a reproducer.
+    verified = stage == "DONE"
+    if not verified:
+        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
+        log("  benching its selectors anyway so fuzzing can continue, but the "
+            "reproducer is UNVERIFIED -- it is a lead, not a proof")
+
+    culprit = st.get("final_culprit") or st.get("conn_culprit")
     sig = s.get("triage_bug_sig")
+    cfg = s.get("current_config")
+    if culprit and Path(culprit).exists() and sig and cfg:
+        quarantine_apply_culprit(s, sig, cfg, culprit)
+        # Write the reproducer back into the bug inventory. The quarantine knows
+        # the culprit and triage holds the .syz, but the dossier -- the thing that
+        # becomes a vendor report -- knew neither, and reported method: None.
+        attribute_bug(sig, culprit, job, verified)
+    else:
+        log("triage %s %s but missing culprit/sig/config; suppression skipped"
+            % (job, stage))
+    # The quarantine owns the disable/rotate decision, but the campaign still
+    # records which signatures it has spent a triage on -- that is what `status`
+    # reports and what makes a re-triage of the same bug visible.
     if sig and sig not in s["suppressed_sigs"]:
         s["suppressed_sigs"].append(sig)
     s["phase"] = "fuzzing"
@@ -446,7 +780,9 @@ def advance_triage(s, d):
     s["triage_bug_sig"] = None
     s["triage_boots"] = 0
     save_state(s)
-    log("triage %s COMPLETE; bug %s benched; resuming fuzzing" % (job, sig))
+    log("triage %s %s; bug %s benched (%s); resuming fuzzing"
+        % (job, "COMPLETE" if verified else "STUCK", sig,
+           "verified reproducer" if verified else "UNVERIFIED lead"))
 
 
 # --- the loop ----------------------------------------------------------------
@@ -456,6 +792,19 @@ def ensure_running(s, cfg):
     Returns the inspect dict for the (now running) session. Resets the
     per-run exec-total baseline so the hang detector starts clean.
     """
+    # The running config must reflect the current quarantine state (a fresh
+    # escalation or a rotation changed disable_syscalls). Apply before start/resume
+    # so syz-manager reads it and FilterCandidates prunes the corpus accordingly.
+    try:
+        apply_disabled(cfg, load_qstate(cfg))
+    except RuntimeError as e:
+        log("quarantine apply skipped for %s: %s" % (config_id(cfg), e))
+    # New run: exec_total resets to 0, so reset the coverage-stall rotation clock.
+    s["q_last_cover"] = None
+    s["q_cover_exec_mark"] = 0
+    # Baseline for this run: active_seconds is recomputed as base + elapsed, never
+    # incremented, so partial intervals count and nothing is double counted.
+    s["run_active_base"] = s.get("active_seconds", 0.0)
     sid = config_id(cfg)
     info = inspect(sid)
     if info.get("found") and info.get("status") == "running" and info.get("pid_alive"):
@@ -480,6 +829,57 @@ def ensure_running(s, cfg):
     return info
 
 
+def handle_crash(s, d, info):
+    """The coordinator work owed after a crash, shared by BOTH detection paths.
+
+    This target reboots on every panic, so almost every crash is discovered by
+    reconcile_boot on the next boot -- NOT by supervise. Keeping this logic only
+    in the supervise branch made it unreachable in practice: a real 2h run took
+    10 crashes and produced zero quarantine decisions, no bug-registry entries
+    and no triage, because every one of them arrived through reconcile_boot.
+
+    Returns True if the campaign flipped to the triaging phase.
+    """
+    panics = info.get("panics", [])
+    log("crash: %d panic report(s); bug inventory -> %s" % (len(panics), BUGS_DIR))
+    for pth in panics:
+        # provenance: which run found it, so one deduped inventory can still be
+        # sliced per campaign (bug_registry list --campaign <name>)
+        route_bug_registry(pth, s.get("name"), s.get("current_config"))
+    sig = latest_panic_signature(s)
+    if not sig:
+        log("crash: no readable panic signature; resuming without a decision")
+        return False
+    if quarantine_decide(s, sig) != "triage":
+        return False
+    return begin_triage(s, d, sig)
+
+
+def reconcile_gap(s, d):
+    """Charge the interval since the driver last saved to reboot overhead.
+
+    The driver dies with the box, so the panic-to-login interval is invisible to
+    every other clock. Measuring it is the difference between "the campaign ran
+    2h" and "the campaign ran 2h and spent 40m rebooting to do it" -- and on a
+    target that panics every 40s, that gap is a real fraction of the run."""
+    prev = s.get("updated_at")
+    if not prev:
+        return
+    then = timefmt.to_epoch(prev)   # tolerates the legacy 'Z' form on disk
+    if then is None:
+        return
+    gap = time.time() - then
+    if gap <= 0:
+        return
+    cap = d.get("max_boot_gap_seconds", DEFAULTS["max_boot_gap_seconds"])
+    if gap > cap:
+        log("gap of %s since the last checkpoint exceeds the %s reboot cap; "
+            "counting the cap and treating the rest as idle"
+            % (fmt_hms(gap), fmt_hms(cap)))
+        gap = cap
+    s["overhead_seconds"] = s.get("overhead_seconds", 0.0) + gap
+
+
 def reconcile_boot(s, d):
     """Handle a run the driver was supervising when it was killed (panic-reboot).
 
@@ -502,6 +902,8 @@ def reconcile_boot(s, d):
     log("boot reconcile: %s ended uncollected -> %s" % (sid, kind))
     record_incident(s, d, kind, info)
     collect_and_prune(s, d, kind)
+    if kind == "crash":
+        handle_crash(s, d, info)   # may flip phase to triaging; the loop honours it
     save_state(s)
 
 
@@ -529,7 +931,11 @@ def supervise(s, d, sid, budget):
         now = time.time()
         if not info.get("found") or not info.get("pid_alive"):
             return "crash" if info.get("panic_evidence") else "hang"
-        s["active_seconds"] += poll
+        started = info.get("run_started_epoch")
+        if started:
+            s["active_seconds"] = s.get("run_active_base", 0.0) + max(0.0, now - started)
+        else:                                   # no run start on record; fall back
+            s["active_seconds"] += poll
         et = info.get("exec_total")
         if et is not None and et != last_et:
             last_et = et
@@ -538,7 +944,12 @@ def supervise(s, d, sid, budget):
         elif et is not None and (now - last_progress) >= hang_after:
             log("hang: exec_total stuck at %s for %ds" % (et, round(now - last_progress)))
             return "hang"
-        if s["active_seconds"] >= budget:
+        # SOFT-group rotation: advancing the disabled set needs a manager restart
+        # (it re-reads disable_syscalls), so surface it as an outcome the loop
+        # handles by re-applying the config and resuming the same config.
+        if quarantine_rotate_due(s):
+            return "rotate"
+        if budget_spent(s, d) >= budget:
             return "budget"
         # breaker can trip mid-run (disk), so re-check each poll
         reason = breaker(s, d)
@@ -560,6 +971,28 @@ def cmd_run(name):
     except OSError:
         log("another driver for %r is already running; exiting" % name)
         return
+    # The brake is checked FIRST, before the state is even read, because its whole
+    # purpose is to stop a box that keeps panicking -- including one that panics
+    # as soon as fuzzing resumes. Anything we do before this is something the
+    # brake failed to prevent.
+    held = brake_held(name)
+    if held:
+        path, why = held
+        log("BRAKE: %s" % path)
+        if why:
+            log("  reason: %s" % why)
+        log("  remove the file and run: fuzz-campaign.py resume %s" % name)
+        s = load_state(name)
+        s["status"] = "halted"
+        s["halt_reason"] = "brake: %s" % (why or path)
+        save_state(s)
+        return                      # exit 0: KeepAlive{SuccessfulExit:false} stays down
+    coord_path = open_coord_log(name)
+    # The launchd-captured stream is shared with every subprocess, so we cannot
+    # rotate it by rename -- truncate it in place when it gets out of hand.
+    if rotate_log(STATE_DIR / ("%s.launchd.log" % name), d["max_log_mb"]):
+        log("launchd log exceeded %.0fMB and was truncated (decisions are kept "
+            "in %s)" % (d["max_log_mb"], coord_path))
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
         s.setdefault(k, v)
@@ -569,12 +1002,37 @@ def cmd_run(name):
         return
     log("campaign %r starting: %d config(s), %.1fh budget each, loop=%s, phase=%s"
         % (name, len(d["items"]), d["budget_hours"], d["loop"], s["phase"]))
+    # Where the three ledgers live. They are campaign-scoped, not session-scoped,
+    # on purpose -- see the note on BUGS_DIR.
+    log("  bug inventory : %s" % BUGS_DIR)
+    log("  quarantine    : %s/quarantine_<config-id>.json" % STATE_DIR)
+    log("  triage jobs   : %s" % (REPO_ROOT / "triage"))
+    log("  decisions log : %s" % coord_path)
+    # Printed on every start so the stop path is in the log you will already be
+    # reading when the box starts misbehaving -- not only in the setup doc.
+    log("  brake (stop)  : touch %s" % GLOBAL_BRAKE)
+    # Whatever killed the last driver -- a panic-reboot mid-fuzz or mid-triage --
+    # the interval since its last checkpoint is overhead this campaign paid.
+    # Charged before any phase branching, because both phases lose the box.
+    reconcile_gap(s, d)
     # In triaging phase there is no fuzzing session to reconcile; the box is
     # (or was) running triage, resumed by the phase branch below.
     if s["phase"] != "triaging":
         reconcile_boot(s, d)
 
     while True:
+        # `fuzz-campaign.py halt` writes the status into the state FILE. Only
+        # supervise re-read it, so a halt was ignored for as long as the campaign
+        # sat in the triaging phase -- and advance_triage's own save_state then
+        # overwrote it from stale memory, silently un-halting the campaign.
+        persisted = load_state(name)
+        if persisted.get("status") == "halted":
+            s["status"] = "halted"
+            s["halt_reason"] = persisted.get("halt_reason")
+            save_state(s)
+            log("campaign halted by user%s"
+                % (": %s" % s["halt_reason"] if s.get("halt_reason") else ""))
+            return
         reason = breaker(s, d)
         if reason:
             s["status"] = "halted"
@@ -594,18 +1052,25 @@ def cmd_run(name):
             if d["loop"]:
                 log("loop: wrapping cursor to 0")
                 s["cursor"] = 0
-                s["active_seconds"] = 0.0
+                roll_budget_clocks(s)
             else:
                 s["status"] = "done"
                 save_state(s)
-                log("campaign %r done" % name)
+                log("campaign %r done: fuzz %s, triage %s, reboots %s, wall %s"
+                    % (name, fmt_hms(lifetime(s, "active_seconds")),
+                       fmt_hms(lifetime(s, "triage_seconds")),
+                       fmt_hms(lifetime(s, "overhead_seconds")),
+                       fmt_hms(lifetime_wall(s))))
                 return
         item = d["items"][s["cursor"]]
         cfg, budget = item["config"], item["budget_seconds"]
-        remaining = budget - s["active_seconds"]
-        log("config %d/%d: %s (%.0f min left of %.1fh budget)"
+        remaining = budget - budget_spent(s, d)
+        log("config %d/%d: %s (%.0f min left of %.1fh %s budget; "
+            "fuzz %s, triage %s, reboots %s)"
             % (s["cursor"] + 1, len(d["items"]), config_id(cfg),
-               remaining / 60, budget / 3600))
+               remaining / 60, budget / 3600, d.get("budget_clock", "fuzz"),
+               fmt_hms(s.get("active_seconds")), fmt_hms(s.get("triage_seconds")),
+               fmt_hms(s.get("overhead_seconds"))))
         try:
             ensure_running(s, cfg)
         except RuntimeError as e:
@@ -625,9 +1090,18 @@ def cmd_run(name):
             session("collect", s["session_id"], "snapshot")
             session("stop", s["session_id"])
             s["cursor"] += 1
-            s["active_seconds"] = 0.0
+            roll_budget_clocks(s)
             s["session_id"] = None
             s["last_exec_total"] = None
+            save_state(s)
+            continue
+        if outcome == "rotate":
+            # A SOFT group rotated: stop and resume the SAME config (budget kept);
+            # ensure_running re-applies the now-rotated disabled set on resume.
+            log("SOFT rotation due on %s; restarting to apply" % config_id(cfg))
+            if inspect(s["session_id"]).get("pid_alive"):
+                session("stop", s["session_id"])
+            s["session_id"] = None
             save_state(s)
             continue
         # crash or hang: stop if still alive, record, collect.
@@ -637,23 +1111,21 @@ def cmd_run(name):
             info = inspect(s["session_id"])
         record_incident(s, d, outcome, info)
         collect_and_prune(s, d, outcome)
-        # Coordinator: a crash with a not-yet-benched signature is a new bug ->
-        # triage it before resuming. A known (already benched) signature, or a
-        # hang, just restarts the same config as before.
-        if outcome == "crash":
-            sig = latest_panic_signature(s)
-            if sig and sig in s["suppressed_sigs"]:
-                log("crash signature %s already benched; resuming fuzzing" % sig)
-            elif sig and begin_triage(s, d, sig):
-                save_state(s)
-                continue                 # loop re-enters the triaging phase
+        # Coordinator: the quarantine SUSPECT gate decides whether a crash earns a
+        # triage. A NEW signature becomes SUSPECT and just resumes (enabled); a
+        # recurrence that needs confirming, or an escape, is triaged; a tolerated
+        # recurrence is handled in place. See quarantine_decide.
+        if outcome == "crash" and handle_crash(s, d, info):
+            save_state(s)
+            continue                     # loop re-enters the triaging phase
         save_state(s)
         # policy: restart same config -- loop re-enters ensure_running (resume)
 
 
 # --- authoring + control -----------------------------------------------------
 def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
-            max_crashes, min_free_gb, keep_cores, force):
+            max_crashes, min_free_gb, keep_cores, force, triage_opts=None,
+            breaker_opts=None):
     path = def_path(name)
     if path.exists() and not force:
         die("campaign %r already exists (%s); use --force to overwrite" % (name, path))
@@ -672,41 +1144,414 @@ def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
         "max_crashes": max_crashes, "min_free_gb": min_free_gb,
         "keep_cores": keep_cores,
     }
+    # The device flags begin_triage passes to `triage.py new`. Without them triage
+    # falls back to its own defaults (no kcov device, no kext id), which is not
+    # what the manual runs used -- so author them here, once, per campaign.
+    tri = {k: v for k, v in (triage_opts or {}).items() if v is not None}
+    if tri:
+        d["triage"] = tri
+    # Breaker overrides sit at the top level and are merged over DEFAULTS by
+    # load_def, so only the ones actually given are written.
+    for k, v in (breaker_opts or {}).items():
+        if v is not None:
+            d[k] = v
     write_json(path, d)
-    log("wrote %s (%d config(s), %.1fh each, loop=%s)"
-        % (path, len(rel), budget_hours, loop))
-    print("  run it:      sudo ./scripts/fuzz-campaign.py run %s" % name)
-    print("  or install:  sudo ./scripts/fuzz-campaign.py install %s" % name)
+    log("wrote %s (%d config(s), %.1fh each, loop=%s, triage=%s)"
+        % (path, len(rel), budget_hours, loop, tri or "defaults"))
+    print("  pre-flight:  ./scripts/fuzz-campaign.py doctor %s" % name)
+    print("  run it:      ./scripts/fuzz-campaign.py run %s" % name)
+    print("  or install:  sudo ./scripts/fuzz-campaign.py install %s --agent --user fuzz" % name)
 
 
-def cmd_status(name):
+def _delta(cur, prev, fmt="%+d"):
+    """Render the change since the previous sample, or "" when there is none.
+
+    Watch mode exists to show movement, and an absolute counter does not: 11.2M
+    programs looks identical one refresh later whether the box is fuzzing hard or
+    wedged. The delta is the part you actually read."""
+    if prev is None or cur is None or cur == prev:
+        return ""
+    try:
+        return "  " + (fmt % (cur - prev))
+    except (TypeError, ValueError):
+        return ""
+
+
+def corpus_facts(cfg):
+    """(inputs, bytes, mtime) for the config's corpus.db, or None.
+
+    Surfaced because a config IS its workdir: re-running a config resumes that
+    workdir's corpus rather than starting over, which is right for making
+    progress and wrong for measuring "coverage reached from scratch in 24h".
+    Whether you are continuing or starting fresh should not be something you have
+    to infer from a log line that scrolled past hours ago.
+    """
+    try:
+        conf = read_json(cfg)
+        wd = (conf or {}).get("workdir")
+        if not wd:
+            return None
+        db = Path(wd) / "corpus.db"
+        st = db.stat()
+        return {"path": str(db), "bytes": st.st_size, "mtime": st.st_mtime,
+                "workdir": wd}
+    except OSError:
+        return None
+
+
+def status_lines(name, prev=None):
+    """The status block as a list of lines, plus a sample dict for the next call.
+
+    prev is the previous call's sample; when given, changed counters are annotated
+    with their delta.
+    """
     d = load_def(name)
     s = load_state(name)
-    print("campaign %s : %s" % (name, s["status"]))
+    prev = prev or {}
+    out = []
+
+    def row(label, value, extra=""):
+        out.append("  %-12s: %s%s" % (label, value, extra))
+
+    out.append("campaign %s : %s" % (name, s["status"]))
     if s.get("halt_reason"):
-        print("  halt reason : %s" % s["halt_reason"])
-    print("  configs     : %d (loop=%s)" % (len(d["items"]), d["loop"]))
-    print("  cursor      : %d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])))
-    if s.get("current_config"):
+        row("halt reason", s["halt_reason"])
+    held = brake_held(name)
+    if held:
+        row("BRAKE", "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
+    row("configs", "%d (loop=%s)" % (len(d["items"]), d["loop"]))
+    row("cursor", "%d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])))
+
+    cfg = s.get("current_config")
+    if cfg:
         item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-        print("  current     : %s" % config_id(s["current_config"]))
-        print("  budget      : %.2f / %.2f h used"
-              % (s["active_seconds"] / 3600, item["budget_seconds"] / 3600))
-    print("  incidents   : %d crash / %d hang" % (s["crashes"], s["hangs"]))
-    print("  phase       : %s" % s.get("phase", "fuzzing"))
+        row("current", config_id(cfg))
+        row("budget", "%.2f / %.2f h used (%s clock)"
+            % (budget_spent(s, d) / 3600, item["budget_seconds"] / 3600,
+               d.get("budget_clock", "fuzz")))
+        # A config is a workdir. Say plainly whether this run inherited a corpus.
+        cf_facts = corpus_facts(cfg)
+        if cf_facts:
+            row("corpus", "%s  (%.0f KB, last grew %s)"
+                % (Path(cf_facts["workdir"]).name, cf_facts["bytes"] / 1024.0,
+                   timefmt.fmt_epoch(cf_facts["mtime"], short=True)),
+                _delta(cf_facts["bytes"], prev.get("corpus_bytes"), "%+d B"))
+        else:
+            row("corpus", "none yet -- this config starts from scratch")
+
+    # Three clocks, campaign-lifetime (never reset by a config advance). Reported
+    # separately because "24h of fuzzing" and "24h of campaign" are different
+    # claims, and a writeup that conflates them overstates the fuzzing.
+    row("fuzzing", fmt_hms(lifetime(s, "active_seconds")), "  (manager executing)")
+    row("minimizing", fmt_hms(lifetime(s, "triage_seconds")), "  (triage)")
+    row("rebooting", fmt_hms(lifetime(s, "overhead_seconds")), "  (panic -> back up)")
+    row("wall", fmt_hms(lifetime_wall(s)), "  (sum of the three)")
+
+    # What the box actually did, not just how long it was up: on this target a
+    # campaign can burn an hour of wall clock and execute very little.
+    live = inspect(s["session_id"]) if s.get("session_id") else {}
+    execs = live.get("exec_total") if live.get("exec_total") is not None \
+        else s.get("last_exec_total")
+    cov = live.get("coverage")
+    row("executed", "%s program(s)%s"
+        % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
+           "  (%s/sec)" % live.get("rate") if live.get("rate") else ""),
+        _delta(execs, prev.get("execs"), "%+,d".replace(",", "")))
+    if cov not in (None, ""):
+        row("coverage", "%s basic block(s)" % cov, _delta(_int(cov), prev.get("cov")))
+    row("incidents", "%d crash / %d hang" % (s["crashes"], s["hangs"]),
+        _delta(s["crashes"], prev.get("crashes")))
+    row("phase", s.get("phase", "fuzzing"))
     if s.get("phase") == "triaging":
-        print("  triaging    : job %s, bug %s (advance %d/%d)"
-              % (s.get("triage_job"), s.get("triage_bug_sig"),
-                 s.get("triage_boots", 0), d["triage_max_boots"]))
+        row("triaging", "job %s, bug %s (advance %d/%d)"
+            % (s.get("triage_job"), s.get("triage_bug_sig"),
+               s.get("triage_boots", 0), d["triage_max_boots"]))
     if s.get("suppressed_sigs"):
-        print("  benched sigs: %d (%s)"
-              % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
-    print("  disk free   : %.1f GB" % free_gb())
-    print("  updated     : %s" % s.get("updated_at"))
+        row("benched sigs", "%d (%s)"
+            % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
+    row("disk free", "%.1f GB" % free_gb())
+    row("updated", timefmt.fmt(s.get("updated_at")))
+    row("started", timefmt.fmt(s.get("started_at")))
     for inc in s["incidents"][-5:]:
-        print("    - %s  %-6s %s  (ran %ss, panic=%s)"
-              % (inc["at"], inc["kind"], config_id(inc["config"]),
-                 inc.get("ran_seconds"), inc.get("panic_evidence")))
+        out.append("    - %s  %-6s %s  (ran %ss, panic=%s)"
+                   % (timefmt.fmt(inc["at"]), inc["kind"], config_id(inc["config"]),
+                      inc.get("ran_seconds"), inc.get("panic_evidence")))
+
+    sample = {"execs": execs, "cov": _int(cov), "crashes": s["crashes"],
+              "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
+    return out, sample
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def cmd_status(name, watch=False, interval=10):
+    """Campaign dashboard: printed once, or redrawn until Ctrl-C with --watch.
+
+    Watch mode annotates the counters that moved since the last redraw, so a
+    wedged manager is visible as "nothing changed" rather than requiring you to
+    remember the previous number.
+    """
+    if not watch:
+        lines, _ = status_lines(name)
+        print("\n".join(lines))
+        return
+    prev = None
+    try:
+        while True:
+            lines, sample = status_lines(name, prev)
+            head = ("fuzz-campaign status --watch  (every %ds, Ctrl-C to quit)  %s"
+                    % (interval, timefmt.stamp()))
+            # Clear + home, then repaint, so the block does not scroll away.
+            sys.stdout.write("\033[2J\033[H" + "\n".join([head, ""] + lines) + "\n")
+            sys.stdout.flush()
+            prev = sample
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+
+
+def cmd_doctor(name):
+    """Pre-flight a campaign: check the things a supervised run needs before it
+    hits its first crash. Exit 0 if nothing is fatal, 1 if any FAIL."""
+    d = load_def(name)
+    checks = []  # (level, message)
+
+    def add(level, msg):
+        checks.append((level, msg))
+
+    # The brake. Reported first because it is the check you need to have read
+    # BEFORE the box misbehaves -- afterwards you may not have a usable login.
+    held = brake_held(name)
+    if held:
+        add("FAIL", "BRAKE SET (%s%s) -- this campaign will halt instead of running; "
+                    "clear it with `fuzz-campaign.py brake --clear`"
+            % (held[0], ": %s" % held[1] if held[1] else ""))
+    else:
+        add("OK", "brake clear (set it with `touch %s`; from Recovery: `touch \"%s\"`)"
+            % (GLOBAL_BRAKE, recovery_hint()))
+
+    # Coordinator's own binary. A daemon can't use the `go run` fallback (minimal
+    # PATH), so the built binary is required there; foreground can go run.
+    if RINGREPRO_BIN.exists() or os.environ.get("SYZ_RINGREPRO"):
+        add("OK", "syz-ring-repro binary present (%s)" % RINGREPRO_BIN)
+    elif shutil.which("go"):
+        add("WARN", "syz-ring-repro not built (%s): foreground uses `go run`, but the "
+            "daemon cannot -- run `make target`" % RINGREPRO_BIN)
+    else:
+        add("FAIL", "no syz-ring-repro binary (%s) and no `go` on PATH -- run `make target`"
+            % RINGREPRO_BIN)
+
+    # fuzz-session's device binaries. syz-manager itself validates that BOTH
+    # syz-execprog and syz-executor sit under <syzkaller>/bin/<arch>/ and exits
+    # FATAL at startup if either is absent (pkg/mgrconfig/load.go), so check both
+    # here -- a tree missing syz-execprog otherwise fails one second into the run.
+    for binname in ("syz-executor", "syz-execprog"):
+        bp = REPO_ROOT / "bin/darwin_arm64" / binname
+        add("OK" if bp.exists() else "FAIL",
+            "%s present" % binname if bp.exists()
+            else "%s MISSING (%s) -- syz-manager exits FATAL without it; run `make target`"
+                 % (binname, bp))
+    mgr = Path(os.environ.get("SYZ_MANAGER_BIN", REPO_ROOT / "bin/syz-manager"))
+    add("OK" if mgr.exists() else "FAIL",
+        "syz-manager present" if mgr.exists() else "syz-manager MISSING (%s) -- make manager" % mgr)
+
+    # Helper scripts the coordinator shells out to. quarantine.py and
+    # bug_registry.py are imported/executed on the crash path, so a tree that
+    # published only the two drivers (an old sync) fails here rather than at 3am.
+    for p in (SESSION, TRIAGE, SCRIPT_DIR / "crash_fingerprint.py",
+              SCRIPT_DIR / "quarantine.py", BUG_REGISTRY):
+        add("OK" if p.exists() else "FAIL",
+            "%s present" % p.name if p.exists() else "%s MISSING (%s)" % (p.name, p))
+
+    # Everything below is checked AS THE USER THAT WILL RUN THE CAMPAIGN. Under
+    # launchd that is the agent's user (e.g. fuzz), not the person running doctor
+    # -- so run `doctor` as that user (sudo -u fuzz ...) for a truthful answer.
+    add("INFO", "checks below run as uid %d (%s) -- run doctor as the campaign's "
+        "launchd user for a truthful answer" % (os.geteuid(), getpass.getuser()))
+
+    # Panic reports drive fingerprint/dedup/new-bug detection AND the crash gate.
+    # Existing-but-unreadable is the dangerous case: the driver simply never sees
+    # a crash, so it never triages, never quarantines, and fuzzes a dead box.
+    readable = []
+    for dp in PANIC_DIRS:
+        if not _is_dir(dp):
+            add("WARN", "panic dir %s absent (ok if unused)" % dp)
+        elif os.access(str(dp), os.R_OK | os.X_OK):
+            readable.append(dp)
+            add("OK", "panic dir %s readable" % dp)
+        else:
+            add("FAIL", "panic dir %s exists but is NOT readable by this user -- "
+                "crashes would be invisible (grant access, e.g. add the user to the "
+                "dir's group)" % dp)
+    if not readable:
+        add("FAIL", "no readable panic dir (%s) -- the driver cannot detect a crash"
+            % ", ".join(str(dp) for dp in PANIC_DIRS))
+
+    # Pruning unlinks cores, which needs write on the *directory*, not the file.
+    # Failing this doesn't stop fuzzing; it fills the disk until the breaker halts.
+    for dp in PANIC_DIRS:
+        if _is_dir(dp) and _has_any(dp, CORE_GLOBS):
+            add("OK" if os.access(str(dp), os.W_OK) else "WARN",
+                "cores in %s are prunable" % dp if os.access(str(dp), os.W_OK)
+                else "cores in %s are NOT prunable by this user -- they accumulate "
+                     "(~220MB each) until the low-disk breaker halts the campaign" % dp)
+
+    # Each config in the campaign.
+    for item in d["items"]:
+        cfg = Path(item["config"])
+        conf = read_json(cfg)
+        if conf is None:
+            add("FAIL", "config %s unreadable" % cfg.name)
+            continue
+        add("OK", "config %s loads" % cfg.name)
+        if not conf.get("target"):
+            add("WARN", "config %s has no \"target\"" % cfg.name)
+        if not conf.get("enable_syscalls"):
+            add("WARN", "config %s has empty enable_syscalls" % cfg.name)
+        if not conf.get("workdir"):
+            add("WARN", "config %s has no \"workdir\"" % cfg.name)
+        # The quarantine rewrites disable_syscalls into the config on every
+        # decision; a read-only config silently loses every bench.
+        add("OK" if os.access(str(cfg), os.W_OK) else "FAIL",
+            "config %s writable (quarantine rewrites disable_syscalls)" % cfg.name
+            if os.access(str(cfg), os.W_OK)
+            else "config %s is NOT writable by this user -- quarantine decisions "
+                 "cannot be applied" % cfg.name)
+        wd = conf.get("workdir")
+        if wd:
+            # fuzz-session creates the workdir on first start, so on a fresh tree
+            # only its nearest existing ancestor can be tested -- that is what has
+            # to be writable for the mkdir to succeed.
+            probe = Path(wd)
+            while not _is_dir(probe) and probe.parent != probe:
+                probe = probe.parent
+            ok = os.access(str(probe), os.W_OK)
+            here = "" if probe == Path(wd) else " (nearest existing ancestor of %s)" % wd
+            add("OK" if ok else "FAIL",
+                "workdir %s writable%s" % (probe, here) if ok
+                else "workdir %s is NOT writable by this user%s" % (probe, here))
+
+    # Triage device flags (optional; else triage uses its defaults).
+    tri = d.get("triage") or {}
+    if tri:
+        add("OK", "triage flags: %s" % ", ".join("%s=%s" % kv for kv in tri.items()))
+        kd = tri.get("kcov_device")
+        if kd and not Path(kd).exists():
+            add("WARN", "triage.kcov_device %s not present" % kd)
+    else:
+        add("INFO", "no \"triage\" block -- triage uses defaults (kext_id=1, no kcov)")
+
+    fg = free_gb()
+    add("OK" if fg >= d["min_free_gb"] else "FAIL",
+        "disk free %.1f GB (min %.1f)" % (fg, d["min_free_gb"]))
+    add("OK" if Path("/usr/bin/python3").exists() else "WARN",
+        "/usr/bin/python3 present" if Path("/usr/bin/python3").exists()
+        else "/usr/bin/python3 missing -- daemon falls back to %s" % sys.executable)
+    # syzkaller refuses to pair a manager/executor built from different sources:
+    # the RPC handshake aborts with "mismatching manager/executor git revisions".
+    # syz-ring-repro is the manager side during minimization, so a binary rebuilt
+    # by hand (plain `go build` drops the Makefile's -ldflags -X GitRevision, and
+    # stamps nothing) fails every probe. Build with `make`, not `go build`.
+    revs = {}
+    for binname, bp in (("syz-manager", Path(os.environ.get("SYZ_MANAGER_BIN",
+                                                            REPO_ROOT / "bin/syz-manager"))),
+                        ("syz-executor", REPO_ROOT / "bin/darwin_arm64/syz-executor"),
+                        ("syz-ring-repro", RINGREPRO_BIN)):
+        revs[binname] = _binary_revision(bp)
+    known = {k: v for k, v in revs.items() if v}
+    if len(known) < 3:
+        add("WARN", "could not read a git revision from: %s (skipping the match check)"
+            % ", ".join(sorted(k for k in revs if not revs[k])))
+    elif len(set(known.values())) == 1:
+        add("OK", "manager/executor/ring-repro all built from %s"
+            % list(known.values())[0][:12])
+    else:
+        add("FAIL", "binaries built from DIFFERENT revisions -- the RPC handshake "
+            "will abort every probe: %s. Rebuild with `make`, not `go build` "
+            "(plain go build drops the -ldflags revision stamp)."
+            % ", ".join("%s=%s" % (k, v[:12]) for k, v in sorted(known.items())))
+
+    # The git-revision check above cannot see a DESCRIPTIONS mismatch: the executor
+    # stores that hash as a C literal, but the Go tools compute it at runtime. The
+    # observable proxy is the source: if any sys/<os>/*.txt is newer than the
+    # executor binary, the executor was built from older descriptions, and any Go
+    # tool rebuilt now will abort every probe with "mismatching manager/executor
+    # system call descriptions".
+    # Only meaningful where builds happen: in a published runtime tree the binary
+    # and the .txt files are both copies stamped with the sync time, so comparing
+    # their mtimes says nothing.
+    execbin = REPO_ROOT / "bin/darwin_arm64/syz-executor"
+    if not _is_dir(REPO_ROOT / ".git"):
+        add("INFO", "descriptions-drift check skipped (not a build tree)")
+    elif execbin.exists():
+        try:
+            ebuilt = execbin.stat().st_mtime
+            newer = sorted(t.name for t in (REPO_ROOT / "sys").rglob("*.txt")
+                           if t.stat().st_mtime > ebuilt)
+        except OSError:
+            newer = []
+        if newer:
+            add("WARN", "syscall descriptions edited after syz-executor was built "
+                "(%s) -- rebuilding any Go tool now yields a descriptions mismatch. "
+                "Rebuild the executor too, or build tools from the committed "
+                "descriptions." % ", ".join(newer[:4]))
+        else:
+            add("OK", "syscall descriptions no newer than the executor binary")
+
+    # launchd sets WorkingDirectory to REPO_ROOT, so it is the cwd inherited by
+    # every process the campaign spawns -- including the executor, which creates
+    # its shmem file and tmpdir by relative path and dies at startup if it cannot.
+    add("OK" if os.access(str(REPO_ROOT), os.W_OK) else "FAIL",
+        "tree root %s writable (it is the spawned processes' cwd)" % REPO_ROOT
+        if os.access(str(REPO_ROOT), os.W_OK)
+        else "tree root %s is NOT writable by this user -- it is the launchd job's "
+             "WorkingDirectory, so the executor dies at startup on every run "
+             "(\"SYZFAIL: shmem open failed ... errno 13\")" % REPO_ROOT)
+
+    # Everything the driver persists lives under these; unwritable means the
+    # campaign cannot record a single incident.
+    for dp in (STATE_DIR, BUGS_DIR, REPO_ROOT / "triage" / ".state"):
+        exists = _is_dir(dp)
+        probe = dp if exists else dp.parent
+        ok = _is_dir(probe) and os.access(str(probe), os.W_OK)
+        add("OK" if ok else "FAIL",
+            "%s writable" % dp if ok else "%s is NOT writable by this user" % dp)
+    add("INFO", "launchd daemon %s"
+        % ("INSTALLED (%s)" % plist_path(name) if plist_path(name).exists() else "not installed"))
+    # The user we are RUNNING as first -- that is the one whose agent matters and
+    # the one whose home we can definitely read. SUDO_USER is checked too (that is
+    # where a `sudo ./fuzz-campaign.py install --agent` without --user would have
+    # put it), but under `sudo -u fuzz` that home belongs to someone else and
+    # stat'ing it raises EACCES, so every probe is guarded.
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    for u in dict.fromkeys(x for x in (me, os.environ.get("SUDO_USER")) if x):
+        try:
+            home = Path(pwd.getpwnam(u).pw_dir)
+        except KeyError:
+            continue
+        ap = home / "Library" / "LaunchAgents" / ("%s.plist" % plist_label(name))
+        if _exists(ap):
+            add("INFO", "launchd agent INSTALLED for %s (%s)" % (u, ap))
+
+    fails = sum(1 for lvl, _ in checks if lvl == "FAIL")
+    warns = sum(1 for lvl, _ in checks if lvl == "WARN")
+    print("doctor: campaign %s" % name)
+    marks = {"OK": "ok  ", "WARN": "WARN", "FAIL": "FAIL", "INFO": "--  "}
+    for lvl, msg in checks:
+        print("  [%s] %s" % (marks[lvl], msg))
+    print("summary: %d fail, %d warn" % (fails, warns))
+    if fails:
+        print("-> NOT ready: fix the FAIL items above")
+    elif warns:
+        print("-> startable, but review the WARN items (especially panic dirs)")
+    else:
+        print("-> looks good")
+    return 1 if fails else 0
 
 
 def cmd_list():
@@ -715,15 +1560,20 @@ def cmd_list():
     if not defs:
         print("no campaigns in %s" % CAMPAIGN_DIR)
         return
-    print("%-24s %-9s %-8s %s" % ("CAMPAIGN", "STATUS", "CURSOR", "INCIDENTS"))
+    rows = []
     for dp in defs:
         name = dp.stem
         d = load_def(name)
         s = load_state(name)
-        print("%-24s %-9s %-8s %d/%d"
-              % (name, s["status"],
-                 "%d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])),
-                 s["crashes"], s["hangs"]))
+        status = s["status"]
+        if brake_held(name):
+            status += " (brake)"
+        rows.append((name, status,
+                     "%d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])),
+                     "%d/%d" % (s["crashes"], s["hangs"]),
+                     fmt_hms(lifetime(s, "active_seconds")),
+                     fmt_hms(lifetime_wall(s))))
+    tabulate(rows, ("CAMPAIGN", "STATUS", "CONFIG", "CRASH/HANG", "FUZZED", "WALL"))
 
 
 def _set_status(name, status):
@@ -744,12 +1594,34 @@ def cmd_halt(name):
 
 
 def cmd_resume(name):
+    # A brake outlives a resume on purpose: the next driver start would re-halt,
+    # and silently marking the campaign "running" would look like it worked.
+    held = brake_held(name)
+    if held:
+        die("brake is set (%s%s); clear it first:\n"
+            "  ./scripts/fuzz-campaign.py brake %s--clear"
+            % (held[0], " -- %s" % held[1] if held[1] else "",
+               "" if held[0].endswith("STOP") else "%s " % name)
+            + ("--global " if held[0].endswith("STOP") else ""))
     _set_status(name, "running")
     print("marked running; (re)start the driver: sudo ./scripts/fuzz-campaign.py run %s" % name)
 
 
 # --- launchd -----------------------------------------------------------------
-LAUNCHD_DIR = Path.home() / "/Library" / "LaunchAgents"
+# A LaunchDaemon (system domain, /Library/LaunchDaemons) is the right vehicle:
+# it runs at every boot as root with NO user logged in, which a bare-metal crash
+# box that reboots itself needs. RunAtLoad fires once per boot — exactly one
+# relaunch per crash-reboot — and the coordinator (cmd_run) re-enters whichever
+# phase (fuzzing / triaging) the state file holds. It drives triage.py as a
+# subprocess, so this is the ONLY launchd job to install; do NOT also install
+# triage.py's own agent, which would double-drive the box.
+LAUNCHD_DIR = Path("/Library/LaunchDaemons")
+
+# A daemon inherits a minimal PATH, so give it common tool locations (Go, both
+# homebrew prefixes) — though the coordinator prefers the built binary and does
+# not rely on `go` at runtime. SYZ_* overrides set at install time are carried in.
+DAEMON_PATH = "/usr/local/go/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+DAEMON_ENV_PASSTHROUGH = ("SYZ_PANIC_DIR", "SYZ_KERNEL_PANIC_DIR", "SYZ_RINGREPRO", "SYZ_FILTER")
 
 
 def plist_label(name):
@@ -760,13 +1632,28 @@ def plist_path(name):
     return LAUNCHD_DIR / ("%s.plist" % plist_label(name))
 
 
-def _plist_xml(name):
+def _daemon_env():
+    env = {"PATH": DAEMON_PATH}
+    for k in DAEMON_ENV_PASSTHROUGH:
+        v = os.environ.get(k)
+        if v:
+            env[k] = v
+    return env
+
+
+def _plist_xml(name, user=None):
     logf = STATE_DIR / ("%s.launchd.log" % name)
     # Prefer Apple's stable system python3 for a long-lived daemon; env python3
     # (e.g. Xcode's) can move or vanish across an Xcode update.
     py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
     args = [py, str(SESSION.parent / "fuzz-campaign.py"), "run", name]
     arg_xml = "\n".join("    <string>%s</string>" % a for a in args)
+    env_xml = "\n".join("    <key>%s</key><string>%s</string>" % (k, v)
+                        for k, v in _daemon_env().items())
+    # A system LaunchDaemon runs as root unless pinned to a user. Pin it to the
+    # dedicated fuzzing user so IOKit/coverage access and file ownership match the
+    # interactive setup and the auto-login-after-panic user.
+    user_xml = ("  <key>UserName</key><string>%s</string>\n" % user) if user else ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -774,24 +1661,146 @@ def _plist_xml(name):
         '<plist version="1.0">\n<dict>\n'
         '  <key>Label</key><string>%s</string>\n'
         '  <key>ProgramArguments</key>\n  <array>\n%s\n  </array>\n'
+        '  <key>EnvironmentVariables</key>\n  <dict>\n%s\n  </dict>\n'
+        '%s'
         '  <key>WorkingDirectory</key><string>%s</string>\n'
+        # Without this launchd may class a long-running agent as Background and
+        # throttle its CPU/IO -- which on a fuzzer is a silent throughput cut.
+        '  <key>ProcessType</key><string>Standard</string>\n'
+        # umask 002 (decimal 2): everything the campaign creates under the shared
+        # tree stays group-writable, so the build account can still inspect, clean
+        # and re-sync workdirs that the fuzz account made. Without it fuzz creates
+        # 0755/0644 and the two accounts fence each other out of their own tree.
+        '  <key>Umask</key><integer>2</integer>\n'
         '  <key>RunAtLoad</key><true/>\n'
         '  <key>KeepAlive</key>\n  <dict>\n'
         '    <key>SuccessfulExit</key><false/>\n  </dict>\n'
+        # Don't hot-loop if the driver exits nonzero immediately (e.g. a bug):
+        # wait 30s between relaunches. A crash-reboot resets this anyway.
+        '  <key>ThrottleInterval</key><integer>30</integer>\n'
         '  <key>StandardOutPath</key><string>%s</string>\n'
         '  <key>StandardErrorPath</key><string>%s</string>\n'
         '</dict>\n</plist>\n'
-        % (plist_label(name), arg_xml, REPO_ROOT, logf, logf)
+        % (plist_label(name), arg_xml, env_xml, user_xml, REPO_ROOT, logf, logf)
     )
 
 
-def cmd_install(name):
+def _user_can_read(user, path):
+    """Can `user` actually reach `path`? None when we cannot tell.
+
+    The plist bakes in THIS tree's paths, so installing the agent from a tree the
+    fuzz user cannot traverse (the dev repo under a 0700 home) produces a job that
+    launchd starts and python immediately kills -- with the failure buried in a log
+    the user never opens. Fork + setuid so the check uses the target's real rights,
+    supplementary groups included.
+    """
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    if os.geteuid() != 0:
+        return os.access(str(path), os.R_OK) if pw.pw_uid == os.geteuid() else None
+    pid = os.fork()
+    if pid == 0:                                  # child: drop to the target user
+        try:
+            os.setgroups(os.getgrouplist(user, pw.pw_gid))
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+            os._exit(0 if os.access(str(path), os.R_OK) else 1)
+        except Exception:                         # noqa: BLE001
+            os._exit(2)
+    _, status = os.waitpid(pid, 0)
+    code = os.WEXITSTATUS(status)
+    return None if code == 2 else code == 0
+
+
+def _check_tree_reachable(user):
+    """Fail the install if `user` cannot read the tree the plist will point at."""
+    probe = SCRIPT_DIR / "fuzz-campaign.py"
+    ok = _user_can_read(user, probe)
+    if ok is False:
+        die("%s cannot read %s -- the agent would start and die immediately.\n"
+            "The plist bakes in THIS tree's paths, so install from a tree %s can "
+            "reach: publish with scripts/sync-fuzz-run.sh, then run `install` from "
+            "there (e.g. /Users/Shared/fuzz-run/scripts/fuzz-campaign.py)."
+            % (user, probe, user))
+    if ok is None:
+        log("could not verify %s can read %s -- check it before relying on the agent"
+            % (user, probe))
+
+
+def _chown_state_dirs(user):
+    """Hand the campaign's own state dirs to the daemon/agent user."""
+    for dpath in (STATE_DIR, CAMPAIGN_DIR, BUGS_DIR):
+        try:
+            dpath.mkdir(parents=True, exist_ok=True)
+            shutil.chown(dpath, user=user)
+        except (LookupError, PermissionError, OSError) as e:
+            log("could not chown %s to %s: %s (ensure it is writable by %s)"
+                % (dpath, user, e, user))
+
+
+def cmd_install_agent(name, user=None):
+    """Install a per-user LaunchAgent that runs the campaign inside the user's
+    login (GUI) session -- needed when the fuzzed IOKit driver requires the console
+    session. With auto-login enabled for that user, RunAtLoad fires at every boot
+    (including a panic-reboot), so the campaign resumes unattended.
+
+    Runnable as the user itself (no sudo) or as root (chowns to the user). Loads
+    now if that user has an active GUI session; otherwise it loads at next login.
+    """
+    load_def(name)
+    user = user or os.environ.get("SUDO_USER") or getpass.getuser()
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        die("no such user %r" % user)
+    if not RINGREPRO_BIN.exists() and not os.environ.get("SYZ_RINGREPRO"):
+        die("built binary %s is missing; a headless agent can't use `go run`. "
+            "Build it (make target) or set SYZ_RINGREPRO." % RINGREPRO_BIN)
+    _check_tree_reachable(user)
+    agents = Path(pw.pw_dir) / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = agents / ("%s.plist" % plist_label(name))
+    path.write_text(_plist_xml(name, user=None))   # agent runs as the session user
+    os.chmod(path, 0o644)
+    if os.geteuid() == 0:                           # installed via sudo -> fix ownership
+        try:
+            shutil.chown(path, user=user)
+            shutil.chown(agents, user=user)
+        except (LookupError, PermissionError, OSError) as e:
+            log("could not chown agent plist to %s: %s" % (user, e))
+        _chown_state_dirs(user)
+    log("wrote LaunchAgent %s" % path)
+    dom = "gui/%d" % pw.pw_uid
+    subprocess.run(["launchctl", "bootout", dom, str(path)], stderr=subprocess.DEVNULL)
+    rc = subprocess.run(["launchctl", "bootstrap", dom, str(path)]).returncode
+    if rc != 0:
+        log("agent will load at %s's next login (auto-login); immediate bootstrap "
+            "into %s failed rc=%d -- run it from within %s's session to start now."
+            % (user, dom, rc, user))
+    else:
+        log("loaded LaunchAgent for %s in %s -- RunAtLoad + KeepAlive" % (user, dom))
+
+
+def cmd_install(name, user=None, agent=False):
+    if agent:
+        return cmd_install_agent(name, user)
     load_def(name)   # validate it exists
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if os.geteuid() != 0:
-        die("install writes to %s and loads a system daemon; run with sudo" % LAUNCHD_DIR)
+        die("install writes to %s and loads a system LaunchDaemon; run with sudo" % LAUNCHD_DIR)
+    # A daemon runs with a minimal PATH and cannot use the coordinator's `go run`
+    # fallback, so the built binary must exist (or SYZ_RINGREPRO must point at one).
+    if not RINGREPRO_BIN.exists() and not os.environ.get("SYZ_RINGREPRO"):
+        die("built binary %s is missing; a daemon can't use the `go run` fallback. "
+            "Build it first: make target   (or set SYZ_RINGREPRO)" % RINGREPRO_BIN)
+    if user:
+        _check_tree_reachable(user)
+        _chown_state_dirs(user)   # daemon runs as this user; let it persist state
     path = plist_path(name)
-    path.write_text(_plist_xml(name))
+    path.write_text(_plist_xml(name, user))
     os.chmod(path, 0o644)
     log("wrote %s" % path)
     subprocess.run(["launchctl", "bootout", "system", str(path)],
@@ -799,21 +1808,50 @@ def cmd_install(name):
     rc = subprocess.run(["launchctl", "bootstrap", "system", str(path)]).returncode
     if rc != 0:
         die("launchctl bootstrap failed (rc=%d)" % rc)
-    log("loaded %s -- RunAtLoad + KeepAlive; it survives reboots" % plist_label(name))
+    log("loaded %s -- RunAtLoad + KeepAlive; survives reboots and runs headless" % plist_label(name))
     print("  logs: %s" % (STATE_DIR / ("%s.launchd.log" % name)))
+    print("  note: this is the ONLY job to install -- it drives triage.py itself; "
+          "do not also `triage.py install`.")
 
 
-def cmd_uninstall(name):
+def cmd_uninstall(name, user=None, agent=False):
+    """Stop the daemon/agent now and prevent it from ever restarting.
+
+    bootout unloads the job and kills its running instance; removing the plist
+    means RunAtLoad cannot fire again on the next boot/login. (`halt` only pauses
+    the campaign and leaves the job installed.)
+    """
+    label = plist_label(name)
+    if agent:
+        user = user or os.environ.get("SUDO_USER") or getpass.getuser()
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            die("no such user %r" % user)
+        apath = Path(pw.pw_dir) / "Library" / "LaunchAgents" / ("%s.plist" % label)
+        dom = "gui/%d" % pw.pw_uid
+        subprocess.run(["launchctl", "bootout", "%s/%s" % (dom, label)], stderr=subprocess.DEVNULL)
+        subprocess.run(["launchctl", "bootout", dom, str(apath)], stderr=subprocess.DEVNULL)
+        if apath.exists():
+            apath.unlink()
+            log("removed %s" % apath)
+        else:
+            log("no agent plist at %s" % apath)
+        log("agent %s unloaded; it will NOT restart at %s's next login" % (label, user))
+        return
     if os.geteuid() != 0:
-        die("uninstall unloads a system daemon; run with sudo")
+        die("uninstall unloads a system LaunchDaemon; run with sudo")
     path = plist_path(name)
-    subprocess.run(["launchctl", "bootout", "system", str(path)],
-                   stderr=subprocess.DEVNULL)
+    # Boot out by label and by path, so it works whether or not the file is still
+    # on disk; both unload the job and terminate the running instance.
+    subprocess.run(["launchctl", "bootout", "system/%s" % label], stderr=subprocess.DEVNULL)
+    subprocess.run(["launchctl", "bootout", "system", str(path)], stderr=subprocess.DEVNULL)
     if path.exists():
         path.unlink()
         log("removed %s" % path)
     else:
         log("no plist at %s" % path)
+    log("daemon %s unloaded; it will NOT restart, including across reboots" % label)
 
 
 # --- exclude / include: bench a syscall, then rotate it back -----------------
@@ -840,20 +1878,11 @@ def emit_syscalls(culprit, out=None):
     Runs `syz-ring-repro -emit-json`, which writes syscalls.json next to the
     culprit (unless out is given), and returns the names. Raises RuntimeError if
     the tool fails or writes no readable list.
+
+    Lives in quarantine.py so the coordinator and the standalone `quarantine.py
+    crash --culprit` path cannot drift; this wrapper only adds campaign logging.
     """
-    culprit = Path(culprit)
-    if not culprit.exists():
-        raise RuntimeError("culprit not found: %s" % culprit)
-    out = Path(out) if out else culprit.parent / "syscalls.json"
-    cmd = ringrepro_cmd() + ["-emit-json", "-json-out", str(out), str(culprit)]
-    log("$ %s" % " ".join(cmd))
-    rc = subprocess.run(cmd, cwd=str(REPO_ROOT)).returncode
-    if rc != 0:
-        raise RuntimeError("syz-ring-repro -emit-json exited %d on %s" % (rc, culprit))
-    doc = read_json(out)
-    if not doc or "syscalls" not in doc:
-        raise RuntimeError("no readable syscall list at %s" % out)
-    return doc["syscalls"]
+    return qm.emit_syscalls(culprit, out, log=log)
 
 
 def write_config(path, cfg):
@@ -918,6 +1947,247 @@ def include_syscalls(names, cfg_path, all_=False, dry_run=False):
     return removed, absent
 
 
+# --- quarantine adapter: crash-aware temporary suppression -------------------
+# The coordinator's automatic path uses quarantine.py (per-config state) instead
+# of a permanent blacklist: a NEW crash is SUSPECT (resume enabled, no bench); a
+# confirmed one is classified HARD/REPETITION/SOFT and the whole disabled set is
+# written into the config. exclude/include stay as manual tools.
+def qstate_path(cfg):
+    return STATE_DIR / ("quarantine_%s.json" % config_id(cfg))
+
+
+def load_qstate(cfg):
+    qs = qm.load_state(str(qstate_path(cfg)))
+    if not qs.get("config"):
+        qs["config"] = str(cfg)
+    return qs
+
+
+def save_qstate(cfg, qs):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    qm.save_state(str(qstate_path(cfg)), qs)
+
+
+def apply_disabled(cfg, qs):
+    """Write disable_syscalls = the quarantine's full disabled set into cfg.
+
+    Unlike exclude (incremental), this makes the config exactly match the
+    scheduler: benched selectors that became ACTIVE/rotated out are also removed.
+    Returns True if the file changed.
+    """
+    cfg = Path(cfg)
+    c = read_json(cfg)
+    if c is None:
+        raise RuntimeError("cannot read config %s" % cfg)
+    want = qm.disabled_set(qs)
+    if list(c.get("disable_syscalls", [])) == want:
+        return False
+    c["disable_syscalls"] = want
+    write_config(cfg, c)
+    log("quarantine: disable_syscalls=%s in %s" % (want, cfg.name))
+    return True
+
+
+def culprit_sequence(culprit):
+    """The minimized culprit as a selector sequence for classification.
+
+    See qm.culprit_sequence: -emit-json for the distinct selectors, expanded to N
+    entries when there is only one so HARD (one call) and REPETITION (many calls)
+    are told apart.
+    """
+    return qm.culprit_sequence(culprit, log=log)
+
+
+def quarantine_decide(s, sig):
+    """On a crash (before triage), apply the SUSPECT gate and decide whether to
+    spend a triage on this signature. Returns "triage" or "resume".
+
+    - NEW signature      -> record SUSPECT (resume enabled), no triage.
+    - tolerated recurrence-> increment/escalate in place, no triage.
+    - suspect recurrence  -> "triage" (confirm it, classify at DONE).
+    - disabled/rotating   -> "triage" (an escape: learn the new path at DONE).
+    """
+    cfg = s.get("current_config")
+    if not cfg:
+        return "resume"
+    qs = load_qstate(cfg)
+    rec = qs["catalog"].get(sig)
+    if rec is None:
+        qm.on_crash(qs, sig, None)             # SUSPECT, occ 1, seq deferred
+        save_qstate(cfg, qs)
+        log("crash %s: NEW -> SUSPECT (occ 1); resuming enabled" % sig)
+        return "resume"
+    if rec["disposition"] == qm.TOLERATED:
+        res = qm.on_crash(qs, sig, None)       # increment; escalate if over budget
+        save_qstate(cfg, qs)
+        if res["disposition"] == qm.DISABLED:
+            apply_disabled(cfg, qs)
+            log("crash %s: tolerated REPETITION escalated -> disabled" % sig)
+        else:
+            log("crash %s: tolerated (occ %d); resuming"
+                % (sig, rec["occurrence_count"]))
+        return "resume"
+    # qm.SUSPECTED ("suspect") is the DISPOSITION; qm.SUSPECT ("SUSPECT") is the
+    # CATEGORY. Two letters apart and both live on the same record -- comparing a
+    # disposition against the category constant silently never matches, which is
+    # how every ordinary confirmation came out labelled "ESCAPED".
+    why = ("CONFIRMED (occ %d) -- minimizing to a culprit"
+           % (rec["occurrence_count"] + 1) if rec["disposition"] == qm.SUSPECTED
+           else "ESCAPED a %s bench -- re-minimizing to learn the new path"
+                % rec["disposition"])
+    log("crash %s: %s" % (sig, why))
+    return "triage"                            # suspect-confirm or escape
+
+
+def quarantine_apply_culprit(s, sig, cfg, culprit):
+    """At triage DONE: classify the culprit and write the config's disabled set."""
+    qs = load_qstate(cfg)
+    try:
+        seq = culprit_sequence(culprit)
+    except RuntimeError as e:
+        log("quarantine: cannot read culprit selectors (%s); suppression skipped" % e)
+        return
+    res = qm.on_crash(qs, sig, seq)
+    # Keep the culprit program path on the record so `replay` can verify it later.
+    rec = qs["catalog"].get(sig)
+    if rec is not None:
+        rec["culprit"] = str(culprit)
+    save_qstate(cfg, qs)
+    apply_disabled(cfg, qs)
+    log("quarantine: %s -> %s/%s; disabled=%s"
+        % (sig, res["category"], res["disposition"], res["disabled"]))
+
+
+def attribute_bug(sig, culprit, job, verified):
+    """Record the minimized reproducer against the bug the signature identifies.
+
+    Best-effort: a campaign must not stall because the inventory is unavailable.
+    The quarantine decision has already been applied by the time we get here."""
+    if not BUG_REGISTRY.exists():
+        return
+    try:
+        selectors = culprit_sequence(culprit)
+    except RuntimeError as e:
+        log("bug_registry attribute: cannot read culprit selectors (%s)" % e)
+        selectors = []
+    cmd = [sys.executable, str(BUG_REGISTRY), "--bugs", str(BUGS_DIR),
+           "attribute", "--sig", sig, "--culprit", str(culprit), "--job", job]
+    for sel in dict.fromkeys(selectors):        # de-dup, keep order
+        cmd += ["--selector", sel]
+    if verified:
+        cmd.append("--verified")
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True)
+    except OSError as e:
+        log("bug_registry attribute failed: %s" % e)
+        return
+    for line in (p.stdout or "").splitlines():
+        if line.strip():
+            log("bug_registry: %s" % line.strip())
+
+
+def route_bug_registry(panic_path, campaign=None, config=None, origin="fuzz"):
+    """Best-effort: catalog a panic in the bug registry (the reportable inventory
+    that end-of-campaign replay iterates). Tolerated crashes are catalogued too."""
+    if not BUG_REGISTRY.exists():
+        return
+    try:
+        BUGS_DIR.mkdir(parents=True, exist_ok=True)
+        p = subprocess.run(
+            [sys.executable, str(BUG_REGISTRY), "--bugs", str(BUGS_DIR),
+             "route", str(panic_path), "--origin", origin]
+            + (["--campaign", campaign] if campaign else [])
+            + (["--config", config_id(config)] if config else []),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if p.returncode != 0:
+            log("bug_registry route rc=%d for %s: %s"
+                % (p.returncode, Path(panic_path).name, (p.stdout or "").strip()))
+            return
+        # Echo the routing decision (NEW BUG / new crash / dup + the bug id and
+        # key). Silently succeeding here is what made the bug inventory feel like
+        # it was not being written at all.
+        for line in (p.stdout or "").splitlines():
+            if line.strip():
+                log("bug_registry: %s  <- %s" % (line.strip(), Path(panic_path).name))
+    except Exception as e:  # noqa: BLE001 - cataloguing must never stall the campaign
+        log("bug_registry route failed for %s: %s" % (panic_path, e))
+
+
+def cmd_replay(name, as_json=False):
+    """End-of-campaign verification manifest: every catalogued crash with its
+    culprit and expected signature, so each can be replayed to confirm it still
+    reproduces after the whole campaign.
+
+    Building the authoritative list is done here; re-executing a saved culprit
+    needs the device (syz-ring-repro replays the ring buffer, not a saved .syz),
+    so this emits the list + the confirm command rather than faking a replay.
+    """
+    d = load_def(name)
+    rows, seen = [], []
+    for item in d["items"]:
+        cfg = item["config"]
+        if cfg in seen:
+            continue
+        seen.append(cfg)
+        qs = load_qstate(cfg)
+        for sig, rec in qs.get("catalog", {}).items():
+            culprit = rec.get("culprit")
+            rows.append({
+                "config": config_id(cfg), "crash_id": sig,
+                "category": rec.get("category"), "disposition": rec.get("disposition"),
+                "occurrences": rec.get("occurrence_count"),
+                "culprit": culprit,
+                "minimized_sequence": rec.get("minimized_sequence"),
+                "replayable": bool(culprit and Path(culprit).exists()),
+            })
+    if as_json:
+        json.dump(rows, sys.stdout, indent=2)
+        print()
+        return 0
+    if not rows:
+        print("no catalogued crashes for campaign %r" % name)
+        return 0
+    print("%-10s %-18s %-11s %-4s %-7s %s"
+          % ("category", "crash_id", "disposition", "occ", "replay?", "culprit"))
+    for r in rows:
+        print("%-10s %-18s %-11s %-4s %-7s %s"
+              % (r["category"] or "?", (r["crash_id"] or "?")[:18],
+                 r["disposition"] or "?", r["occurrences"] or 0,
+                 "yes" if r["replayable"] else "NO",
+                 r["culprit"] or "(no culprit stored)"))
+    n_ok = sum(1 for r in rows if r["replayable"])
+    print("\n%d crash(es); %d with a stored culprit to replay." % (len(rows), n_ok))
+    print("Verify one on-device: replay its culprit through the executor, then\n"
+          "  crash_fingerprint.py match-since <crash_id> <since_epoch>")
+    return 0
+
+
+def quarantine_rotate_due(s):
+    """If a SOFT group's rotation is due, advance it, persist, and signal the
+    coordinator to re-apply the config + resume. Coverage-stall telemetry is used
+    when the session exposes it; otherwise the absolute rotate_cap drives it."""
+    cfg = s.get("current_config")
+    if not cfg:
+        return False
+    qs = load_qstate(cfg)
+    if not qs["soft_groups"]:
+        return False
+    info = inspect(s.get("session_id")) if s.get("session_id") else {}
+    exec_total = info.get("exec_total") or 0     # per run: resets to 0 each (re)start
+    cover = info.get("coverage")
+    # Track executions since the last coverage bump, within this run.
+    if cover is not None and cover != s.get("q_last_cover"):
+        s["q_last_cover"] = cover
+        s["q_cover_exec_mark"] = exec_total
+    mark = s.get("q_cover_exec_mark")
+    since_cov = (exec_total - mark) if mark is not None else 0
+    if qm.maybe_rotate(qs, exec_total, since_cov):
+        save_qstate(cfg, qs)
+        return True
+    return False
+
+
 def _target_config(name, config):
     """The config a command should edit: --config, else the crashed config."""
     s = load_state(name)
@@ -979,6 +2249,44 @@ def cmd_include(name, syscalls, config=None, all_=False, dry_run=False):
     return 0
 
 
+def cmd_brake(name, global_=False, reason=None, clear=False, where=False):
+    """Set or clear the brake. Setting one does not stop a running driver by
+    itself -- it stops the NEXT one, which is the case a running driver cannot
+    cover: the box panicking its way through every relaunch."""
+    g, per = brake_paths(name) if name else (GLOBAL_BRAKE, None)
+    target = g if (global_ or not name) else per
+    if where:
+        print("global      : %s" % g)
+        if per:
+            print("per-campaign: %s" % per)
+        print("from Recovery: touch \"%s\"" % recovery_hint())
+        held = brake_held(name) if name else (
+            (str(g), g.read_text().strip()) if g.exists() else None)
+        print("currently   : %s" % ("SET -- %s" % held[0] if held else "not set"))
+        return 0
+    if clear:
+        try:
+            target.unlink()
+            log("brake cleared: %s" % target)
+        except FileNotFoundError:
+            log("no brake at %s" % target)
+        except OSError as e:
+            die("cannot clear brake %s: %s" % (target, e))
+        if name:
+            log("the campaign stays halted until: fuzz-campaign.py resume %s" % name)
+        return 0
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((reason or "set by %s at %s" % (getpass.getuser(), now_iso())) + "\n")
+    except OSError as e:
+        die("cannot set brake %s: %s" % (target, e))
+    log("BRAKE SET: %s" % target)
+    log("  the next driver start will halt instead of fuzzing")
+    log("  clear with: fuzz-campaign.py brake %s--clear"
+        % ("%s " % name if name and not global_ else "--global "))
+    return 0
+
+
 # --- cli ---------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="autonomous campaign driver over fuzz-session.py")
@@ -995,16 +2303,70 @@ def main():
     sp.add_argument("--min-free-gb", type=float, default=DEFAULTS["min_free_gb"])
     sp.add_argument("--keep-cores", type=int, default=DEFAULTS["keep_cores"])
     sp.add_argument("--force", action="store_true")
+    # Baked into the def's "triage" block and replayed to `triage.py new` on every
+    # bug the coordinator decides to minimize. Mirror what the manual runs used.
+    sp.add_argument("--kcov-device", help="coverage device passed to triage (e.g. /dev/pishi)")
+    sp.add_argument("--kext-id", type=int, help="Pishi kext id passed to triage")
+    sp.add_argument("--executor", help="syz-executor for triage (default: bin/darwin_arm64/syz-executor)")
+    sp.add_argument("--ringrepro", help="syz-ring-repro for triage (default: bin/darwin_arm64/syz-ring-repro)")
+    sp.add_argument("--sandbox", help="sandbox mode passed to triage")
+    sp.add_argument("--max-k", type=int, help="triage minimization width cap")
+    # Circuit-breaker overrides. A crash-heavy target needs these loosened, or the
+    # breaker halts the campaign before any bug reaches its second occurrence.
+    sp.add_argument("--crashloop-limit", type=int,
+                    help="consecutive fast crashes before halting (default %d)"
+                         % DEFAULTS["crashloop_limit"])
+    sp.add_argument("--crashloop-window-seconds", type=int,
+                    help="a run shorter than this counts as a fast crash (default %d)"
+                         % DEFAULTS["crashloop_window_seconds"])
+    sp.add_argument("--triage-max-boots", type=int,
+                    help="advances before giving up on a triage (default %d)"
+                         % DEFAULTS["triage_max_boots"])
+    sp.add_argument("--budget-clock", choices=BUDGET_CLOCKS,
+                    help="what --budget-hours measures: 'fuzz' charges only "
+                         "manager execution, 'wall' also charges minimization "
+                         "and reboots (default %s)" % DEFAULTS["budget_clock"])
+
+    sp = sub.add_parser("brake",
+                        help="set/clear the file brake that stops a campaign even "
+                             "from Recovery")
+    sp.add_argument("name", nargs="?", help="campaign to brake (omit for --global)")
+    sp.add_argument("--global", dest="global_", action="store_true",
+                    help="brake every campaign, not just one")
+    sp.add_argument("--reason", help="note stored in the file and logged on halt")
+    sp.add_argument("--clear", action="store_true", help="remove the brake file")
+    sp.add_argument("--where", action="store_true",
+                    help="print the brake paths (including the Recovery form) and exit")
+
+    sp = sub.add_parser("status", help="show campaign runtime state")
+    sp.add_argument("name")
+    sp.add_argument("-w", "--watch", action="store_true",
+                    help="redraw until Ctrl-C, annotating what changed since the "
+                         "last refresh")
+    sp.add_argument("--interval", type=int, default=10,
+                    help="seconds between redraws with --watch (default 10)")
 
     for _n, _h in (("run", "supervision loop (launchd entry point)"),
-                   ("status", "show campaign runtime state"),
-                   ("halt", "mark the campaign halted"),
-                   ("resume", "clear halt and mark running"),
-                   ("install", "generate + load the launchd daemon (sudo)"),
-                   ("uninstall", "unload + remove the launchd daemon (sudo)")):
+                   ("doctor", "pre-flight checks before a run"),
+                   ("halt", "soft-pause the campaign (leaves the daemon installed)"),
+                   ("resume", "clear halt and mark running")):
         s2 = sub.add_parser(_n, help=_h)
         s2.add_argument("name")
+
+    for _n, _h in (("install", "generate + load a launchd job that resumes across reboots"),
+                   ("uninstall", "stop the daemon/agent now + prevent restart (removes the plist)")):
+        sp = sub.add_parser(_n, help=_h)
+        sp.add_argument("name")
+        sp.add_argument("--user", help="the user the job runs as (e.g. fuzz, the auto-login user)")
+        sp.add_argument("--agent", action="store_true",
+                        help="per-user LaunchAgent (runs in the login/GUI session) instead of a "
+                             "system LaunchDaemon -- use when the driver needs the console session")
     sub.add_parser("list", help="table of all campaigns")
+
+    sp = sub.add_parser("replay",
+                        help="verification manifest: every catalogued crash + its culprit to re-confirm")
+    sp.add_argument("name")
+    sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("exclude",
                         help="bench a culprit's syscall (remove it from the config) so fuzzing can resume")
@@ -1028,21 +2390,34 @@ def main():
     if args.cmd == "new":
         cmd_new(args.name, args.configs, args.budget_hours, args.loop,
                 args.poll_seconds, args.hang_after_seconds, args.max_crashes,
-                args.min_free_gb, args.keep_cores, args.force)
+                args.min_free_gb, args.keep_cores, args.force,
+                {"executor": args.executor, "ringrepro": args.ringrepro,
+                 "kcov_device": args.kcov_device, "kext_id": args.kext_id,
+                 "sandbox": args.sandbox, "max_k": args.max_k},
+                {"crashloop_limit": args.crashloop_limit,
+                 "crashloop_window_seconds": args.crashloop_window_seconds,
+                 "triage_max_boots": args.triage_max_boots,
+                 "budget_clock": args.budget_clock})
+    elif args.cmd == "brake":
+        sys.exit(cmd_brake(args.name, args.global_, args.reason, args.clear, args.where))
     elif args.cmd == "run":
         cmd_run(args.name)
     elif args.cmd == "status":
-        cmd_status(args.name)
+        cmd_status(args.name, args.watch, args.interval)
+    elif args.cmd == "doctor":
+        sys.exit(cmd_doctor(args.name))
     elif args.cmd == "list":
         cmd_list()
+    elif args.cmd == "replay":
+        sys.exit(cmd_replay(args.name, args.json))
     elif args.cmd == "halt":
         cmd_halt(args.name)
     elif args.cmd == "resume":
         cmd_resume(args.name)
     elif args.cmd == "install":
-        cmd_install(args.name)
+        cmd_install(args.name, args.user, args.agent)
     elif args.cmd == "uninstall":
-        cmd_uninstall(args.name)
+        cmd_uninstall(args.name, args.user, args.agent)
     elif args.cmd == "exclude":
         sys.exit(cmd_exclude(args.name, args.culprit, args.config, args.dry_run))
     elif args.cmd == "include":
