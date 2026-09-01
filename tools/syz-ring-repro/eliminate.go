@@ -154,6 +154,12 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 	// after other probes have run is exposed to the very accumulated kernel state
 	// the re-check exists to rule out.
 	probesThisBoot := 0
+	// Consecutive probes that never reached the kernel because the executor died.
+	// These carry NO information about the subset, and recording them as negatives
+	// silently produces a confident wrong answer -- one real run fabricated 12,692
+	// "no crash" verdicts from an unwritable working directory without executing a
+	// single program.
+	execErrStreak := 0
 	// The memoized, checkpointed, crash-safe predicate. On a cache hit it replays
 	// instantly (no device run); otherwise it fsyncs the pending mask, runs the
 	// subset on device, and records the result. A crashing subset reboots the box
@@ -177,9 +183,28 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		sub := red.extract(mask)
 		log.Logf(0, "Testing %s %v — %d calls ...", plural(popcount(mask), red.label), setBits(mask), len(sub.Calls))
 		if err := runProgramOnce(target, sub); err != nil {
-			log.Logf(0, "  (executor error, box still up — treating as no crash: %v)", err)
+			execErrStreak++
+			log.Logf(0, "  (executor error, box still up — NOT recorded, %d in a row: %v)",
+				execErrStreak, err)
+			if execErrStreak >= maxExecErrStreak {
+				tool.Failf("the executor failed %d probes in a row (last: %v).\n"+
+					"Nothing has been tested, so minimization cannot make progress. The usual "+
+					"cause is a working directory the invoking user cannot write: the executor "+
+					"creates its shmem file and per-program tmpdir relative to its cwd, and dies "+
+					"with \"SYZFAIL: shmem open failed ... errno 13\". Run from a directory that "+
+					"user owns.", execErrStreak, err)
+			}
+			// Leave the memo untouched: a subset we never managed to run must be
+			// re-probed on a later boot, not replayed as a verdict we never measured.
+			state.Attempting = ""
+			state.AttemptingAt = 0
+			if err := saveDdState(statePath, state); err != nil {
+				tool.Failf("checkpoint: %v", err)
+			}
+			return false
 		}
-		// Reaching here means no kernel panic: this subset did not reproduce.
+		execErrStreak = 0
+		// Reaching here means the subset ran and did not panic the kernel.
 		state.Memo[key] = false
 		state.Attempting = ""
 		state.AttemptingAt = 0
@@ -194,6 +219,13 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 
 	minimal := searchCulprit(red.n, *flagMaxK, pred)
 	verified := verifyCulprit(target, state, statePath, red, minimal, probesThisBoot)
+	// The search has returned, so every subset it wanted has been probed. If the
+	// answer still is not verified, verification has been attempted and failed --
+	// there is no further work that would change the result, and the caller must
+	// be told to stop relaunching us.
+	if !verified && state.exhaustedFor(minimal) {
+		state.Exhausted = true
+	}
 	// Persist the terminal state so the on-disk checkpoint reflects the finished
 	// run. Two paths otherwise leave it stale: a verification that crashed and was
 	// recovered on the next boot sets VerifiedCrash only in memory (loadDdState),
@@ -202,7 +234,7 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 	if err := saveDdState(statePath, state); err != nil {
 		tool.Failf("checkpoint: %v", err)
 	}
-	return finishMinimize(p, red, minimal, culpritPath, verified)
+	return finishMinimize(p, red, minimal, culpritPath, verified, state.Exhausted)
 }
 
 // verifyCulprit re-runs the culprit on its own to confirm it reproduces without
@@ -252,7 +284,7 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 }
 
 func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath string,
-	verified bool) error {
+	verified, exhausted bool) error {
 	sub := red.extract(minimal)
 	if err := os.WriteFile(culpritPath, sub.Serialize(), 0644); err != nil {
 		return fmt.Errorf("write culprit: %w", err)
@@ -263,6 +295,8 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 	status := "NOT verified (never re-checked on its own)"
 	if verified {
 		status = "verified (crashes on its own)"
+	} else if exhausted {
+		status = "NOT verified — re-checked and it did NOT crash alone (search exhausted)"
 	}
 	log.Logf(0, "")
 	log.Logf(0, "Minimal culprit: %s, %s.", plural(popcount(minimal), red.label), status)
@@ -270,6 +304,12 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 		log.Logf(0, "  [%d] %s", i, red.describe(i))
 	}
 	log.Logf(0, "Wrote %d-call reproducer to %s", len(sub.Calls), culpritPath)
+	if exhausted {
+		log.Logf(0, "")
+		log.Logf(0, "This is the final answer for this program: no subset reproduces on "+
+			"its own, so the bug needs state an earlier program leaves behind. Treat the "+
+			"sequence above as a lead, not a proof — re-running will not improve it.")
+	}
 	return nil
 }
 
@@ -277,6 +317,10 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 // is still up (nil on clean completion). A kernel panic reboots the machine and
 // kills this process, so a crash never returns here — it is observed out-of-band
 // via the checkpoint on the next boot.
+// How many back-to-back executor failures mean the environment is broken rather
+// than a program being flaky. Small: a healthy run has essentially none.
+const maxExecErrStreak = 10
+
 func runProgramOnce(target *prog.Target, p *prog.Prog) error {
 	sandbox, err := flatrpc.SandboxToFlags(*flagSandbox)
 	if err != nil {

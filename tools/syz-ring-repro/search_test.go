@@ -370,3 +370,36 @@ func TestBestCulprit(t *testing.T) {
 		t.Errorf("recovered-attempt culprit = 0x%x ok=%v; want 0x2 true", mask, ok)
 	}
 }
+
+// A finished search whose answer has already failed re-check is exhausted: there
+// is nothing left to try, and the orchestrator must stop relaunching. Without
+// this signal a clean exit with no VerifiedCrash is indistinguishable from "not
+// done yet", which spun six triage advances on a real campaign.
+func TestExhaustedFor(t *testing.T) {
+	s := &ddState{Memo: map[string]bool{"9": true}}
+	if s.exhaustedFor(0x9) {
+		t.Error("exhausted before verification was ever attempted")
+	}
+	s.VerifyFailed = append(s.VerifyFailed, maskKey(0x9))
+	if !s.exhaustedFor(0x9) {
+		t.Error("not exhausted after the answer failed re-check")
+	}
+	// A different candidate is still worth trying.
+	if s.exhaustedFor(0x3) {
+		t.Error("exhausted for a mask that was never re-checked")
+	}
+}
+
+// Exhausted must survive the checkpoint: the whole point is that the NEXT
+// process learns not to repeat the work.
+func TestExhaustedRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conn_state.json")
+	s := &ddState{Kind: "connection", NUnits: 4, ProgHash: "p",
+		Memo: map[string]bool{"2": true}, VerifyFailed: []string{"2"}, Exhausted: true}
+	if err := saveDdState(path, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadDdState(path, 4, "p", ""); !got.Exhausted {
+		t.Error("Exhausted did not survive the checkpoint round trip")
+	}
+}

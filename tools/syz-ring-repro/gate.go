@@ -29,6 +29,48 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 )
 
+// bootEpoch is when this machine last booted, or 0 if it cannot be determined.
+//
+// The minimizer's crash signal is indirect: a subset that panics the box kills
+// this process, and the pending checkpoint is recovered as a repro on the next
+// boot. But a process can die WITHOUT the box going down -- an operator
+// restarting the launchd agent, a SIGKILL, an OOM. Those recover as a crash too,
+// which invents a culprit; and because the memo is checkpointed, the wrong answer
+// is permanent. Comparing the boot time against when the attempt started tells
+// the two apart. Darwin-only (kern.boottime); elsewhere this returns 0 and
+// callers fall back to the old, more permissive behaviour.
+func bootEpoch() float64 {
+	out, err := exec.Command("sysctl", "-n", "kern.boottime").Output()
+	if err != nil {
+		return 0
+	}
+	i := strings.Index(string(out), "sec = ")
+	if i < 0 {
+		return 0
+	}
+	rest := string(out)[i+len("sec = "):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end <= 0 {
+		return 0
+	}
+	v, err := strconv.ParseFloat(rest[:end], 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// rebootedSince reports whether the box actually rebooted after `at`. A false
+// answer means the process died for some other reason, so a pending attempt must
+// NOT be counted as a reproduction.
+func rebootedSince(at float64) bool {
+	b := bootEpoch()
+	if b <= 0 || at <= 0 {
+		return true // cannot tell: keep the permissive behaviour
+	}
+	return b >= at
+}
+
 // gateNow is the epoch stamped as a subset starts running, i.e. the "since" a
 // crash gate scopes its panic-report scan to. Whole seconds are enough — reports
 // land seconds after the reboot — and the Python side applies a small grace

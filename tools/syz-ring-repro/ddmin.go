@@ -194,6 +194,17 @@ type ddState struct {
 	// VerifyFailed are masks that crashed during the search but did not crash on
 	// re-check. Recorded so verification is attempted once and cannot loop.
 	VerifyFailed []string `json:"verify_failed,omitempty"`
+	// Exhausted marks a finished search whose best candidate has already failed
+	// verification: there is nothing left to try, and re-running will produce the
+	// same unverified answer forever.
+	//
+	// Without this the caller cannot tell "not finished yet, relaunch me" from
+	// "finished, and the answer is that no subset reproduces alone". Both looked
+	// like a clean exit with no VerifiedCrash, so an orchestrator that relaunches
+	// until verification succeeds spins until its boot budget runs out. That is
+	// not hypothetical: a poisoned checkpoint burned six triage advances in a real
+	// campaign and would have consumed all forty.
+	Exhausted bool `json:"exhausted,omitempty"`
 	// AttemptingAt / VerifyingAt are the wall-clock epochs the in-flight
 	// Attempting / Verifying subset started running, so a crash gate can scope its
 	// panic-report scan to reports produced by that subset's reboot. Zero when
@@ -212,6 +223,13 @@ func (s *ddState) meanProbeMs() int64 {
 }
 
 func maskKey(mask uint64) string { return strconv.FormatUint(mask, 16) }
+
+// exhaustedFor reports whether the finished search's answer has already been
+// re-checked and failed. Called only after searchCulprit returns, so "the search
+// wanted nothing more" is implied; this adds "and verification is spent".
+func (s *ddState) exhaustedFor(minimal uint64) bool {
+	return slices.Contains(s.VerifyFailed, maskKey(minimal))
+}
 
 // bestCulprit reports the smallest subset currently known to crash, and whether
 // one exists. This is the checkpoint's best answer at any moment, without any
@@ -267,6 +285,7 @@ func progHash(p *prog.Prog) string {
 //     panic (see atomicWriteJSON). Its Attempting mask is the crash the lost
 //     write existed to record, so it is recovered the same way. Without this,
 //     any checkpoint written before the fsync-the-directory fix is unreadable.
+//
 // The optional gate (variadic so existing callers stay 4-arg) filters reboots
 // that reproduced a different bug than the target out of the recovered memo; a
 // nil/absent gate recovers every reboot as a crash, the original behavior.
@@ -323,6 +342,11 @@ func (s *ddState) recoverVerify(key string, at float64, nConns int, gate *crashG
 	if !validMask(key, nConns) {
 		return
 	}
+	if !rebootedSince(at) {
+		log.Logf(0, "interrupted while verifying %s but the box never rebooted "+
+			"— verification is inconclusive, not a pass", key)
+		return
+	}
 	if gate.verdict(at) == gateOther {
 		if !slices.Contains(s.VerifyFailed, key) {
 			s.VerifyFailed = append(s.VerifyFailed, key)
@@ -353,6 +377,13 @@ func validMask(key string, nConns int) bool {
 func (s *ddState) recoverAttempt(key string, at float64, nConns int, gate *crashGate) {
 	s.Attempting = ""
 	if !validMask(key, nConns) {
+		return
+	}
+	if !rebootedSince(at) {
+		// Interrupted, not crashed. Leave it UNMEMOIZED so the subset is probed
+		// again rather than recorded as a verdict we never actually observed.
+		log.Logf(0, "interrupted while testing %s but the box never rebooted "+
+			"— not counting it as a repro; it will be re-probed", key)
 		return
 	}
 	if gate.verdict(at) == gateOther {
