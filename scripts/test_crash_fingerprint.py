@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for crash_fingerprint against synthetic and real panic logs."""
+import json
 import os
 import sys
 import tempfile
@@ -97,6 +98,40 @@ class Store(unittest.TestCase):
         self.assertEqual(cf.classify(self._fp("bbb"), store, ignore), "ignored")
         # still counted, so recurrence of a suppressed bug is visible.
         self.assertEqual(store["signatures"]["bbb"]["count"], 1)
+
+
+class IpsJson(unittest.TestCase):
+    """Newer macOS .ips/.panic reports: a JSON header line + a payload JSON whose
+    panicString holds the panic text -- with LITERAL control characters (raw
+    tabs/newlines), which a strict json.loads rejects. load_panic_text must still
+    recover the panic text and parse real frames, not fall back to the raw JSON.
+    """
+
+    def _write_ips(self, path):
+        ps = ("panic(cpu 6 caller 0xfffffe004ac3e264): Kernel data abort. at pc 0x1\n"
+              "Panicked thread: 0xabc, backtrace: 0xdef, tid: 123\n"
+              "\t  lr: 0xfffffe0049b97104  fp: 0xfffffe4c00000000\n"
+              "Kernel Extensions in backtrace:\n"
+              "  com.apple.driver.AppleJPEGDriver(7.7.9)[44530213-6160-3DB4-9987-BC76BCBE423D]"
+              "@0xfffffe0049b8b090->0xfffffe0049bb287b\n"
+              "Kernel text exec base: 0xfffffe0049000000\n")
+        # json.dumps escapes control chars; un-escape them back to LITERAL tabs
+        # and newlines inside the string, reproducing the real-world payload that
+        # trips strict parsing.
+        payload = ('{"panicString": %s}' % json.dumps(ps)).replace("\\n", "\n").replace("\\t", "\t")
+        with open(path, "w") as f:
+            f.write('{"bug_type":"210","timestamp":"2026-08-24 16:42:28.00 +0200"}\n')
+            f.write(payload)
+
+    def test_recovers_frames_from_ips_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.panic")
+            self._write_ips(p)
+            fp = cf.fingerprint(p)
+            self.assertEqual(fp["title"], "Kernel data abort")
+            self.assertEqual(fp["crashing_kext"], "AppleJPEGDriver")
+            self.assertTrue(fp["frames"], "expected real frames, got none (fell back to raw JSON)")
+            self.assertIn("AppleJPEGDriver+0x", ";".join(fp["frames"]))
 
 
 class MatchSince(unittest.TestCase):

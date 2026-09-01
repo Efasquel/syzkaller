@@ -24,6 +24,9 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import timefmt  # noqa: E402
+
 
 # For `match-since` (the syz-ring-repro crash gate): report globs + a grace
 # window so a report written a second or two before the recorded "since" (clock
@@ -61,6 +64,12 @@ def load_panic_text(path):
     .ips/.panic are two lines: a header JSON, then a payload JSON carrying the
     panic under "panicString". A *.kernel.core.log is already that text. We
     sniff the first non-space byte: '{' means the JSON container.
+
+    strict=False is essential: newer macOS payloads embed literal control
+    characters (raw tabs/newlines inside string fields such as panicString), and
+    a strict json.loads rejects those with "Invalid control character", which
+    would silently fall back to parsing the raw JSON as if it were panic text --
+    yielding a garbage signature with zero frames.
     """
     with open(path, "r", errors="replace") as f:
         raw = f.read()
@@ -69,7 +78,7 @@ def load_panic_text(path):
         parts = raw.split("\n", 1)
         if len(parts) == 2:
             try:
-                payload = json.loads(parts[1])
+                payload = json.loads(parts[1], strict=False)
                 ps = payload.get("panicString")
                 if ps:
                     return ps
@@ -80,7 +89,7 @@ def load_panic_text(path):
 
 # --- parsing ----------------------------------------------------------------
 _MODULE_RE = re.compile(
-    r'([\w.]+)\([^)]*\)\[[0-9A-Fa-f-]+\]@(0x[0-9a-fA-F]+)->(0x[0-9a-fA-F]+)')
+    r'([\w.]+)\([^)]*\)\[([0-9A-Fa-f-]+)\]@(0x[0-9a-fA-F]+)->(0x[0-9a-fA-F]+)')
 _KTEXT_RE = re.compile(r'Kernel text exec base:\s*(0x[0-9a-fA-F]+)')
 _LR_RE = re.compile(r'\blr:\s*(0x[0-9a-fA-F]+)')
 
@@ -115,13 +124,16 @@ def short_kext(name):
 def parse_modules(text):
     """Parse the loaded modules that frames can be attributed to.
 
-    Returns (crashing_kext, ranges) where ranges is a list of
+    Returns (crashing_kext, ranges, uuids) where ranges is a list of
     (name, base, end) covering every kext listed under "Kernel Extensions in
     backtrace:" plus a synthetic "kernel" range from the kernel text base to
-    infinity. crashing_kext is the first non-dependency entry (the extension the
-    backtrace is attributed to), or None.
+    infinity, and uuids maps each kext's short name to its load-UUID (so a
+    symbol map can be matched to the exact binary that crashed). crashing_kext
+    is the first non-dependency entry (the extension the backtrace is attributed
+    to), or None.
     """
     ranges = []
+    uuids = {}
     crashing = None
     in_kexts = False
     for line in text.splitlines():
@@ -135,8 +147,10 @@ def parse_modules(text):
                 if line.strip() and "dependency:" not in line:
                     break
                 continue
-            name, base, end = m.group(1), int(m.group(2), 16), int(m.group(3), 16)
+            name, uuid = m.group(1), m.group(2)
+            base, end = int(m.group(3), 16), int(m.group(4), 16)
             ranges.append((name, base, end))
+            uuids.setdefault(short_kext(name), uuid.lower())
             if crashing is None and "dependency:" not in line:
                 crashing = name
     km = _KTEXT_RE.search(text)
@@ -146,7 +160,7 @@ def parse_modules(text):
         # bogus, slide-varying offset.
         base = int(km.group(1), 16)
         ranges.append(("kernel", base, base + KERNEL_TEXT_MAX))
-    return crashing, ranges
+    return crashing, ranges, uuids
 
 
 def parse_backtrace(text):
@@ -201,14 +215,19 @@ def deslide(addrs, ranges):
     return frames
 
 
+def _signature(title, crashing, frames):
+    """The dedup signature: sha256 of title | crashing-kext | de-slid frames."""
+    key = "%s|%s|%s" % (title, crashing or "?", ";".join(frames))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def fingerprint(path):
     """Parse a report and return its signature and the parts it was built from."""
     text = load_panic_text(path)
     title = parse_title(text)
-    crashing, ranges = parse_modules(text)
+    crashing, ranges, _ = parse_modules(text)
     frames = deslide(parse_backtrace(text), ranges)
-    key = "%s|%s|%s" % (title, crashing or "?", ";".join(frames))
-    sig = hashlib.sha256(key.encode()).hexdigest()[:16]
+    sig = _signature(title, crashing, frames)
     return {
         "signature": sig,
         "title": title,
@@ -279,7 +298,251 @@ def classify(fp, store, ignore=None, report_name=None):
 
 
 def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return timefmt.now_iso()
+
+
+# --- fault analysis (analyze) -----------------------------------------------
+# The dedup *signature* answers "is this the same crash again?". The fault
+# *analysis* answers a different question -- "which bug is this, and how does it
+# fail?" -- by extracting the two facts that actually separate distinct bugs in a
+# driver: the culprit code site (which method) and the fault class (read vs
+# write, null vs not). Those combine into a bug_key that groups a bug's several
+# crash manifestations while keeping genuinely different bugs apart, which the
+# raw backtrace signature does not (one root cause can crash several ways, and
+# the panic's own "crashing kext" label misattributes coverage-relocated faults).
+_ESR_RE = re.compile(r'\besr:\s*(0x[0-9a-fA-F]+)')
+_FAR_RE = re.compile(r'\bfar:\s*(0x[0-9a-fA-F]+)')
+_PC_RE = re.compile(r'\bpc:\s*(0x[0-9a-fA-F]+)\s+cpsr:')
+_KUUID_RE = re.compile(r'Kernel UUID:\s*([0-9A-Fa-f-]+)')
+_PGZ_ZONE_RE = re.compile(
+    r'Probabilistic GZAlloc Report:.*?Zone\s*:\s*(\S+)', re.S)
+_PGZ_KIND_RE = re.compile(
+    r'Probabilistic GZAlloc Report:.*?Kind\s*:\s*([^\n]+)', re.S)
+
+# Coverage/instrumentation kexts (KextFuzz/Pishi) statically relocate one
+# instruction per basic block into their own __text. A fault whose PC lands there
+# is still the *driver's* bug -- so these modules are skipped when picking the
+# culprit frame, and the panic's own crashing-kext label (which then reads
+# "Pishi") is corrected to the first real driver frame beneath the fault.
+INSTRUMENTATION_MODULES = ("Pishi", "Kcov")
+
+# Kexts in a kernelcache are disassembled by tools (Ghidra) at a __TEXT_EXEC
+# address that sits this far above the runtime kext load base, so a de-slid
+# runtime offset must be shifted by this to match an offset read off a
+# disassembly. Overridable per module in the symbol file ("text_offset").
+DEFAULT_TEXT_OFFSET = 0x10000
+
+
+def _hex(regex, text):
+    m = regex.search(text)
+    return int(m.group(1), 16) if m else None
+
+
+def _grp(regex, text):
+    m = regex.search(text)
+    return m.group(1).strip() if m else None
+
+
+def _resolve(addr, ranges):
+    """(short_module, offset) for a raw address, or (None, None) if unmatched.
+
+    Kexts are tried before the bounded kernel range, mirroring deslide(), so a
+    kext frame is never mis-attributed to the kernel.
+    """
+    if addr is None:
+        return None, None
+    a = canonicalize(addr)
+    kexts = [r for r in ranges if r[0] != "kernel"]
+    kernel = [r for r in ranges if r[0] == "kernel"]
+    for name, base, end in kexts + kernel:
+        if base <= a < end:
+            return short_kext(name), a - base
+    return None, None
+
+
+def decode_esr(esr):
+    """Decode an AArch64 ESR_EL1 into (ec, wnr, dfsc, direction).
+
+    EC (bits 31:26) is the exception class: 0x24/0x25 are data aborts, for which
+    bit 6 (WnR) is write-not-read and bits 5:0 (DFSC) is the fault status;
+    0x20/0x21 are instruction aborts (an execute fault). direction is
+    READ/WRITE/EXEC, or None for a class we do not model.
+    """
+    ec = (esr >> 26) & 0x3F
+    wnr = (esr >> 6) & 1
+    dfsc = esr & 0x3F
+    if ec in (0x24, 0x25):
+        direction = "WRITE" if wnr else "READ"
+    elif ec in (0x20, 0x21):
+        direction = "EXEC"
+    else:
+        direction = None
+    return ec, wnr, dfsc, direction
+
+
+def classify_fault(direction, far):
+    """The fault class used in a bug_key: direction, plus a NULL- prefix when the
+    faulting address is within the first page (a null / near-null dereference,
+    e.g. a write through a failed allocation or a struct field off a NULL base).
+
+    The PGZ verdict (out-of-bounds vs use-after-free) is deliberately NOT folded
+    in here: for one over-read it flips between the two depending on what the
+    sweep happened to hit, which would split one bug. It is recorded separately.
+    """
+    if direction is None:
+        return "OTHER"
+    if far is not None and far < 0x1000:
+        return "NULL-%s" % direction
+    return direction
+
+
+def lookup_symbol(symbols, module, uuid, runtime_off):
+    """Resolve a runtime kext offset to a function name via a loaded symbol map.
+
+    Returns (func_name_or_None, disasm_offset, confidence). The name is returned
+    *without* any confidence decoration so the bug_key stays stable when an
+    inferred range is later confirmed; confidence is returned alongside for
+    display. The symbol map's ranges are disassembly (Ghidra) offsets, so the
+    runtime offset is shifted up by the module's text_offset before it is
+    matched. Matching prefers the exact binary by UUID, falling back to name.
+    """
+    entry = None
+    if uuid and uuid in symbols.get("by_uuid", {}):
+        entry = symbols["by_uuid"][uuid]
+    elif module in symbols.get("by_name", {}):
+        entry = symbols["by_name"][module]
+    if entry is None or runtime_off is None:
+        return None, None, None
+    disasm_off = runtime_off + entry.get("text_offset", DEFAULT_TEXT_OFFSET)
+    for fn in entry.get("functions", []):
+        if fn["start"] <= disasm_off < fn["end"]:
+            return fn["name"], disasm_off, fn.get("confidence")
+    return None, disasm_off, None
+
+
+def load_symbols(sym_dir):
+    """Load symbols/*.json into indexes by UUID and by module name.
+
+    Each file: {"module","uuid","text_offset"?,"functions":[{"name","start",
+    "end","confidence"?}]}. start/end are disassembly offsets (hex strings or
+    ints). Returns {"by_uuid":{...},"by_name":{...}}; an empty index if the
+    directory is absent, so analyze degrades to offset-only bug keys.
+    """
+    idx = {"by_uuid": {}, "by_name": {}}
+    if not sym_dir or not os.path.isdir(sym_dir):
+        return idx
+    for path in sorted(globmod.glob(os.path.join(sym_dir, "*.json"))):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:  # noqa: BLE001
+            print("warning: bad symbol file %s: %s" % (path, e), file=sys.stderr)
+            continue
+        fns = []
+        for fn in data.get("functions", []):
+            s, e = fn["start"], fn["end"]
+            fns.append({
+                "name": fn["name"],
+                "start": s if isinstance(s, int) else int(s, 16),
+                "end": e if isinstance(e, int) else int(e, 16),
+                "confidence": fn.get("confidence"),
+            })
+        to = data.get("text_offset", DEFAULT_TEXT_OFFSET)
+        entry = {
+            "functions": fns,
+            "text_offset": to if isinstance(to, int) else int(to, 16),
+        }
+        if data.get("uuid"):
+            idx["by_uuid"][data["uuid"].lower()] = entry
+        if data.get("module"):
+            idx["by_name"][data["module"]] = entry
+    return idx
+
+
+def analyze(path, symbols=None):
+    """Extract the bug-discriminating facts from a panic report.
+
+    Returns a record with the dedup signature (as before) plus: the fault class
+    (from ESR/FAR), the culprit code site (first backtrace frame that is neither
+    kernel nor instrumentation, de-slid to module+offset and, if a symbol map is
+    given, a function name), and a bug_key = module:site:fault_class that is the
+    stable identity used by the bug registry.
+    """
+    symbols = symbols or {"by_uuid": {}, "by_name": {}}
+    text = load_panic_text(path)
+    title = parse_title(text)
+    crashing, ranges, uuids = parse_modules(text)
+    raw = parse_backtrace(text)
+    frames = deslide(raw, ranges)
+    sig = _signature(title, crashing, frames)
+
+    esr = _hex(_ESR_RE, text)
+    far = _hex(_FAR_RE, text)
+    pc = _hex(_PC_RE, text)
+    ec = wnr = dfsc = direction = None
+    if esr is not None:
+        ec, wnr, dfsc, direction = decode_esr(esr)
+    fclass = classify_fault(direction, far)
+    pgz_zone = _grp(_PGZ_ZONE_RE, text)
+    pgz_kind = _grp(_PGZ_KIND_RE, text)
+
+    # Culprit = first frame that is neither kernel nor instrumentation. The
+    # panic/exception-handler frames at the very top are all kernel, so this
+    # lands on the driver call site that issued the faulting operation.
+    culprit_mod = culprit_off = None
+    for a in raw:
+        mod, off = _resolve(a, ranges)
+        if mod is None or mod == "kernel":
+            continue
+        if any(s in mod for s in INSTRUMENTATION_MODULES):
+            continue
+        culprit_mod, culprit_off = mod, off
+        break
+
+    pc_mod, pc_off = _resolve(pc, ranges)
+    pc_instrumented = bool(pc_mod and any(s in pc_mod for s in INSTRUMENTATION_MODULES))
+
+    func = culprit_disasm = func_conf = None
+    if culprit_mod:
+        func, culprit_disasm, func_conf = lookup_symbol(
+            symbols, culprit_mod, uuids.get(culprit_mod), culprit_off)
+
+    if func:
+        site = func
+    elif culprit_off is not None:
+        # No symbol: key on the runtime offset (prefix r) so it is unambiguous
+        # against a disassembly offset, and still stable across reboots.
+        site = "r+0x%x" % culprit_off
+    else:
+        site = "?"
+    bug_key = "%s:%s:%s" % (culprit_mod or "?", site, fclass)
+
+    return {
+        "report": path,
+        "signature": sig,
+        "bug_key": bug_key,
+        "title": title,
+        "crashing_kext": short_kext(crashing) if crashing else None,
+        "fault_class": fclass,
+        "direction": direction,
+        "far": far,
+        "far_null": far is not None and far < 0x1000,
+        "esr": esr,
+        "ec": ec,
+        "wnr": wnr,
+        "dfsc": dfsc,
+        "culprit_module": culprit_mod,
+        "culprit_off": culprit_off,
+        "culprit_disasm_off": culprit_disasm,
+        "culprit_func": func,
+        "culprit_func_confidence": func_conf,
+        "pc_site": ("%s+0x%x" % (pc_mod, pc_off)) if pc_mod else None,
+        "pc_instrumented": pc_instrumented,
+        "pgz_zone": pgz_zone,
+        "pgz_verdict": pgz_kind,
+        "kext_uuid": uuids.get(culprit_mod) if culprit_mod else None,
+        "kernel_uuid": _grp(_KUUID_RE, text),
+    }
 
 
 # --- CLI --------------------------------------------------------------------
@@ -391,6 +654,61 @@ def cmd_match_since(args):
         print("other %s" % sigs[-1])
 
 
+def _fmt_hex(v):
+    return "0x%x" % v if isinstance(v, int) else "-"
+
+
+def cmd_analyze(args):
+    """Analyze report(s): print the fault class, culprit site, and bug_key.
+
+    Unlike `print`/`classify` (which dedup by backtrace signature), this decodes
+    ESR/FAR and de-slides the culprit driver frame to a method, producing the
+    bug_key the registry groups on. --symbols points at a dir of per-driver
+    symbol maps so the culprit resolves to a function name instead of an offset.
+    """
+    symbols = load_symbols(args.symbols)
+    out = []
+    for path in args.report:
+        try:
+            rec = analyze(path, symbols)
+        except Exception as e:  # noqa: BLE001
+            print("%s\n  error: %s" % (path, e), file=sys.stderr)
+            continue
+        out.append(rec)
+        if args.json:
+            continue
+        print("%s" % rec["bug_key"])
+        print("  report : %s" % os.path.basename(path))
+        print("  fault  : %s  esr=%s far=%s%s  dfsc=%s" % (
+            rec["fault_class"], _fmt_hex(rec["esr"]), _fmt_hex(rec["far"]),
+            " (null)" if rec["far_null"] else "", _fmt_hex(rec["dfsc"])))
+        site = rec["culprit_module"] or "?"
+        if rec["culprit_off"] is not None:
+            site += "+0x%x" % rec["culprit_off"]
+        if rec["culprit_func"]:
+            site += " = %s" % rec["culprit_func"]
+            if rec["culprit_func_confidence"] == "inferred":
+                site += " (inferred)"
+        if rec["culprit_disasm_off"] is not None:
+            site += "  (disasm 0x%x)" % rec["culprit_disasm_off"]
+        print("  culprit: %s" % site)
+        pc = rec["pc_site"] or "?"
+        if rec["pc_instrumented"]:
+            pc += "  (instrumentation -- relocated instruction)"
+        print("  pc     : %s" % pc)
+        if rec["pgz_verdict"]:
+            print("  pgz    : %s  [%s]" % (rec["pgz_verdict"], rec["pgz_zone"] or "?"))
+        print("  sig    : %s" % rec["signature"])
+    if args.json:
+        json.dump(out if len(out) != 1 else out[0], sys.stdout, indent=2)
+        print()
+
+
+def cmd_show(args):
+    """Show a report that is in json."""
+    print(load_panic_text(args.target))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -417,6 +735,18 @@ def main():
     pm.add_argument("since", type=float, help="unix epoch; only reports newer than this count")
     pm.add_argument("--dir", action="append", help="panic report dir (repeatable)")
     pm.set_defaults(func=cmd_match_since)
+
+    pa = sub.add_parser("analyze",
+                        help="decode fault class + culprit site + bug_key (no store)")
+    pa.add_argument("report", nargs="+")
+    pa.add_argument("--symbols", default=os.path.join(os.path.dirname(__file__), "symbols"),
+                    help="dir of per-driver symbol maps (symbols/<Driver>.json)")
+    pa.add_argument("--json", action="store_true")
+    pa.set_defaults(func=cmd_analyze)
+
+    ps = sub.add_parser("show", help="show report")
+    ps.add_argument("target", help="crash report to show")
+    ps.set_defaults(func=cmd_show)
 
     args = ap.parse_args()
     if not getattr(args, "func", None):
