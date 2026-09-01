@@ -3,6 +3,7 @@
 import os
 import shutil
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +118,48 @@ class TriageOffline(unittest.TestCase):
         # A bool flag is bare (no value token following it).
         i = cmd.index("-debug")
         self.assertNotEqual(cmd[i + 1], "True")
+
+
+class StuckTest(unittest.TestCase):
+    """A minimization that cannot do better must stop, not loop.
+
+    The failure this prevents: syz-ring-repro exits 0 with no verified culprit
+    both when it needs another boot AND when it has proved no subset reproduces
+    alone. Treating both as "relaunch me" spun six triage advances on a real
+    campaign and would have burned all forty before halting."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _state(self, **kw):
+        p = self.dir / "conn_state.json"
+        p.write_text(json.dumps(kw))
+        return p
+
+    def test_not_exhausted_when_flag_absent(self):
+        self.assertFalse(triage.stage_exhausted(self._state(memo={})))
+
+    def test_exhausted_when_flag_set(self):
+        self.assertTrue(triage.stage_exhausted(self._state(exhausted=True)))
+
+    def test_missing_checkpoint_is_not_exhausted(self):
+        """No file means nothing has run yet -- that is 'resume', not 'give up'."""
+        self.assertFalse(triage.stage_exhausted(self.dir / "absent.json"))
+
+    def test_verified_and_exhausted_are_independent(self):
+        st = self._state(verified_crash="8", exhausted=False)
+        self.assertTrue(triage.stage_verified(st))
+        self.assertFalse(triage.stage_exhausted(st))
+
+    def test_stuck_is_terminal_but_not_a_stage(self):
+        """STUCK must not be reachable by advancing through STAGES."""
+        self.assertNotIn(triage.STUCK, triage.STAGES)
+        self.assertIn(triage.STUCK, triage.TERMINAL)
+        self.assertIn("DONE", triage.TERMINAL)
 
 
 if __name__ == "__main__":

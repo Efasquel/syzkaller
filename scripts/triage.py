@@ -33,6 +33,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import crash_fingerprint as cf  # noqa: E402
+import timefmt  # noqa: E402
+from tablefmt import tabulate  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -51,14 +53,22 @@ PANIC_GLOBS = ("*.panic", "*.ips", "*.kernel.core.log")
 # writes; MERGE is offline, the two MINIMIZE stages drive the device.
 STAGES = ("MERGE", "MINIMIZE_CONN", "MINIMIZE_CALLS", "DONE")
 
+# STUCK is terminal but is NOT in STAGES: it is not a step on the way to DONE,
+# it is where a job stops when minimization has proved it cannot do better. A
+# stage that can no longer make progress must SAY so -- returning "not finished,
+# relaunch me" forever is what burned six triage advances on a real campaign and
+# would have consumed all forty before halting.
+STUCK = "STUCK"
+TERMINAL = ("DONE", STUCK)
+
 
 # --- small utilities ---------------------------------------------------------
 def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return timefmt.now_iso()
 
 
 def log(msg):
-    sys.stdout.write("%s  %s\n" % (now_iso(), msg))
+    sys.stdout.write("%s  %s\n" % (timefmt.stamp(), msg))
     sys.stdout.flush()
 
 
@@ -108,6 +118,22 @@ def save_job(st):
 
 def job_dir(st):
     return Path(st["dir"])
+
+
+def exec_scratch(st):
+    """A writable cwd for the executor that syz-ring-repro spawns.
+
+    The executor creates its shmem file and per-program tmpdir RELATIVE TO ITS
+    CWD (`syz.XXXXXX`, `./syzkaller.XXXXXX` in executor/common.h). It inherits
+    our cwd, which under launchd is the job's WorkingDirectory -- the shared tree
+    root, which the fuzzing user can read but not write. The executor then dies at
+    startup with "SYZFAIL: shmem open failed ... errno 13", every probe reads as
+    an executor error, and minimization concludes nothing reproduces having never
+    executed a single program. Give it the job dir, which the running user owns.
+    """
+    d = job_dir(st) / "exec"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def ringrepro_cmd(st, *args):
@@ -208,6 +234,13 @@ def stage_verified(state_json):
     return bool(s and s.get("verified_crash"))
 
 
+def stage_exhausted(state_json):
+    """True when the checkpoint says the search is finished and its answer has
+    already failed re-check -- relaunching cannot change the outcome."""
+    s = read_json(state_json)
+    return bool(s and s.get("exhausted"))
+
+
 def run_merge(st):
     """Offline: concatenate + statically reduce the ring buffer into merged.syz.
     No device, so this never reboots; it either succeeds or fails outright."""
@@ -216,7 +249,7 @@ def run_merge(st):
                         "-from", str(st.get("from", -1)), "-to", str(st.get("to", 0)),
                         st["ring_buffer"])
     log("MERGE: %s" % " ".join(cmd))
-    rc = subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
     if rc != 0 or not merged.exists():
         die("merge failed (rc=%d); see output above" % rc)
     log("MERGE done -> %s" % merged)
@@ -246,6 +279,24 @@ def gate_args(st):
     return ["-target_sig", sig, "-confirm_cmd", confirm]
 
 
+def _stabilize(culprit, dst):
+    """Durably copy syz-ring-repro's ephemeral culprit.syz to a stage-specific file
+    and fsync it. Two reasons: the NEXT stage must read a different file than the
+    one it writes its own -culprit into (both are `culprit.syz` otherwise, so a
+    stage clobbers its own input); and the tool does not fsync `culprit.syz`, so an
+    unclean panic-reboot can lose it -- a stage-named, fsync'd copy survives and
+    lets the next stage (or an -emit-culprit recovery) proceed. Returns dst's path.
+    """
+    dst = Path(dst)
+    shutil.copyfile(culprit, dst)
+    fd = os.open(str(dst), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return str(dst)
+
+
 def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     """Drive one on-device minimization stage to completion for this boot.
 
@@ -260,7 +311,7 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     cmd = ringrepro_cmd(st, flag, "-state", str(state_json),
                         "-culprit", str(culprit), *gate_args(st), str(prog))
     log("%s: %s" % (stage, " ".join(cmd)))
-    rc = subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
     # Reconcile any panic this run produced (it may have rebooted us on a prior
     # invocation; on this one it returned, but earlier subsets still left logs).
     reconcile_panics(st)
@@ -269,14 +320,32 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
             % (stage, rc))
         return
     if not stage_verified(state_json):
+        if stage_exhausted(state_json):
+            # The search is spent: its best candidate was re-checked in isolation
+            # and did not crash. That is a RESULT about the bug -- it needs state
+            # an earlier program leaves behind -- not a reason to try again.
+            st[out_key] = _stabilize(culprit, job_dir(st) / ("%s.syz" % out_key))
+            st["stage"] = STUCK
+            st["stuck_at"] = stage
+            st["stuck_reason"] = (
+                "no %s subset reproduces in isolation; the bug needs accumulated "
+                "state. The saved culprit is the smallest sequence seen to crash "
+                "DURING the search, so treat it as a lead, not a proof."
+                % ("connection" if "CONN" in stage else "call"))
+            save_job(st)
+            log("%s: STUCK -- %s" % (stage, st["stuck_reason"]))
+            log("%s: unverified culprit preserved at %s" % (stage, st[out_key]))
+            return
         # Exited cleanly but nothing verified: no crashing subset yet. For a real
         # crasher this means it still needs a boot that reproduces; relaunch.
         log("%s: run finished without a verified culprit yet; will resume" % stage)
         return
-    st[out_key] = str(culprit)
+    # Preserve this stage's result under a durable, stage-specific name so the next
+    # stage reads it (not its own live culprit.syz) and it survives a panic-reboot.
+    st[out_key] = _stabilize(culprit, job_dir(st) / ("%s.syz" % out_key))
     st["stage"] = STAGES[STAGES.index(stage) + 1]
     save_job(st)
-    log("%s done -> %s (verified)" % (stage, culprit))
+    log("%s done -> %s (verified)" % (stage, st[out_key]))
 
 
 # --- the orchestrator --------------------------------------------------------
@@ -292,7 +361,7 @@ def advance(st):
     elif stage == "MINIMIZE_CALLS":
         run_minimize(st, "MINIMIZE_CALLS", "-minimize-calls",
                      "conn_culprit", "final_culprit", "call_state.json")
-    elif stage == "DONE":
+    elif stage in TERMINAL:
         return
     else:
         die("unknown stage: %s" % stage)
@@ -302,18 +371,27 @@ def cmd_run(name):
     """One launch of the driver: advance until DONE or a reboot kills us."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     st = load_job(name)
-    if st["stage"] == "DONE":
-        log("%s already DONE: %s" % (name, st.get("final_culprit", "?")))
+    if st["stage"] in TERMINAL:
+        log("%s already %s: %s"
+            % (name, st["stage"], st.get("final_culprit") or st.get("conn_culprit") or "?"))
+        if st["stage"] == STUCK:
+            log("  %s" % st.get("stuck_reason", ""))
         return
     log("triage %s: stage=%s dir=%s" % (name, st["stage"], st["dir"]))
     # Advance repeatedly within this boot: offline stages (MERGE) fall straight
     # through, and a device stage that finishes without rebooting lets the next
     # begin immediately. A reboot simply kills us mid-loop; relaunch resumes.
     last = None
-    while st["stage"] != "DONE" and st["stage"] != last:
+    while st["stage"] not in TERMINAL and st["stage"] != last:
         last = st["stage"]
         advance(st)
         st = load_job(name)          # advance persisted; reload the fresh state
+    if st["stage"] == STUCK:
+        log("triage %s STUCK at %s -> %s"
+            % (name, st.get("stuck_at"), st.get("conn_culprit") or st.get("final_culprit")))
+        log("  %s" % st.get("stuck_reason", ""))
+        _print_summary(st)
+        return
     if st["stage"] == "DONE":
         log("triage %s COMPLETE -> %s" % (name, st.get("final_culprit")))
         _print_summary(st)
@@ -402,16 +480,22 @@ def cmd_list():
     rows = []
     for sf in sorted(STATE_DIR.glob("*.json")):
         st = read_json(sf)
-        if st:
-            rows.append((st["name"], st["stage"],
-                         st.get("target_signature") or "-",
-                         len(st.get("incidents", []))))
+        if not st:
+            continue
+        # A finished job's worth is its reproducer, and whether it is proven.
+        if st["stage"] == "DONE":
+            repro = "verified"
+        elif st["stage"] == STUCK:
+            repro = "UNVERIFIED"
+        else:
+            repro = "-"
+        rows.append((st["name"], st["stage"], repro,
+                     st.get("target_signature") or "-",
+                     len(st.get("incidents", []))))
     if not rows:
         print("no triage jobs")
         return
-    print("%-20s %-16s %-18s %s" % ("NAME", "STAGE", "TARGET SIG", "PANICS"))
-    for name, stage, sig, n in rows:
-        print("%-20s %-16s %-18s %d" % (name, stage, sig, n))
+    tabulate(rows, ("NAME", "STAGE", "REPRO", "TARGET SIG", "PANICS"))
 
 
 # --- launchd (survive reboots) ----------------------------------------------

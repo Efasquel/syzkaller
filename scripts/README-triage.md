@@ -234,6 +234,34 @@ halts with a reason for a human to look. `status` shows the phase:
 scripts/fuzz-campaign.py status <campaign>   # phase, triage job, benched sigs
 ```
 
+Before a run, pre-flight it — this checks the built binaries, the config, the
+panic dirs, and the optional triage flags, so you don't discover a gap only after
+the first crash:
+
+```sh
+scripts/fuzz-campaign.py doctor <campaign>   # exit 0 if nothing fatal, 1 on FAIL
+```
+
+To run it truly hands-off across reboots, install it as a **LaunchDaemon**
+(system domain, `/Library/LaunchDaemons`) — it runs at every boot as root with no
+user logged in, which a self-rebooting crash box needs:
+
+```sh
+sudo scripts/fuzz-campaign.py install   <campaign>   # RunAtLoad; survives reboots
+sudo scripts/fuzz-campaign.py uninstall <campaign>   # stop now + never restart
+```
+
+This is the **only** launchd job to install — the coordinator drives `triage.py`
+itself as a subprocess, so do **not** also `triage.py install` (that would
+double-drive the box). The daemon runs with a minimal `PATH`, so it uses the
+**built** `bin/darwin_arm64/syz-ring-repro` (run `make target` first); install
+refuses if it's missing. Logs land in `campaigns/.state/<campaign>.launchd.log`.
+
+**Stopping it:** `uninstall` (sudo) boots out the running daemon *and* removes the
+plist, so it will not restart — including on the next reboot. `halt` is a softer
+pause: it flags the campaign halted (the daemon self-exits within a poll and
+idles on future boots) but leaves it installed, ready for `resume`.
+
 Triage device flags (executor, ringrepro, kcov_device, kext_id, sandbox, max_k)
 come from an optional `"triage": { … }` object in the campaign definition JSON;
 omit it and triage uses its own defaults. **Rotation** (`include` a benched
