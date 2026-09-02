@@ -1379,6 +1379,14 @@ def status_lines(name, prev=None):
     execs = live.get("exec_total") if live.get("exec_total") is not None \
         else s.get("last_exec_total")
     cov = live.get("coverage")
+    # The manager's UI: coverage browser, corpus, crash list. Only meaningful
+    # while the manager is actually serving, so it is shown with that caveat
+    # rather than as a link that may quietly not answer.
+    if live.get("http"):
+        url = live["http"]
+        if not url.startswith("http"):
+            url = "http://%s" % url
+        row("web ui", url if live.get("pid_alive") else "%s  (manager down)" % url)
     row("executed", "%s program(s)%s"
         % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
            "  (%s/sec)" % live.get("rate") if live.get("rate") else ""),
