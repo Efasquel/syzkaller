@@ -101,11 +101,19 @@ DEFAULTS = {
     "crashloop_window_seconds": 20,   # a run shorter than this never fuzzed anything
     "crashloop_limit": 15,      # this many consecutive such crashes => halt
     "triage_max_boots": 40,     # give up (halt) if triage can't reach a culprit in this many advances
-    # Which clock --budget measures. "fuzz" charges only time the manager spent
-    # executing programs; "wall" also charges minimization and reboot overhead.
-    # The literature quotes 24h runs both ways, so both totals are always kept and
-    # this only picks which one the budget test reads.
-    "budget_clock": "fuzz",
+    # Which clock --budget measures.
+    #   "wall"  -- everything the campaign occupied the rig for: session uptime
+    #              PLUS minimization PLUS reboot overhead. "Give this config 24
+    #              hours of machine time", which is what a comparison between
+    #              configurations needs, and the default for that reason.
+    #   "fuzz"  -- session uptime only, so a long triage does not eat the budget.
+    #              Note this is uptime, NOT time spent executing programs: the
+    #              manager also starts up, triages the corpus and waits on RPC,
+    #              and on a measured run only 56% of uptime was execution. For
+    #              that figure use `runstats.py show`, which reads syz-manager's
+    #              own counter.
+    # wall >= fuzz always, so this default can only end a campaign sooner.
+    "budget_clock": "wall",
     # Cap on the launchd-captured log. One real campaign produced 7.0MB across
     # 119,299 lines, of which 33,267 were per-probe minimizer chatter -- the
     # coordinator's own decisions were unreadable inside it, and `tail -f` on the
@@ -1044,6 +1052,19 @@ def cmd_run(name):
         # fuzzing. advance_triage flips phase back to "fuzzing" when it benches
         # the culprit, or halts the campaign if triage cannot make progress.
         if s["phase"] == "triaging":
+            # The budget is otherwise only tested inside supervise, which does
+            # not run in this phase -- so a long minimization would overrun a
+            # wall budget without ever noticing. Check before spending another
+            # boot on triage. Only the wall clock can expire here; a fuzz-clock
+            # budget deliberately does not charge triage at all.
+            item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
+            if budget_spent(s, d) >= item["budget_seconds"]:
+                log("budget spent (%s clock) while triaging %s; stopping the "
+                    "campaign with the triage job left resumable"
+                    % (d.get("budget_clock"), s.get("triage_job")))
+                s["status"] = "done"
+                save_state(s)
+                return
             advance_triage(s, d)
             if s["status"] == "halted":
                 return
@@ -1242,7 +1263,13 @@ def status_lines(name, prev=None):
     # Three clocks, campaign-lifetime (never reset by a config advance). Reported
     # separately because "24h of fuzzing" and "24h of campaign" are different
     # claims, and a writeup that conflates them overstates the fuzzing.
-    row("fuzzing", fmt_hms(lifetime(s, "active_seconds")), "  (manager executing)")
+    # Honest label. This counter is session-alive wall time, NOT time spent
+    # executing programs: it includes manager startup, corpus triage, RPC waits
+    # and the manager's own minimization. On a measured 24h run it overstated
+    # actual fuzzing by 77% (18.9h alive vs 10.7h executing). syz-manager keeps
+    # the real figure in its bench series; `runstats.py show` reports it.
+    row("session up", fmt_hms(lifetime(s, "active_seconds")),
+        "  (manager alive -- NOT time executing; see runstats.py show)")
     row("minimizing", fmt_hms(lifetime(s, "triage_seconds")), "  (triage)")
     row("rebooting", fmt_hms(lifetime(s, "overhead_seconds")), "  (panic -> back up)")
     row("wall", fmt_hms(lifetime_wall(s)), "  (sum of the three)")
@@ -2323,9 +2350,10 @@ def main():
                     help="advances before giving up on a triage (default %d)"
                          % DEFAULTS["triage_max_boots"])
     sp.add_argument("--budget-clock", choices=BUDGET_CLOCKS,
-                    help="what --budget-hours measures: 'fuzz' charges only "
-                         "manager execution, 'wall' also charges minimization "
-                         "and reboots (default %s)" % DEFAULTS["budget_clock"])
+                    help="what --budget-hours measures: 'fuzz' charges session "
+                         "uptime (NOT time executing programs -- expect ~55-60%% "
+                         "of it), 'wall' also charges minimization and reboots "
+                         "(default %s)" % DEFAULTS["budget_clock"])
 
     sp = sub.add_parser("brake",
                         help="set/clear the file brake that stops a campaign even "
