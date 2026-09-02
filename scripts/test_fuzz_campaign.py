@@ -388,9 +388,66 @@ class ClockTest(unittest.TestCase):
         s = {"active_seconds": 100.0, "triage_seconds": 900.0, "overhead_seconds": 900.0}
         self.assertEqual(fc.budget_spent(s, {"budget_clock": "wall"}), 1900.0)
 
-    def test_default_budget_clock_is_fuzz(self):
-        """Minimizing a bug must not eat the fuzzing budget by default."""
-        self.assertEqual(fc.DEFAULTS["budget_clock"], "fuzz")
+    def test_default_budget_clock_is_wall(self):
+        """"Give this config 24 hours of machine time" is what comparing
+        configurations needs, so every phase is charged by default."""
+        self.assertEqual(fc.DEFAULTS["budget_clock"], "wall")
+
+    def test_wall_is_never_less_than_fuzz(self):
+        """So the default can only ever end a campaign sooner, never overrun."""
+        s = {"active_seconds": 100.0, "triage_seconds": 50.0,
+             "overhead_seconds": 25.0}
+        self.assertGreaterEqual(fc.budget_spent(s, {"budget_clock": "wall"}),
+                                fc.budget_spent(s, {"budget_clock": "fuzz"}))
+
+    def test_triage_phase_stops_when_the_wall_budget_is_spent(self):
+        """The budget is otherwise only tested inside supervise, which does not
+        run while triaging -- so a long minimization would overrun the envelope
+        without ever noticing."""
+        s = fc.init_state("camp")
+        s.update({"phase": "triaging", "triage_job": "camp_t1",
+                  "triage_bug_sig": "S", "active_seconds": 3600.0,
+                  "triage_seconds": 3600.0})
+        d = dict(fc.DEFAULTS, budget_clock="wall",
+                 items=[{"config": "/x.cfg", "budget_seconds": 7200}], name="camp")
+        advanced = []
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "advance_triage",
+                               lambda *a: advanced.append(1)), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a: None), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None):
+            fc.cmd_run("camp")
+        self.assertEqual(advanced, [])          # never spent another triage boot
+        self.assertEqual(s["status"], "done")
+
+    def test_triage_phase_continues_while_budget_remains(self):
+        s = fc.init_state("camp")
+        s.update({"phase": "triaging", "triage_job": "camp_t1",
+                  "triage_bug_sig": "S", "active_seconds": 60.0})
+        d = dict(fc.DEFAULTS, budget_clock="wall",
+                 items=[{"config": "/x.cfg", "budget_seconds": 7200}], name="camp")
+        advanced = []
+
+        def stop_after_one(st, dd):
+            advanced.append(1)
+            st["status"] = "halted"
+
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "advance_triage", stop_after_one), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a: None), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None):
+            fc.cmd_run("camp")
+        self.assertEqual(advanced, [1])
 
     def test_roll_banks_totals_and_zeroes_the_budget(self):
         s = fc.init_state("camp")

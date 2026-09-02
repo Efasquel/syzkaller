@@ -373,9 +373,18 @@ rebooting   : 0h23m  (panic -> back up)
 wall        : 5h26m  (sum of the three)
 ```
 
-`--budget-hours` measures **fuzzing** by default, so minimizing a bug never eats
-the fuzzing budget; `--budget-clock wall` charges everything if you want a run
-bounded in wall-clock terms instead. Both totals are always kept, so a writeup can
+`--budget-hours` measures **wall** by default: session uptime plus minimization
+plus reboot overhead. That is "give this config 24 hours of machine time", which
+is what comparing one configuration against another needs. `--budget-clock fuzz`
+charges session uptime only, so a stubborn bug's minimization cannot eat the
+budget — useful when you care about fuzzing throughput rather than a fixed
+envelope. `wall >= fuzz` always, so the default can only end a campaign sooner.
+
+> **`fuzzing` in `status` is session uptime, not time executing programs.** The
+> manager also starts up, triages the corpus and waits on RPC; on a measured run
+> only **56%** of uptime was execution (18.9 h alive → 10.7 h executing). For the
+> real figure, `runstats.py show <run>` reads syz-manager's own counter and
+> prints an `efficiency` line. Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
 say "24h fuzzing, 31h wall, of which 4h minimization" rather than picking one
 number and hiding the rest. Nothing accrues while the campaign is halted or idle,
 and a reboot gap longer than `max_boot_gap_seconds` (15 min) is treated as idle
