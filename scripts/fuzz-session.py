@@ -108,7 +108,14 @@ ARTIFACTS_SUBDIR = "artifacts"
 INCIDENT_DIRS = {"crash": "crashes", "hang": "hangs", "snapshot": "snapshots"}
 EVENT_KINDS = tuple(INCIDENT_DIRS)
 STOP_TIMEOUT = 30       # seconds to wait for a graceful (SIGINT) shutdown
-RPC_PORT_TIMEOUT = 60   # seconds to wait for the manager to log its rpc port
+# Seconds to wait for the manager to log its rpc port. Generous on purpose: the
+# manager compiles the whole enabled grammar before it starts serving, so this
+# scales with the config. A 12-syscall AppleJPEGDriver config gets there in
+# seconds; a 91-syscall IOSurface config took 96s on a cold workdir and blew a
+# 60s limit -- which cost that config an hour of its budget sitting idle with no
+# executor. Waiting costs nothing when the port appears early (polled every
+# 0.5s), and wait_for_rpc_port gives up immediately if the manager dies.
+RPC_PORT_TIMEOUT = 300
 DEFAULT_EXECUTORS = 1   # single device == single executor; override with -e/--no-executor
 
 # Metrics pulled from the last bench record. Keys are syz-manager stat names.
@@ -218,6 +225,15 @@ def pid_alive(pid, rec_boot=None):
             return False
     try:
         os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        # EPERM means the process EXISTS but belongs to another user, which is
+        # proof of life, not death. This is the normal case here: the campaign
+        # runs as `fuzz` and is routinely inspected from an admin account, so
+        # treating EPERM as dead made every cross-user check lie. It reported a
+        # manager with twenty hours of uptime as "crashed", and stop_one() --
+        # which refuses to signal a pid it believes is dead -- then declined to
+        # stop it, leaving it fuzzing unsupervised.
         return True
     except (OSError, ValueError):
         return False
@@ -769,18 +785,34 @@ def fmt_row(cols, widths):
 _RPC_RE = re.compile(r"serving rpc on tcp://(\d+)")
 
 
-def wait_for_rpc_port(logf, timeout=RPC_PORT_TIMEOUT):
-    """Poll a manager run log for 'serving rpc on tcp://<port>'."""
+def wait_for_rpc_port(logf, timeout=RPC_PORT_TIMEOUT, pid=None):
+    """Poll a manager run log for 'serving rpc on tcp://<port>'.
+
+    pid, when given, is the manager: if it dies there is no port coming, so stop
+    waiting rather than burning the whole timeout on a corpse.
+    """
     deadline = time.time() + timeout
+    waited, announced = 0.0, 0.0
     while time.time() < deadline:
         try:
             for line in Path(logf).read_text(errors="replace").splitlines():
                 m = _RPC_RE.search(line)
                 if m:
+                    if waited > 20:
+                        print("    ... rpc ready after %.0fs" % waited)
                     return int(m.group(1))
         except OSError:
             pass
+        if pid is not None and waited > 5 and not pid_alive(pid):
+            warn("manager pid %s exited before serving rpc; see the run log" % pid)
+            return None
+        # A heartbeat, so a long compile reads as progress rather than a stall.
+        if waited - announced >= 30:
+            announced = waited
+            print("    ... still compiling (%.0fs of %ds)" % (waited, timeout))
+            sys.stdout.flush()
         time.sleep(0.5)
+        waited += 0.5
     return None
 
 
@@ -873,7 +905,22 @@ def start_executors(state, count):
     need = count - len(live_executors(state))
     if need <= 0:
         return
-    port = wait_for_rpc_port(state["stdout"])
+    # Say what the silence is. syz-manager compiles every enabled syscall before
+    # it serves rpc, and that scales with the grammar: ~2 minutes for a
+    # 91-syscall config on this box, seconds for a 12-syscall one. Without this
+    # line the wait is indistinguishable from a hang -- which is exactly how a
+    # missed rpc port went unnoticed for an hour of budget.
+    n = 0
+    try:
+        conf = json.loads(Path(state["config"]).read_text())
+        n = len(conf.get("enable_syscalls") or [])
+    except (OSError, ValueError, KeyError):
+        pass
+    print("  waiting for syz-manager to serve rpc%s -- it compiles the enabled"
+          % (" (%d syscall(s) to compile)" % n if n else ""))
+    print("    grammar first, so expect ~2 min for a large one. Up to %ds."
+          % RPC_PORT_TIMEOUT)
+    port = wait_for_rpc_port(state["stdout"], pid=state.get("pid"))
     if not port:
         warn("could not read rpc port from manager log within %ds; "
              "start executors later with: %s exec-start %s"

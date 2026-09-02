@@ -1923,6 +1923,35 @@ def cmd_install_agent(name, user=None):
             % (user, dom, rc, user))
     else:
         log("loaded LaunchAgent for %s in %s -- RunAtLoad + KeepAlive" % (user, dom))
+        startup_hint(name)
+
+
+def startup_hint(name):
+    """What to expect in the first minutes, printed where you will read it.
+
+    syz-manager compiles every enabled syscall before it serves rpc, so a large
+    grammar leaves the box apparently idle for a couple of minutes at the start
+    of each config. That silence is indistinguishable from a hang, and mistaking
+    one for the other is how a missed rpc port cost a config an hour of budget.
+    """
+    try:
+        d = load_def(name)
+    except SystemExit:
+        return
+    counts = []
+    for it in d["items"]:
+        conf = read_json(it["config"]) or {}
+        counts.append((config_id(it["config"]),
+                       len(conf.get("enable_syscalls") or [])))
+    big = max((n for _, n in counts), default=0)
+    log("first minutes of each config are a GRAMMAR COMPILE, not a stall:")
+    for cid, n in counts:
+        log("  %-46s %3d syscall(s)%s"
+            % (cid, n, "  (~2 min to serve rpc)" if n >= 60 else ""))
+    if big >= 60:
+        log("  the largest takes roughly two minutes before syz-executor appears")
+    log("  a real stall is a manager with NO executor and no corpus growth after")
+    log("  that; check with: /bin/ps -Ao command | grep syz-executor")
 
 
 def cmd_install(name, user=None, agent=False):
@@ -1950,6 +1979,7 @@ def cmd_install(name, user=None, agent=False):
     if rc != 0:
         die("launchctl bootstrap failed (rc=%d)" % rc)
     log("loaded %s -- RunAtLoad + KeepAlive; survives reboots and runs headless" % plist_label(name))
+    startup_hint(name)
     print("  logs: %s" % (STATE_DIR / ("%s.launchd.log" % name)))
     print("  note: this is the ONLY job to install -- it drives triage.py itself; "
           "do not also `triage.py install`.")
