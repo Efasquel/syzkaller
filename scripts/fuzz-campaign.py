@@ -32,6 +32,7 @@ Commands:
 import argparse
 import atexit
 import fcntl
+import signal
 import getpass
 import json
 import os
@@ -119,6 +120,10 @@ DEFAULTS = {
     # coordinator's own decisions were unreadable inside it, and `tail -f` on the
     # combined stream was useless exactly when it mattered.
     "max_log_mb": 25.0,
+    # How often to look for a stop request. Cheap (one stat of a local file), so
+    # it is decoupled from poll_seconds, which is expensive (an HTTP round trip
+    # to the manager) and therefore rare.
+    "stop_check_seconds": 5,
     # A gap between the driver's last save and the next boot is reboot overhead.
     # Capped, because an unbounded gap is not overhead -- it is the rig sitting
     # idle while you were asleep, and charging that would make the wall clock a
@@ -638,6 +643,21 @@ def latest_panic_signature(s):
     return sig
 
 
+def config_kcov(cfg):
+    """The config's own coverage settings, as triage flag values.
+
+    Empty when the config has no kext_coverage block or cannot be read, so the
+    campaign-level triage defaults still apply."""
+    conf = read_json(cfg) if cfg else None
+    kc = (conf or {}).get("kext_coverage") or {}
+    out = {}
+    if kc.get("kext_id") is not None:
+        out["kext_id"] = kc["kext_id"]
+    if kc.get("kcov_device"):
+        out["kcov_device"] = kc["kcov_device"]
+    return out
+
+
 def begin_triage(s, d, sig):
     """Pause fuzzing and stand up a triage job for a new bug. Returns True on
     success; on any failure the campaign just resumes fuzzing (no phase change)."""
@@ -653,7 +673,14 @@ def begin_triage(s, d, sig):
 
     s["triage_seq"] += 1
     job = "%s_t%d" % (s["name"], s["triage_seq"])
-    tri = d.get("triage") or {}
+    tri = dict(d.get("triage") or {})
+    # The coverage device settings belong to the CONFIG, not the campaign: each
+    # driver has its own Pishi kext id (a bitmask -- AppleJPEGDriver=1, AppleSSE=4,
+    # IOSurface=128 ...), so a campaign spanning several drivers cannot carry one
+    # id for all of them. Minimizing an IOSurface crash under AppleJPEGDriver's id
+    # would configure coverage for the wrong kext. Take them from the config that
+    # actually crashed and fall back to the campaign's block.
+    tri.update(config_kcov(s.get("current_config")))
     # Pin the target signature so triage's crash gate is active from the first
     # subset (a second bug firing during minimization won't misdirect it).
     args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force"]
@@ -915,6 +942,33 @@ def reconcile_boot(s, d):
     save_state(s)
 
 
+def wait_for_stop(s, d, seconds):
+    """Sleep up to `seconds`, returning early if a stop is requested.
+
+    Returns "halted", "brake", or None if the full interval elapsed quietly.
+    The brake is checked here as well as at startup: it is the stop you reach
+    for when the box is misbehaving, and having to wait out a poll interval for
+    it defeats the purpose.
+    """
+    step = d.get("stop_check_seconds", DEFAULTS["stop_check_seconds"])
+    deadline = time.time() + seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        time.sleep(min(step, remaining))
+        if load_state(s["name"]).get("status") == "halted":
+            return "halted"
+        held = brake_held(s["name"])
+        if held:
+            path, why = held
+            log("BRAKE while running: %s%s" % (path, " -- %s" % why if why else ""))
+            s["status"] = "halted"
+            s["halt_reason"] = "brake: %s" % (why or path)
+            save_state(s)
+            return "brake"
+
+
 def supervise(s, d, sid, budget):
     """Poll until an incident, budget exhaustion, or manager death.
 
@@ -926,14 +980,23 @@ def supervise(s, d, sid, budget):
     last_et = s.get("last_exec_total")
     last_progress = time.time()
     while True:
-        time.sleep(poll)
-        latest_state = load_state(s["name"])
-        if latest_state["status"] == "halted":
+        # A stop request must not wait on the progress poll. Those are two very
+        # different costs: inspect() talks to the manager over HTTP and is
+        # deliberately infrequent (poll_seconds, 10 min by default), while
+        # noticing a halt is one stat() of a local file. Sleeping the whole poll
+        # in one go coupled them, so `halt` took up to ten minutes to be seen --
+        # long enough to feel broken and to invite killing the driver instead,
+        # which is how a half-stopped campaign gets left behind.
+        stop = wait_for_stop(s, d, poll)
+        if stop == "halted":
             log("campaign halted by user")
             session("stop", sid)
             return "halted"
+        if stop == "brake":
+            session("stop", sid)
+            return "halted"
 
-        s.update(latest_state)
+        s.update(load_state(s["name"]))
 
         info = inspect(sid)
         now = time.time()
@@ -1220,6 +1283,33 @@ def corpus_facts(cfg):
         return None
 
 
+def orphaned_session(s, d):
+    """A live fuzzing session with no supervisor updating the campaign state.
+
+    This is what `launchctl bootout` used to leave behind: fuzz-session spawns
+    syz-manager detached, so unloading the agent kills the supervisor while the
+    manager keeps fuzzing. The campaign still says "running" because nothing is
+    left to say otherwise -- the most misleading state the system can be in, so
+    it is detected rather than inferred from a stale timestamp by eye.
+
+    Detected by the state going unwritten for well over a poll interval while
+    the session is still alive.
+    """
+    if s.get("status") != "running" or not s.get("session_id"):
+        return None
+    last = timefmt.to_epoch(s.get("updated_at"))
+    if last is None:
+        return None
+    stale = time.time() - last
+    # Two polls plus a margin: one missed write is a slow inspect, not a death.
+    if stale < max(2.5 * d["poll_seconds"], 120):
+        return None
+    info = inspect(s["session_id"])
+    if not (info.get("found") and info.get("pid_alive")):
+        return None
+    return {"sid": s["session_id"], "stale_for": stale, "pid": info.get("pid")}
+
+
 def status_lines(name, prev=None):
     """The status block as a list of lines, plus a sample dict for the next call.
 
@@ -1237,6 +1327,15 @@ def status_lines(name, prev=None):
     out.append("campaign %s : %s" % (name, s["status"]))
     if s.get("halt_reason"):
         row("halt reason", s["halt_reason"])
+    orphan = orphaned_session(s, d)
+    if orphan:
+        out.append("  !! NO SUPERVISOR: the state has not been written for %s "
+                   "(poll is %ds)." % (fmt_hms(orphan["stale_for"]), d["poll_seconds"]))
+        out.append("     The manager is still fuzzing, unwatched: no budget is "
+                   "enforced, no crash")
+        out.append("     is filed, and it holds /dev/pishi against the next "
+                   "campaign. Stop it with:")
+        out.append("       fuzz-session.py stop %s" % orphan["sid"])
     held = brake_held(name)
     if held:
         row("BRAKE", "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
@@ -1471,7 +1570,22 @@ def cmd_doctor(name):
         if kd and not Path(kd).exists():
             add("WARN", "triage.kcov_device %s not present" % kd)
     else:
-        add("INFO", "no \"triage\" block -- triage uses defaults (kext_id=1, no kcov)")
+        add("INFO", "no \"triage\" block -- triage uses each config's kext_coverage")
+    # Each config's own kext id wins over the campaign's, so a multi-driver
+    # campaign triages every crash against the right kext. Show what each will
+    # use, and say plainly when a config cannot supply one.
+    seen = []
+    for it in d["items"]:
+        kc = config_kcov(it["config"])
+        seen.append((config_id(it["config"]), kc.get("kext_id"), kc.get("kcov_device")))
+    if len({k for _, k, _ in seen if k is not None}) > 1:
+        add("OK", "multi-driver campaign: kext_id taken per config (%s)"
+            % ", ".join("%s=%s" % (n.split("_")[0], k) for n, k, _ in seen))
+    for n, k, _ in seen:
+        if k is None:
+            add("WARN", "%s has no kext_coverage.kext_id -- triage falls back to "
+                        "the campaign default, which is wrong for a multi-driver "
+                        "run" % n)
 
     fg = free_gb()
     add("OK" if fg >= d["min_free_gb"] else "FAIL",
@@ -1841,13 +1955,176 @@ def cmd_install(name, user=None, agent=False):
           "do not also `triage.py install`.")
 
 
+def stop_campaign_session(name):
+    """Stop whatever fuzzing session this campaign has running, if any."""
+    s = load_state(name)
+    sid = s.get("session_id")
+    if not sid:
+        return
+    info = inspect(sid)
+    if not info.get("found"):
+        return
+    if info.get("status") == "running" or info.get("pid_alive"):
+        log("stopping fuzzing session %s (pid %s) before unloading the job"
+            % (sid, info.get("pid")))
+        session("stop", sid)
+    else:
+        log("session %s already stopped" % sid)
+
+
+# --- the reliable stop ------------------------------------------------------
+def running_processes(pattern):
+    """[(pid, command)] of live processes whose command contains `pattern`.
+
+    Deliberately reads the process table rather than any state file. Every stop
+    path used to trust the session record, and the record can be wrong in the
+    worst direction: pid_alive() returned False for a manager that had been
+    running for twenty hours, so stop_one() refused to touch it and the thing
+    kept fuzzing. Reality is what `ps` says.
+    """
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "pid,command"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in (out or "").splitlines()[1:]:
+        line = line.strip()
+        if not line or pattern not in line:
+            continue
+        pid, _, cmd = line.partition(" ")
+        try:
+            found.append((int(pid), cmd.strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def campaign_processes(s):
+    """(managers, executors) belonging to this campaign, from the process table.
+
+    Managers are matched on the config path so a stop cannot reach into an
+    unrelated session. Executors carry no config, so they are matched by the
+    session's scratch directory, and otherwise left alone.
+    """
+    cfg = s.get("current_config") or ""
+    sid = s.get("session_id") or ""
+    managers = [p for p in running_processes("syz-manager") if cfg and cfg in p[1]]
+    executors = [p for p in running_processes("syz-executor")
+                 if sid and sid in p[1]]
+    return managers, executors
+
+
+def _signal(pid, sig, what):
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        log("  cannot signal %s pid %d (owned by another user -- re-run with sudo)"
+            % (what, pid))
+        return False
+    except OSError as e:
+        log("  could not signal %s pid %d: %s" % (what, pid, e))
+        return False
+
+
+def cmd_stop(name, grace=30, keep_agent=False):
+    """End a campaign's fuzzing for good, whether or not a supervisor is alive.
+
+    The other stop paths all assume the supervisor is running: `halt` writes a
+    flag it has to read, and the brake is checked in its loop. When the
+    supervisor is gone -- killed by a `launchctl bootout`, say -- syz-manager
+    keeps fuzzing detached, the campaign still reports "running" because nothing
+    updates it, and the orphan holds /dev/pishi against the next campaign. This
+    is the path that does not care.
+
+    Order matters: stop the relaunch first, or launchd restarts the supervisor
+    in the middle of the teardown.
+    """
+    s = load_state(name)
+    log("stopping campaign %r" % name)
+
+    # 1. Nothing may bring it back while we work.
+    if not keep_agent:
+        label = plist_label(name)
+        for dom in ("gui/502", "system"):
+            subprocess.run(["launchctl", "bootout", "%s/%s" % (dom, label)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("  launchd job %s booted out (if it was loaded)" % label)
+    s["status"] = "halted"
+    s["halt_reason"] = s.get("halt_reason") or "stopped by user"
+    save_state(s)
+
+    # 2. Graceful: let fuzz-session close the session down properly, so the
+    #    registry, the scratch cleanup and the final state are all consistent.
+    #    Bounded, because a graceful step that can hang forever defeats the whole
+    #    purpose of this command -- and one did: a scratch retire that could not
+    #    rename fell back to walking 65,000 directories it had no permission to
+    #    delete. Whatever survives the timeout is handled by the escalation below.
+    if s.get("session_id"):
+        try:
+            subprocess.run([sys.executable, str(SESSION), "stop", s["session_id"]],
+                           timeout=max(grace, 30))
+        except subprocess.TimeoutExpired:
+            log("  fuzz-session stop did not return in %ds; escalating"
+                % max(grace, 30))
+        except OSError as e:
+            log("  could not run fuzz-session stop: %s" % e)
+
+    # 3. Verify against the process table, and escalate only against what
+    #    survived. A graceful stop that silently did nothing is the failure
+    #    this whole command exists to prevent.
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        managers, executors = campaign_processes(s)
+        if not managers and not executors:
+            log("  all processes gone")
+            break
+        time.sleep(1)
+    managers, executors = campaign_processes(s)
+    for pid, cmd in managers + executors:
+        log("  still alive after %ds: pid %d  %s" % (grace, pid, cmd[:70]))
+        _signal(pid, signal.SIGINT, "process")
+    if managers or executors:
+        time.sleep(3)
+        for pid, cmd in campaign_processes(s)[0] + campaign_processes(s)[1]:
+            log("  SIGKILL pid %d (did not exit on SIGINT)" % pid)
+            _signal(pid, signal.SIGKILL, "process")
+
+    # 4. Say what is true now, and fail loudly if anything is left: a stop that
+    #    reports success while a manager still holds /dev/pishi is worse than
+    #    one that reports failure.
+    managers, executors = campaign_processes(s)
+    if managers or executors:
+        log("STOP INCOMPLETE: %d manager(s), %d executor(s) still running"
+            % (len(managers), len(executors)))
+        for pid, cmd in managers + executors:
+            log("  pid %d  %s" % (pid, cmd[:80]))
+        log("  they are probably owned by another user -- re-run with sudo")
+        return 1
+    log("campaign %r stopped: no manager, no executor, nothing holding the "
+        "coverage device" % name)
+    return 0
+
+
 def cmd_uninstall(name, user=None, agent=False):
     """Stop the daemon/agent now and prevent it from ever restarting.
 
     bootout unloads the job and kills its running instance; removing the plist
     means RunAtLoad cannot fire again on the next boot/login. (`halt` only pauses
     the campaign and leaves the job installed.)
+
+    The fuzzing SESSION is stopped first, and that is not optional. fuzz-session
+    spawns syz-manager detached, so it is not part of the launchd job's process
+    tree: booting out the agent kills the supervisor and leaves the manager
+    fuzzing on with nobody watching it. The campaign then still reports
+    "running" -- nothing is left to update its state -- while the orphan holds
+    /dev/pishi and blocks the next campaign.
     """
+    stop_campaign_session(name)
     label = plist_label(name)
     if agent:
         user = user or os.environ.get("SUDO_USER") or getpass.getuser()
@@ -2355,6 +2632,19 @@ def main():
                          "of it), 'wall' also charges minimization and reboots "
                          "(default %s)" % DEFAULTS["budget_clock"])
 
+    sp = sub.add_parser("stop",
+                        help="end a campaign's fuzzing for good, whether or not "
+                             "a supervisor is alive (verifies against the "
+                             "process table)")
+    sp.add_argument("name")
+    sp.add_argument("--grace", type=int, default=30,
+                    help="seconds to wait for a graceful exit before escalating "
+                         "to SIGINT/SIGKILL (default 30)")
+    sp.add_argument("--keep-agent", action="store_true",
+                    help="leave the launchd job loaded (it will relaunch the "
+                         "supervisor, which then sees the halt and exits)")
+    sp.set_defaults(func=None)
+
     sp = sub.add_parser("brake",
                         help="set/clear the file brake that stops a campaign even "
                              "from Recovery")
@@ -2426,6 +2716,8 @@ def main():
                  "crashloop_window_seconds": args.crashloop_window_seconds,
                  "triage_max_boots": args.triage_max_boots,
                  "budget_clock": args.budget_clock})
+    elif args.cmd == "stop":
+        sys.exit(cmd_stop(args.name, args.grace, args.keep_agent))
     elif args.cmd == "brake":
         sys.exit(cmd_brake(args.name, args.global_, args.reason, args.clear, args.where))
     elif args.cmd == "run":

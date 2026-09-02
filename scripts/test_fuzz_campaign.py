@@ -9,6 +9,7 @@ translation (syz-ring-repro -emit-json) is exercised by the Go tests.
 
 import importlib.util
 import json
+import signal
 import tempfile
 import time
 import unittest
@@ -508,6 +509,174 @@ class ClockTest(unittest.TestCase):
             fc.advance_triage(s, d)
         self.assertGreater(s["triage_seconds"], 0.0)
         self.assertEqual(s["active_seconds"], 0.0)
+
+
+class StopLatencyTest(unittest.TestCase):
+    """`halt` used to take up to poll_seconds (10 min) to be noticed, because
+    the state re-read was welded to the expensive progress poll. Long enough to
+    feel broken, and to invite killing the driver instead."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.state = self.dir / "state"
+        self.state.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _d(self):
+        return dict(fc.DEFAULTS, stop_check_seconds=0.01, name="camp")
+
+    def test_returns_none_when_nothing_asks_it_to_stop(self):
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "STATE_DIR", self.state), \
+             mock.patch.object(fc, "GLOBAL_BRAKE", self.dir / "STOP"):
+            fc.save_state(s)
+            t0 = time.time()
+            self.assertIsNone(fc.wait_for_stop(s, self._d(), 0.05))
+            self.assertGreaterEqual(time.time() - t0, 0.04)
+
+    def test_notices_a_halt_far_sooner_than_the_poll_interval(self):
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "STATE_DIR", self.state), \
+             mock.patch.object(fc, "GLOBAL_BRAKE", self.dir / "STOP"):
+            fc.save_state(s)
+            halted = dict(s, status="halted")
+            fc.save_state(halted)
+            t0 = time.time()
+            # Ask for a 600s wait, as production does; it must not take that.
+            self.assertEqual(fc.wait_for_stop(s, self._d(), 600), "halted")
+            self.assertLess(time.time() - t0, 1.0)
+
+    def test_a_brake_set_mid_run_stops_it_too(self):
+        """The brake is the stop you reach for when the box misbehaves; waiting
+        out a poll interval for it defeats the purpose."""
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "STATE_DIR", self.state), \
+             mock.patch.object(fc, "GLOBAL_BRAKE", self.dir / "STOP"):
+            fc.save_state(s)
+            (self.dir / "STOP").write_text("box is wedged")
+            self.assertEqual(fc.wait_for_stop(s, self._d(), 600), "brake")
+            self.assertEqual(s["status"], "halted")
+            self.assertIn("box is wedged", s["halt_reason"])
+
+    def test_stop_check_is_decoupled_from_the_progress_poll(self):
+        """The two have very different costs: one stat() versus an HTTP round
+        trip to the manager."""
+        self.assertLess(fc.DEFAULTS["stop_check_seconds"],
+                        fc.DEFAULTS["poll_seconds"])
+
+
+class StopTest(unittest.TestCase):
+    """The stop that does not assume a supervisor is alive.
+
+    halt and brake are both flags a supervisor has to READ. When it is gone --
+    killed by a launchctl bootout, say -- syz-manager keeps fuzzing detached,
+    the campaign still reports "running" because nothing updates it, and the
+    orphan holds /dev/pishi against the next campaign."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _state(self):
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid1", "current_config": "/cfg/mine.cfg"})
+        return s
+
+    def test_matches_this_campaigns_manager_only(self):
+        """A stop must never reach into an unrelated session."""
+        table = [(1, "/bin/syz-manager -config /cfg/mine.cfg"),
+                 (2, "/bin/syz-manager -config /cfg/other.cfg")]
+        with mock.patch.object(fc, "running_processes",
+                               lambda pat: table if "manager" in pat else []):
+            managers, _ = fc.campaign_processes(self._state())
+        self.assertEqual([p for p, _ in managers], [1])
+
+    def test_matches_executors_by_session_id(self):
+        table = [(3, "syz-executor runner /tmp/syz-exec-sid1-0"),
+                 (4, "syz-executor runner /tmp/syz-exec-other-0")]
+        with mock.patch.object(fc, "running_processes",
+                               lambda pat: table if "executor" in pat else []):
+            _, execs = fc.campaign_processes(self._state())
+        self.assertEqual([p for p, _ in execs], [3])
+
+    def test_no_config_matches_nothing(self):
+        """Rather than matching every manager on the box."""
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "running_processes",
+                               lambda pat: [(1, "syz-manager -config /a.cfg")]):
+            managers, execs = fc.campaign_processes(s)
+        self.assertEqual(managers, [])
+        self.assertEqual(execs, [])
+
+    def _run_stop(self, procs_over_time, **kw):
+        """procs_over_time: list of (managers, executors) returned in sequence."""
+        s = self._state()
+        calls = {"session_stop": 0, "signals": []}
+        seq = list(procs_over_time)
+
+        def fake_procs(_s):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        def fake_run(cmd, *a, **k):
+            if isinstance(cmd, list) and "stop" in cmd:
+                calls["session_stop"] += 1
+                if kw.get("hang"):
+                    raise fc.subprocess.TimeoutExpired(cmd, 1)
+            return None
+
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "campaign_processes", fake_procs), \
+             mock.patch.object(fc, "_signal",
+                               lambda pid, sig, what: calls["signals"].append((pid, sig))), \
+             mock.patch.object(fc.subprocess, "run", fake_run):
+            rc = fc.cmd_stop("camp", grace=kw.get("grace", 0),
+                             keep_agent=kw.get("keep_agent", True))
+        return rc, calls, s
+
+    def test_clean_stop_reports_success(self):
+        rc, calls, s = self._run_stop([([], [])])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["session_stop"], 1)
+        self.assertEqual(calls["signals"], [])
+        self.assertEqual(s["status"], "halted")
+
+    def test_survivor_is_signalled_not_reported_as_stopped(self):
+        """A graceful stop that silently did nothing is the failure this whole
+        command exists to prevent."""
+        alive = ([(46434, "syz-manager -config /cfg/mine.cfg")], [])
+        rc, calls, _ = self._run_stop([alive])
+        self.assertEqual(rc, 1)                       # loud, not a false success
+        self.assertTrue(calls["signals"])
+        self.assertIn(46434, [pid for pid, _ in calls["signals"]])
+
+    def test_escalates_to_sigkill(self):
+        alive = ([(46434, "syz-manager -config /cfg/mine.cfg")], [])
+        _, calls, _ = self._run_stop([alive])
+        sigs = [sig for _, sig in calls["signals"]]
+        self.assertIn(signal.SIGINT, sigs)
+        self.assertIn(signal.SIGKILL, sigs)
+
+
+    def test_a_hung_graceful_stop_does_not_block_the_teardown(self):
+        """One did: a scratch retire that could not rename fell back to walking
+        65,000 directories it had no permission to delete."""
+        alive = ([(46434, "syz-manager -config /cfg/mine.cfg")], [])
+        rc, calls, _ = self._run_stop([alive], hang=True)
+        self.assertEqual(calls["session_stop"], 1)
+        self.assertTrue(calls["signals"])       # escalated instead of hanging
+
+    def test_marks_halted_so_a_relaunch_exits(self):
+        _, _, s = self._run_stop([([], [])])
+        self.assertEqual(s["status"], "halted")
+        self.assertTrue(s["halt_reason"])
 
 
 class BrakeTest(unittest.TestCase):
