@@ -20,8 +20,36 @@
 #   * a destination config's "disable_syscalls" is carried across, so re-syncing
 #     does not throw away the quarantine decisions the campaign has accumulated.
 #
+# Output is colour-coded by phase (==> section, OK done, SKIP not done, KEPT a
+# decision made on your behalf). Colour is suppressed when stdout is not a
+# terminal or NO_COLOR is set, since this is routinely redirected into a log.
+#
 # Usage: ./scripts/sync-fuzz-run.sh [FUZZ_ROOT]   (default /Users/Shared/fuzz-run)
+#        NO_COLOR=1 ./scripts/sync-fuzz-run.sh
 set -euo pipefail
+
+# --- colour ------------------------------------------------------------------
+# Only when stdout is a terminal, and never when NO_COLOR is set: this script is
+# routinely redirected into a log and run from other scripts, where escape codes
+# are noise at best and confuse a grep at worst.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=; C_BOLD=; C_DIM=; C_RED=; C_GREEN=; C_YELLOW=; C_BLUE=; C_CYAN=
+fi
+
+# A section header, so the phases of a publish are distinguishable at a glance.
+step()  { printf '%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+# Something was done. The count belongs here: "9 scripts" is verifiable, "ok" is not.
+ok()    { printf '    %s%s%s %s\n' "$C_GREEN" "OK" "$C_RESET" "$*"; }
+# Something was deliberately not done, and you may need to care.
+skip()  { printf '    %s%s%s %s\n' "$C_YELLOW" "SKIP" "$C_RESET" "$*"; }
+# A decision the sync made on your behalf that changes what will run.
+note()  { printf '    %s%s%s %s\n' "$C_CYAN" "KEPT" "$C_RESET" "$*"; }
+info()  { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+fail()  { printf '%sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 DST="${1:-/Users/Shared/fuzz-run}"
@@ -64,34 +92,51 @@ cp_atomic() {
   mv -f "$d.tmp.$$" "$d"
 }
 
-echo "sync $SRC -> $DST"
+printf '%s%s%s %s\n  %s->%s %s\n' \
+  "$C_BOLD" "publish" "$C_RESET" "$SRC" "$C_DIM" "$C_RESET" "$DST"
 mkdir -p "$DST"/scripts "$DST"/bin/darwin_arm64
 for d in "${WRITABLE[@]}"; do mkdir -p "$DST/$d"; done
 
 # --- scripts + binaries (read-only artifacts) --------------------------------
+step "scripts"
 for f in "${SCRIPTS[@]}"; do
-  [ -f "$SRC/scripts/$f" ] || { echo "missing $SRC/scripts/$f" >&2; exit 1; }
+  [ -f "$SRC/scripts/$f" ] || fail "missing $SRC/scripts/$f"
   cp_atomic "$SRC/scripts/$f" "$DST/scripts/$f"
   chmod +x "$DST/scripts/$f"
 done
+ok "${#SCRIPTS[@]} script(s): ${SCRIPTS[*]}"
+
+step "binaries"
 for b in "${BINS[@]}"; do
-  [ -f "$SRC/$b" ] || { echo "missing $SRC/$b -- run \`make target\` / \`make manager\`" >&2; exit 1; }
+  [ -f "$SRC/$b" ] || fail "missing $SRC/$b -- run \`make target\` / \`make manager\`"
   cp_atomic "$SRC/$b" "$DST/$b"
   chmod +x "$DST/$b"
+  info "$(basename "$b")  $(/usr/bin/stat -f '%z bytes, built %Sm' -t '%d/%m %H:%M' "$SRC/$b" 2>/dev/null)"
 done
+ok "${#BINS[@]} binary/binaries"
 
 # --- configs (repoint paths; keep the destination's quarantine decisions) -----
+step "configs"
+cfg_n=0
 for c in "$SRC"/config/*.cfg; do
+  cfg_n=$((cfg_n + 1))
   base="$(basename "$c")"
-  /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" <<'PY'
+  /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" "${C_CYAN:+1}" <<'PY'
 import json, os, sys
 src, dst, old, new = sys.argv[1:5]
+# Colour is decided once, by the shell, from isatty + NO_COLOR. Deciding it again
+# here would emit escapes into a redirected log.
+_c = len(sys.argv) > 5 and sys.argv[5] == "1"
+YEL = "\033[33m" if _c else ""
+CYN = "\033[36m" if _c else ""
+RST = "\033[0m" if _c else ""
 try:
     cfg = json.load(open(src))
 except ValueError as e:
     # A hand-edited config that no longer parses can't be loaded by syz-manager
     # either. Warn and skip it rather than aborting the whole publish.
-    sys.stderr.write("  SKIP %s: not valid JSON (%s)\n" % (os.path.basename(src), e))
+    sys.stderr.write("    %sSKIP%s %s: not valid JSON (%s)\n"
+                     % (YEL, RST, os.path.basename(src), e))
     raise SystemExit(0)
 for k, v in list(cfg.items()):
     if isinstance(v, str) and v.startswith(old):
@@ -105,7 +150,8 @@ except (OSError, ValueError):
     prev = None
 if prev:
     cfg["disable_syscalls"] = prev
-    print("  kept disable_syscalls=%s in %s" % (prev, os.path.basename(dst)))
+    print("    %sKEPT%s %s: disable_syscalls=%s (the campaign's quarantine "
+          "decisions)" % (CYN, RST, os.path.basename(dst), ", ".join(prev)))
 tmp = dst + ".tmp.%d" % os.getpid()
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=4); f.write("\n")
@@ -114,25 +160,35 @@ os.replace(tmp, dst)
 PY
 done
 [ -f "$SRC/config/kext_ids.json" ] && cp_atomic "$SRC/config/kext_ids.json" "$DST/config/kext_ids.json"
+ok "$cfg_n config(s) repointed into $DST"
 
 # --- syscall descriptions ----------------------------------------------------
 # syz-manager has the grammar compiled in, so it does not read these. fuzz-session's
 # pre-flight lint does: without them it reports every enabled syscall as "not
 # defined in sys/<os>/*.txt", a false alarm that buries the real warnings.
+step "syscall descriptions"
 mkdir -p "$DST/sys/darwin"
+desc_n=0
 for t in "$SRC"/sys/darwin/*.txt; do
   [ -e "$t" ] || break
   cp_atomic "$t" "$DST/sys/darwin/$(basename "$t")"
+  desc_n=$((desc_n + 1))
 done
+ok "$desc_n description file(s) (for fuzz-session's lint; the manager has the grammar compiled in)"
 
 # --- campaign definitions (defs only; .state is fuzz-owned runtime) ----------
 # Defs reference configs by repo-relative path, which resolves against the fuzz
 # tree's own root -- so no rewriting is needed here.
+step "campaign definitions"
+camp_n=0
 for j in "$SRC"/campaigns/*.json; do
   [ -e "$j" ] || break
   cp_atomic "$j" "$DST/campaigns/$(basename "$j")"
+  camp_n=$((camp_n + 1))
 done
+ok "$camp_n definition(s); .state left alone (it is fuzz-owned runtime)"
 
+step "permissions"
 # --- permissions: read-only artifacts group-readable; state group-writable ---
 # No setgid: macOS refuses it on this volume, and BSD group inheritance already
 # gives new files the parent dir's group (staff), which both wan and fuzz share.
@@ -160,10 +216,14 @@ find "$DST/campaigns" "$DST/sessions" "$DST/triage" \
      -path "$DST/campaigns/bugs/*/reports" -prune -o \
      -type f -exec chmod g+rw {} + 2>/dev/null || true
 
-echo "done. configs repointed: workdir + syzkaller -> $DST (kernel_obj left in place)"
-echo
-echo "next: pre-flight AS THE FUZZ USER -- doctor's permission checks are only"
-echo "      meaningful when run as the user launchd will run the campaign as."
-echo "      cd out of the repo first: sudo -u fuzz inherits your cwd, and fuzz"
-echo "      cannot getcwd() inside the 0700 build tree."
-echo "  cd $DST && sudo -u fuzz /usr/bin/python3 scripts/fuzz-campaign.py doctor <campaign>"
+ok "tree root 775 (it is the launchd job's cwd), state dirs group-writable"
+info "kernel_obj left in place -- already fuzz-readable, so the 120MB BKC is not copied"
+
+printf '\n%s%s%s\n' "$C_GREEN$C_BOLD" "published." "$C_RESET"
+printf '%snext: pre-flight AS THE FUZZ USER.%s doctor'"'"'s permission checks only mean\n' \
+  "$C_BOLD" "$C_RESET"
+printf '      something when run as the user launchd will run the campaign as.\n'
+printf '      %scd out of the repo first: sudo -u fuzz inherits your cwd, and fuzz\n' "$C_DIM"
+printf '      cannot getcwd() inside the 0700 build tree.%s\n' "$C_RESET"
+printf '  %scd %s && sudo -u fuzz /usr/bin/python3 scripts/fuzz-campaign.py doctor <campaign>%s\n' \
+  "$C_CYAN" "$DST" "$C_RESET"
