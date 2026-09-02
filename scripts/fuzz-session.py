@@ -756,6 +756,10 @@ def cmd_inspect(target):
         "status": state.get("status"),
         "pid": state.get("pid"), "pid_alive": state_pid_alive(state),
         "config": state.get("config"), "workdir": workdir,
+        # The manager's web UI. Recorded per session because the port is taken
+        # from the config, so a driver supervising several configs cannot guess
+        # it -- and it is the first thing you want when a run looks wrong.
+        "http": state.get("http"),
         "run_started": _epoch_iso(started) if started else None,
         "run_started_epoch": started,
         "exec_total": et if et != "" else None,
