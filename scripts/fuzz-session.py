@@ -52,6 +52,7 @@ the pre-run corpus.db + ring_buffer + config to workdir/snapshots/<ts>_auto/
 """
 import argparse
 import collections
+import errno
 import fnmatch
 import hashlib
 import json
@@ -947,8 +948,23 @@ def retire_scratch(path):
     try:
         os.rename(str(path), str(trash))
         return trash
-    except OSError:
-        shutil.rmtree(path, ignore_errors=True)
+    except OSError as e:
+        # EXDEV is the one case where a blocking delete is the right answer: the
+        # rename is impossible but the removal is not.
+        if e.errno == errno.EXDEV:
+            shutil.rmtree(path, ignore_errors=True)
+            return None
+        # Anything else -- and in practice this is EPERM -- must NOT fall back to
+        # a walk. These dirs live in /tmp, which is sticky, so only their owner
+        # can rename or unlink them: a stop run by the wrong user cannot touch a
+        # scratch tree the fuzz user created. shutil.rmtree(ignore_errors=True)
+        # then walks every one of ~65,000 subdirectories, fails on each, swallows
+        # the error and keeps going -- minutes of work that deletes nothing while
+        # looking exactly like a hung stop. Leave it for whoever owns it; the next
+        # stop or `clean` by that user picks it up.
+        warn("cannot retire scratch %s (%s) -- leaving it for its owner; "
+             "run stop as that user, or: sudo rm -rf %s"
+             % (path, e.strerror or e, path))
         return None
 
 
