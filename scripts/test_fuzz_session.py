@@ -140,5 +140,149 @@ class RpcPortTest(unittest.TestCase):
         self.assertGreaterEqual(fs.RPC_PORT_TIMEOUT, 120)
 
 
+class OrphanExecutorTest(unittest.TestCase):
+    """The executor holds the coverage device EXCLUSIVELY, so one wedged in the
+    kernel makes every later manager die with 'open of kcov device failed
+    (errno 16)'. No restart can succeed until it is gone -- which is how a single
+    hung program turned a campaign into a halt rather than a recovery."""
+
+    def _ps(self, lines):
+        out = "PID COMMAND\n" + "".join(lines)
+        return mock.patch.object(fs.subprocess, "run",
+                                 lambda *a, **k: type("R", (), {"stdout": out})())
+
+    def test_untracked_executor_is_an_orphan(self):
+        with self._ps(["  527 %s exec\n" % fs.EXECUTOR_BIN]):
+            self.assertEqual([p for p, _ in fs.orphan_executors({})], [527])
+
+    def test_this_sessions_own_executors_are_left_alone(self):
+        state = {"executors": [{"pid": 527}]}
+        with self._ps(["  527 %s exec\n" % fs.EXECUTOR_BIN]):
+            self.assertEqual(fs.orphan_executors(state), [])
+
+    def test_only_our_executor_binary_is_touched(self):
+        """Nothing outside this tree is ever killed."""
+        with self._ps(["  900 /somewhere/else/syz-executor exec\n"]):
+            self.assertEqual(fs.orphan_executors({}), [])
+
+    def test_nothing_running_is_no_orphans(self):
+        with self._ps([]):
+            self.assertEqual(fs.orphan_executors({}), [])
+
+    def test_reap_kills_a_normal_orphan(self):
+        killed = []
+        with self._ps(["  527 %s exec\n" % fs.EXECUTOR_BIN]), \
+             mock.patch.object(fs, "proc_state", lambda pid: "S"), \
+             mock.patch.object(fs.os, "kill", lambda pid, sig: killed.append(pid)), \
+             mock.patch.object(fs.time, "sleep", lambda n: None):
+            freed, wedged = fs.reap_orphan_executors({})
+        self.assertIn(527, killed)
+        self.assertEqual(wedged, [])
+
+    def test_a_permission_error_does_not_raise(self):
+        """Killing another user's executor needs sudo; that must warn, not crash
+        the session start."""
+        def eperm(pid, sig):
+            raise PermissionError("nope")
+        with self._ps(["  527 %s exec\n" % fs.EXECUTOR_BIN]), \
+             mock.patch.object(fs, "proc_state", lambda pid: "S"), \
+             mock.patch.object(fs.os, "kill", eperm), \
+             mock.patch.object(fs.time, "sleep", lambda n: None):
+            fs.reap_orphan_executors({})
+
+
+class UnkillableTest(unittest.TestCase):
+    """STAT 'U' is uninterruptible sleep: the thread is inside a kernel call
+    that never returns and never checks for signals, so SIGKILL is only QUEUED.
+    This is what a real driver hang looks like from userspace, and it is the one
+    case where the honest answer is 'only a reboot clears this'."""
+
+    def test_u_state_is_unkillable(self):
+        with mock.patch.object(fs, "proc_state", lambda pid: "U"):
+            self.assertTrue(fs.unkillable(527))
+
+    def test_ordinary_states_are_killable(self):
+        for st in ("S", "R", "S+", "Ss", "Z"):
+            with mock.patch.object(fs, "proc_state", lambda pid, _s=st: _s):
+                self.assertFalse(fs.unkillable(1), st)
+
+    def test_a_gone_process_is_not_unkillable(self):
+        with mock.patch.object(fs, "proc_state", lambda pid: ""):
+            self.assertFalse(fs.unkillable(999999))
+
+    def test_reap_does_not_bother_signalling_a_wedged_process(self):
+        """SIGKILL cannot reach it, so sending one is noise that also looks like
+        the problem was addressed."""
+        killed = []
+        with self._ps_u(["  527 %s exec\n" % fs.EXECUTOR_BIN]), \
+             mock.patch.object(fs, "proc_state", lambda pid: "U"), \
+             mock.patch.object(fs.os, "kill", lambda pid, sig: killed.append(pid)), \
+             mock.patch.object(fs.time, "sleep", lambda n: None):
+            freed, wedged = fs.reap_orphan_executors({})
+        self.assertEqual(killed, [])
+        self.assertEqual(wedged, [527])
+
+    def _ps_u(self, lines):
+        out = "PID COMMAND\n" + "".join(lines)
+        return mock.patch.object(fs.subprocess, "run",
+                                 lambda *a, **k: type("R", (), {"stdout": out})())
+
+
+class DiagnoseHangTest(unittest.TestCase):
+    """A wedged executor is blocked in ONE call, so unlike a crash -- where the
+    fault is state-dependent and you need the whole sequence -- the stack IS the
+    answer. Seconds and no reboots, against a minimizer that costs a reboot per
+    positive probe."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def _sample(self, body, rc=0):
+        return mock.patch.object(
+            fs, "_run_capture", lambda cmd, timeout=90: (rc, body))
+
+    def test_extracts_the_blocked_call(self):
+        body = ("Thread 0x1\n"
+                "  2000 IOConnectCallMethod  (in IOKit)\n"
+                "  2000 unrelated_frame  (in libsystem)\n")
+        with self._sample(body), \
+             mock.patch.object(fs, "proc_state", lambda pid: "U"):
+            res = fs.diagnose_hang([527], self.dir)
+        pid, path, frames = res[0]
+        self.assertEqual(pid, 527)
+        self.assertTrue(Path(path).is_file())
+        self.assertTrue(any("IOConnectCallMethod" in f for f in frames))
+        self.assertFalse(any("unrelated_frame" in f for f in frames))
+
+    def test_saves_the_full_dump_not_just_the_matches(self):
+        """The filter is a convenience; the evidence is the whole stack."""
+        body = "Thread 0x1\n  2000 mach_msg_trap\n  2000 something_else\n"
+        with self._sample(body), mock.patch.object(fs, "proc_state", lambda pid: "U"):
+            _, path, _ = fs.diagnose_hang([527], self.dir)[0]
+        self.assertIn("something_else", Path(path).read_text())
+
+    def test_no_stack_is_reported_not_faked(self):
+        """Both tools need root for another user's process; that must be said,
+        not silently produce an empty result that looks like a clean stack."""
+        with self._sample("", rc=1), mock.patch.object(fs, "proc_state", lambda pid: "U"):
+            pid, path, frames = fs.diagnose_hang([527], self.dir)[0]
+        self.assertIsNone(path)
+        self.assertEqual(frames, [])
+
+    def test_no_wedged_process_is_not_an_error(self):
+        with mock.patch.object(fs, "orphan_executors", lambda st: []):
+            self.assertEqual(fs.diagnose_hang(None, self.dir), [])
+
+    def test_finds_wedged_executors_when_no_pid_given(self):
+        with mock.patch.object(fs, "orphan_executors",
+                               lambda st: [(527, "syz-executor exec")]), \
+             mock.patch.object(fs, "unkillable", lambda pid: True), \
+             mock.patch.object(fs, "proc_state", lambda pid: "U"), \
+             self._sample("  IOAVBFamily::doSomething\n"):
+            res = fs.diagnose_hang(None, self.dir)
+        self.assertEqual(res[0][0], 527)
+        self.assertTrue(any("IOAVB" in f for f in res[0][2]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -943,6 +943,178 @@ def start_executors(state, count):
     save_state(state)
 
 
+def orphan_executors(state=None):
+    """Our syz-executor processes NOT tracked by `state` -- leftovers from a
+    wedged or half-stopped run.
+
+    They matter because the executor holds the coverage device EXCLUSIVELY. One
+    program wedged in the kernel leaves an executor alive forever, and every
+    subsequent manager then dies at startup with "open of kcov device failed
+    (errno 16)" -- EBUSY. No restart can succeed until the orphan is gone, so a
+    campaign that only knows how to restart halts instead of recovering.
+
+    Matched on our own executor path, so nothing outside this tree is ever
+    touched. Returns [(pid, command)].
+    """
+    tracked = {int(e["pid"]) for e in (state or {}).get("executors", [])
+               if e.get("pid")}
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "pid,command"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    mine = str(EXECUTOR_BIN) if "EXECUTOR_BIN" in globals() else "syz-executor"
+    found = []
+    for line in (out or "").splitlines()[1:]:
+        line = line.strip()
+        if "syz-executor" not in line or mine not in line:
+            continue
+        pid_s, _, cmd = line.partition(" ")
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid not in tracked and pid != os.getpid():
+            found.append((pid, cmd.strip()))
+    return found
+
+
+def proc_state(pid):
+    """ps STAT for a pid, or "" -- 'U' is uninterruptible sleep."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(int(pid))],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=5).stdout.strip()
+        return out.split()[0] if out else ""
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+
+def unkillable(pid):
+    """True when pid is wedged in the kernel and cannot be signalled away.
+
+    STAT 'U' is uninterruptible sleep: the thread is inside a kernel call that
+    never returns and never checks for signals, so SIGKILL is merely QUEUED --
+    it is delivered if the call returns, which by definition it will not. This
+    is what a real driver hang looks like from userspace, and it is the one
+    condition where the honest answer is "only a reboot clears this".
+    """
+    return proc_state(pid).startswith("U")
+
+
+def reap_orphan_executors(state=None):
+    """Free the coverage device by killing orphaned executors.
+
+    Returns (freed, wedged): how many died, and the pids that cannot be killed
+    at all. A non-empty `wedged` means no restart on this boot can succeed --
+    the device stays held until the machine reboots.
+    """
+    orphans = orphan_executors(state)
+    if not orphans:
+        return 0, []
+    for pid, cmd in orphans:
+        if unkillable(pid):
+            continue          # signalling it is pointless; reported below
+        warn("orphaned executor pid %d holds the coverage device -- killing it "
+             "(%s)" % (pid, cmd[:60]))
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except PermissionError:
+            warn("  cannot kill pid %d (owned by another user); run as that "
+                 "user or with sudo" % pid)
+        except OSError:
+            pass
+    time.sleep(1)
+    left = orphan_executors(state)
+    wedged = [pid for pid, _ in left if unkillable(pid)]
+    for pid in wedged:
+        warn("executor pid %d is in uninterruptible sleep (STAT U): wedged inside "
+             "a kernel call that never returns. SIGKILL cannot reach it, so it "
+             "will hold the coverage device until the machine REBOOTS." % pid)
+    other = [pid for pid, _ in left if pid not in wedged]
+    if other:
+        warn("%d orphaned executor(s) survived the kill: %s"
+             % (len(other), ", ".join(str(p) for p in other)))
+    return len(orphans) - len(left), wedged
+
+
+def _run_capture(cmd, timeout=90):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout or ""
+    except subprocess.TimeoutExpired:
+        return 1, "(timed out after %ds)" % timeout
+    except OSError as e:
+        return 1, str(e)
+
+
+# Frames worth pulling out of a stack dump. A wedged executor is blocked in ONE
+# call, so unlike a crash -- where the fault is state-dependent and you need the
+# whole sequence -- the stack IS the answer.
+_HANG_FRAMES = re.compile(
+    r"IOConnect|IOService|IOKit|io_connect|mach_msg|semaphore|_sleep|"
+    r"msleep|thread_block|lck_|IOLock|AVB|IOAVB", re.I)
+
+
+def diagnose_hang(pids=None, out_dir=None):
+    """Capture what a wedged executor is blocked in, with sample and spindump.
+
+    Seconds, no reboots, and it names the kernel call directly -- which is why
+    it is the first thing to try, ahead of any minimization. Minimizing a hang
+    costs a reboot per positive probe; this costs nothing and often ends the
+    investigation.
+
+    Returns [(pid, path, interesting_frames)].
+    """
+    if pids is None:
+        pids = [pid for pid, _ in orphan_executors(None) if unkillable(pid)]
+        pids += [pid for pid, _ in orphan_executors(None) if pid not in pids]
+    if not pids:
+        print("no wedged executor found")
+        return []
+    out_dir = Path(out_dir or ".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for pid in pids:
+        stamp = now_ts()
+        print("  pid %d (STAT %s)" % (pid, proc_state(pid) or "?"))
+        text = ""
+        for label, cmd in (("sample", ["/usr/bin/sample", str(pid), "3", "-mayDie"]),
+                           ("spindump", ["/usr/sbin/spindump", str(pid), "3",
+                                         "-stdout"])):
+            rc, body = _run_capture(cmd)
+            if rc == 0 and body.strip():
+                text += "\n===== %s =====\n%s" % (label, body)
+                print("    %s: captured %d lines" % (label, body.count("\n")))
+            else:
+                # Both need root for another user's process; say so once, plainly.
+                first = (body or "").strip().splitlines()[:1]
+                print("    %s: unavailable%s"
+                      % (label, " -- %s" % first[0][:90] if first else ""))
+        if not text.strip():
+            warn("no stack captured for pid %d -- both sample and spindump need "
+                 "root for another user's process: sudo is required" % pid)
+            results.append((pid, None, []))
+            continue
+        path = out_dir / ("hang-%d-%s.txt" % (pid, stamp))
+        path.write_text(text)
+        frames = []
+        for line in text.splitlines():
+            if _HANG_FRAMES.search(line) and line.strip() not in frames:
+                frames.append(line.strip())
+        print("    saved %s" % path)
+        if frames:
+            print("    frames naming the blocked call:")
+            for f in frames[:12]:
+                print("      %s" % f[:110])
+        else:
+            print("    no IOKit/driver frames matched -- read the full dump")
+        results.append((pid, str(path), frames))
+    return results
+
+
 def stop_executors(state):
     """Kill all executors of a session and wipe their scratch dirs."""
     execs = state.get("executors", [])
@@ -1331,6 +1503,17 @@ def save_grammar(workdir, conf, stamp, dedupe=True):
 def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     if not MANAGER_BIN.exists() or not os.access(MANAGER_BIN, os.X_OK):
         die("syz-manager not built at %s (run: make manager)" % MANAGER_BIN)
+    # The coverage device is exclusive, and a wedged executor holds it forever.
+    # Without this the manager dies at startup with "open of kcov device failed
+    # (errno 16)" and no restart can ever succeed -- which is how a single hung
+    # program turned into a halted campaign rather than a recovered one.
+    _, wedged = reap_orphan_executors(None)
+    if wedged:
+        die("cannot start: executor pid(s) %s are wedged in the kernel "
+            "(uninterruptible sleep) and still hold the coverage device. "
+            "syz-manager would die with \"open of kcov device failed "
+            "(errno 16)\". Nothing on this boot can free it -- REBOOT the machine."
+            % ", ".join(str(p) for p in wedged))
     cfg = Path(cfg_arg)
     if not cfg.is_file():
         die("config not found: %s" % cfg_arg)
@@ -1557,6 +1740,14 @@ def cmd_resume(target, executors=None, allow_concurrent=False, force=False):
     state = refresh_status(sid)
     if state and state.get("status") == "running":
         die("session '%s' is already running (pid %s)." % (sid, state.get("pid")))
+    # Free the coverage device before trying: this session's own executors are
+    # tracked and left alone, but a leftover from a wedged run would make the
+    # manager die at startup with EBUSY (see reap_orphan_executors).
+    _, wedged = reap_orphan_executors(state)
+    if wedged:
+        die("cannot resume: executor pid(s) %s are wedged in the kernel and hold "
+            "the coverage device; only a reboot frees it."
+            % ", ".join(str(p) for p in wedged))
     cfg = config_for_id(sid)
     if not cfg:
         die("cannot find config for '%s' (looked in registry and config/%s.cfg)" % (sid, sid))
@@ -2740,6 +2931,14 @@ def main():
     sp.add_argument("target")
     sub.add_parser("list", help="table of all sessions")
     sub.add_parser("ls", help="alias for list")
+    sp = sub.add_parser("diagnose-hang",
+                        help="capture what a wedged executor is blocked in "
+                             "(sample + spindump); needs sudo for another "
+                             "user's process")
+    sp.add_argument("pid", nargs="*", type=int,
+                    help="pids to sample (default: every wedged executor found)")
+    sp.add_argument("--out", help="directory for the dumps (default: cwd)")
+
     sp = sub.add_parser("inspect", help="machine-readable JSON status (for fuzz-campaign)")
     sp.add_argument("target")
     for _name, _help in (("status", "dashboard for one session (--watch to redraw)"),
@@ -2832,6 +3031,8 @@ def main():
         cmd_exec_stop(args.target)
     elif args.cmd in ("list", "ls"):
         cmd_list()
+    elif args.cmd == "diagnose-hang":
+        diagnose_hang(args.pid or None, args.out)
     elif args.cmd == "inspect":
         cmd_inspect(args.target)
     elif args.cmd in ("status", "watch"):
