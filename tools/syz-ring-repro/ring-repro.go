@@ -39,18 +39,19 @@ import (
 )
 
 var (
-	flagOS         = flag.String("os", runtime.GOOS, "target os")
-	flagArch       = flag.String("arch", runtime.GOARCH, "target arch")
-	flagExecutor   = flag.String("executor", "./syz-executor", "path to executor binary")
-	flagSandbox    = flag.String("sandbox", "none", "sandbox for execution (none/setuid/namespace/android)")
-	flagSandboxArg = flag.Int("sandbox_arg", 0, "argument for sandbox runner")
-	flagRepeat     = flag.Int("repeat", 1, "number of times to replay the full sequence (0 = infinite)")
-	flagProcs      = flag.Int("procs", 1, "number of parallel executor processes")
-	flagDebug      = flag.Bool("debug", false, "debug output from executor")
-	flagOutput     = flag.Bool("output", false, "print each program before execution")
-	flagUnsafe     = flag.Bool("unsafe", false, "use unsafe program deserialization mode")
-	flagSlowdown   = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
-	flagFrom       = flag.Int("from", -1, "start of range, as an offset back from the most recent program n "+
+	flagOS           = flag.String("os", runtime.GOOS, "target os")
+	flagArch         = flag.String("arch", runtime.GOARCH, "target arch")
+	flagExecutor     = flag.String("executor", "./syz-executor", "path to executor binary")
+	flagExecutorName = flag.String("executor_name", "", "process name to run the executor under. Some IOKit drivers only hand out a user client to a caller with an expected p_comm -- IOBluetoothHCIControllerUserClient returns kIOReturnUnsupported to anything not named 'bluetoothd' -- so without this every IOServiceOpen fails, every later call is inert, and minimization reports that nothing reproduces. A copy of -executor is staged under this name in the job root (next to the program file) and executed from there, because Darwin takes p_comm from the file executed, not argv[0]. Empty (default) runs -executor under its own name")
+	flagSandbox      = flag.String("sandbox", "none", "sandbox for execution (none/setuid/namespace/android)")
+	flagSandboxArg   = flag.Int("sandbox_arg", 0, "argument for sandbox runner")
+	flagRepeat       = flag.Int("repeat", 1, "number of times to replay the full sequence (0 = infinite)")
+	flagProcs        = flag.Int("procs", 1, "number of parallel executor processes")
+	flagDebug        = flag.Bool("debug", false, "debug output from executor")
+	flagOutput       = flag.Bool("output", false, "print each program before execution")
+	flagUnsafe       = flag.Bool("unsafe", false, "use unsafe program deserialization mode")
+	flagSlowdown     = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
+	flagFrom         = flag.Int("from", -1, "start of range, as an offset back from the most recent program n "+
 		"(e.g. 5 selects from n-5); -1 = oldest available")
 	flagTo = flag.Int("to", 0, "end of range, as an offset back from the most recent program n "+
 		"(e.g. 1 selects up to n-1); 0 = most recent")
@@ -93,6 +94,15 @@ var (
 		"as <confirm_cmd> <target_sig> <since_epoch>; it should print 'match' / 'none' (both counted as the "+
 		"target crash) or 'other <sig>' (a different bug — not counted). Typically "+
 		"'python3 scripts/crash_fingerprint.py match-since --dir <panic-dir>'")
+	// A healthy program on this target runs in about 2ms (syz-manager's own
+	// "prog exec time"), so this is many hundreds of times the mean. It only ever
+	// pays out on a genuine hang: a program that finishes cancels the context
+	// immediately, so negative probes cost nothing extra. Without a deadline a
+	// wedged program blocked the minimizer forever -- including during an
+	// ordinary crash minimization that happened to trip a hang.
+	flagProgTimeout = flag.Int("prog_timeout", 20,
+		"seconds to wait for one program to finish before treating it as a hang")
+
 	flagMaxK = flag.Int("max_k", 3, "with -minimize-conn, the largest culprit size searched by enumeration "+
 		"before falling back to ddmin halving. Enumeration costs sum(C(n,k)) cheap probes but crashes "+
 		"(and so reboots) only once, on the answer; halving crashes on nearly every reduction step. "+
@@ -122,6 +132,7 @@ func main() {
 		os.Exit(1)
 	}
 	dir := flag.Args()[0]
+	execBaseDir = executorBase(dir)
 
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
@@ -247,7 +258,7 @@ func main() {
 			KcovDevice: *flagKcovDevice,
 			KextID:     *flagKextID,
 		},
-		Executor:         *flagExecutor,
+		Executor:         resolveExecutor(),
 		HandleInterrupts: true,
 		MachineChecked:   ctx.machineChecked,
 		OutputWriter:     os.Stderr,
