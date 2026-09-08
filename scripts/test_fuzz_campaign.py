@@ -9,6 +9,7 @@ translation (syz-ring-repro -emit-json) is exercised by the Go tests.
 
 import importlib.util
 import json
+import os
 import signal
 import tempfile
 import time
@@ -597,13 +598,19 @@ class StopTest(unittest.TestCase):
             managers, _ = fc.campaign_processes(self._state())
         self.assertEqual([p for p, _ in managers], [1])
 
-    def test_matches_executors_by_session_id(self):
-        table = [(3, "syz-executor runner /tmp/syz-exec-sid1-0"),
-                 (4, "syz-executor runner /tmp/syz-exec-other-0")]
+    def test_matches_executors_by_binary_path_not_session_id(self):
+        """A session id never appears in an executor's argv -- it is only the
+        cwd. Matching on it found NOTHING, so stop reported "all processes gone"
+        while two executors were still running, one of them unkillable and
+        holding the coverage device."""
+        exe = str(fc.REPO_ROOT / "bin" / "darwin_arm64" / "syz-executor")
+        table = [(3, "%s runner 0 127.0.0.1 49182" % exe),
+                 (4, "%s exec" % exe),
+                 (5, "/somewhere/else/syz-executor exec")]
         with mock.patch.object(fc, "running_processes",
                                lambda pat: table if "executor" in pat else []):
             _, execs = fc.campaign_processes(self._state())
-        self.assertEqual([p for p, _ in execs], [3])
+        self.assertEqual([p for p, _ in execs], [3, 4])   # 5 is not ours
 
     def test_no_config_matches_nothing(self):
         """Rather than matching every manager on the box."""
@@ -634,6 +641,7 @@ class StopTest(unittest.TestCase):
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "save_state", lambda st: None), \
              mock.patch.object(fc, "campaign_processes", fake_procs), \
+             mock.patch.object(fc, "proc_stat", lambda pid: kw.get("stat", "S")), \
              mock.patch.object(fc, "_signal",
                                lambda pid, sig, what: calls["signals"].append((pid, sig))), \
              mock.patch.object(fc.subprocess, "run", fake_run):
@@ -673,10 +681,129 @@ class StopTest(unittest.TestCase):
         self.assertEqual(calls["session_stop"], 1)
         self.assertTrue(calls["signals"])       # escalated instead of hanging
 
+
+    def test_a_wedged_survivor_is_not_signalled_and_not_called_success(self):
+        """SIGKILL cannot reach a STAT U process. Reporting success while it
+        still holds the coverage device is the exact failure this command
+        exists to prevent -- and it happened."""
+        alive = ([(3958, "syz-executor exec")], [])
+        rc, calls, _ = self._run_stop([alive], stat="U")
+        self.assertEqual(rc, 1)                 # loud, not a false success
+        self.assertEqual(calls["signals"], [])  # no futile signals
+
     def test_marks_halted_so_a_relaunch_exits(self):
         _, _, s = self._run_stop([([], [])])
         self.assertEqual(s["status"], "halted")
         self.assertTrue(s["halt_reason"])
+
+
+class HangDetectionTest(unittest.TestCase):
+    """The detector used to require exec_total to be READABLE, on both branches.
+    A manager that stopped reporting -- which is what a bad hang looks like --
+    could therefore never be declared hung: the worse the wedge, the more
+    invisible it was. A box sat 38 minutes on one stuck program."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _supervise(self, infos, hang_after=1, stuck=None):
+        """Run supervise against a scripted sequence of inspect() results."""
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg"})
+        d = dict(fc.DEFAULTS, hang_after_seconds=hang_after, poll_seconds=0,
+                 stop_check_seconds=0.01, name="camp")
+        seq = list(infos)
+
+        def fake_inspect(sid):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "inspect", fake_inspect), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: stuck), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            return fc.supervise(s, d, "sid", budget=10 ** 9)
+
+    def test_unreadable_exec_total_is_a_hang(self):
+        """The bug: this returned nothing and supervised forever."""
+        alive = {"found": True, "pid_alive": True, "exec_total": None,
+                 "run_started_epoch": time.time()}
+        self.assertEqual(self._supervise([alive], hang_after=0), "hang")
+
+    def test_frozen_exec_total_is_still_a_hang(self):
+        alive = {"found": True, "pid_alive": True, "exec_total": 500,
+                 "run_started_epoch": time.time()}
+        self.assertEqual(self._supervise([alive, alive], hang_after=0), "hang")
+
+    def test_progress_is_not_a_hang(self):
+        """Advancing exec_total must reset the clock, or a healthy run would be
+        killed the moment it exceeded hang_after."""
+        base = {"found": True, "pid_alive": True, "run_started_epoch": time.time()}
+        moving = [dict(base, exec_total=n) for n in (100, 200, 300)]
+        # Budget expiry is the only other way out, so a non-hang shows as budget.
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg"})
+        d = dict(fc.DEFAULTS, hang_after_seconds=9999, poll_seconds=0,
+                 stop_check_seconds=0.01, name="camp")
+        seq = list(moving)
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "inspect",
+                               lambda sid: seq.pop(0) if len(seq) > 1 else seq[0]), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            self.assertEqual(fc.supervise(s, d, "sid", budget=0), "budget")
+
+    def test_a_wedged_executor_is_a_hang_regardless_of_counters(self):
+        """One `syz-executor exec` per program, so one alive for minutes is a
+        syscall that never returned -- direct evidence, not an inference."""
+        alive = {"found": True, "pid_alive": True, "exec_total": 1,
+                 "run_started_epoch": time.time()}
+        self.assertEqual(self._supervise([alive], hang_after=9999, stuck=2398),
+                         "hang")
+
+
+class EtimeTest(unittest.TestCase):
+    def test_parses_ps_elapsed_forms(self):
+        self.assertEqual(fc._etime_seconds("04:59"), 299)
+        self.assertEqual(fc._etime_seconds("38:35"), 2315)
+        self.assertEqual(fc._etime_seconds("12:34:56"), 45296)
+        self.assertEqual(fc._etime_seconds("1-02:03:04"), 93784)
+
+    def test_garbage_is_none(self):
+        for bad in ("", None, "abc", "1:2:x"):
+            self.assertIsNone(fc._etime_seconds(bad), bad)
+
+    def test_below_the_limit_is_not_stuck(self):
+        ps = "ELAPSED COMMAND\n    00:02 /bin/syz-executor exec\n"
+        with mock.patch.object(fc.subprocess, "run",
+                               lambda *a, **k: type("R", (), {"stdout": ps})()):
+            self.assertIsNone(fc.stuck_executor_seconds(dict(fc.DEFAULTS)))
+
+    def test_above_the_limit_is_stuck(self):
+        ps = "ELAPSED COMMAND\n    38:35 /bin/syz-executor exec\n"
+        with mock.patch.object(fc.subprocess, "run",
+                               lambda *a, **k: type("R", (), {"stdout": ps})()):
+            self.assertEqual(fc.stuck_executor_seconds(dict(fc.DEFAULTS)), 2315)
+
+    def test_the_runner_process_is_not_an_exec(self):
+        """`syz-executor runner` is long-lived by design; only `exec` is per-program."""
+        ps = "ELAPSED COMMAND\n 20:03:09 /bin/syz-executor runner 0 127.0.0.1 49178\n"
+        with mock.patch.object(fc.subprocess, "run",
+                               lambda *a, **k: type("R", (), {"stdout": ps})()):
+            self.assertIsNone(fc.stuck_executor_seconds(dict(fc.DEFAULTS)))
 
 
 class BrakeTest(unittest.TestCase):
@@ -832,6 +959,193 @@ class StatusWatchTest(unittest.TestCase):
              mock.patch.object(fc, "free_gb", lambda: 100.0):
             lines, _ = fc.status_lines("camp")
         self.assertTrue(any("starts from scratch" in ln for ln in lines))
+
+
+
+
+class ConfigTriageFlagsTest(unittest.TestCase):
+    """The crashing config's device settings must reach triage.
+
+    A missing executor_name is silent and catastrophic: the driver refuses every
+    IOServiceOpen, every later call is inert, and minimization reports "nothing
+    reproduces" from a search that never touched the driver. Campaign
+    drivers_260902 spent 25,461 probes that way.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_executor_name_is_carried(self):
+        cfg = write_cfg(self.dir, {
+            "executor_name": "bluetoothd",
+            "kext_coverage": {"kext_id": 32, "kcov_device": "/dev/pishi"},
+        })
+        flags = fc.config_triage_flags(str(cfg))
+        self.assertEqual(flags["executor_name"], "bluetoothd")
+        self.assertEqual(flags["kext_id"], 32)
+        self.assertEqual(flags["kcov_device"], "/dev/pishi")
+
+    def test_absent_and_blank_names_are_omitted(self):
+        for value in (None, "", "   "):
+            body = {"kext_coverage": {"kext_id": 1}}
+            if value is not None:
+                body["executor_name"] = value
+            flags = fc.config_triage_flags(str(write_cfg(self.dir, body)))
+            self.assertNotIn("executor_name", flags, value)
+
+    def test_unreadable_config_yields_no_flags(self):
+        bad = self.dir / "broken.cfg"
+        bad.write_text("{ not json")
+        self.assertEqual(fc.config_triage_flags(str(bad)), {})
+
+
+class ExhaustedSignatureTest(unittest.TestCase):
+    """A search that reproduced NOTHING must not be repeated.
+
+    Signature b2db82ffad422697 was triaged three times in a row -- 6,657 / 6,093 /
+    8,557 probes -- because nothing recorded that the previous attempt had already
+    exhausted the whole search space without a single reproduction.
+    """
+
+    def _state(self, **over):
+        s = {"name": "c", "exhausted_sigs": [], "suppressed_sigs": [],
+             "current_config": None, "triage_bug_sig": None}
+        s.update(over)
+        return s
+
+    def test_exhausted_signature_is_not_retriaged(self):
+        s = self._state(exhausted_sigs=["deadbeef"])
+        with mock.patch.object(fc, "latest_panic_signature", return_value="deadbeef"), \
+             mock.patch.object(fc, "route_bug_registry"), \
+             mock.patch.object(fc, "quarantine_decide") as decide, \
+             mock.patch.object(fc, "begin_triage") as begin:
+            self.assertFalse(fc.handle_crash(s, {}, {"panics": []}))
+        decide.assert_not_called()
+        begin.assert_not_called()
+
+    def test_fresh_signature_still_triages(self):
+        s = self._state()
+        with mock.patch.object(fc, "latest_panic_signature", return_value="cafe"), \
+             mock.patch.object(fc, "route_bug_registry"), \
+             mock.patch.object(fc, "quarantine_decide", return_value="triage"), \
+             mock.patch.object(fc, "begin_triage", return_value=True) as begin:
+            self.assertTrue(fc.handle_crash(s, {}, {"panics": []}))
+        begin.assert_called_once()
+
+    def test_forget_exhausted_clears_one_and_all(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(fc, "STATE_DIR", Path(td)):
+                s = self._state(exhausted_sigs=["aa", "bb"])
+                with mock.patch.object(fc, "load_state", return_value=s), \
+                     mock.patch.object(fc, "save_state"):
+                    fc.cmd_forget_exhausted("c", "aa")
+                    self.assertEqual(s["exhausted_sigs"], ["bb"])
+                    fc.cmd_forget_exhausted("c")
+                    self.assertEqual(s["exhausted_sigs"], [])
+
+
+class NewSeedsDeviceSettingsFromConfig(unittest.TestCase):
+    """`new` should take device settings from the config, not from your typing.
+
+    Each driver has its own Pishi kext id (AppleJPEGDriver=1 ... AppleFDEKeyStore
+    =256). A campaign carrying the wrong one triages a crash against the wrong
+    kext, and the only thing that stopped that was remembering to pass --kext-id
+    correctly every time.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "campaigns").mkdir()
+        self._patch = mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns")
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _cfg(self, stem, kext=None, workdir="w", name=None, syscalls=()):
+        body = {"workdir": "/tmp/%s" % workdir, "enable_syscalls": list(syscalls)}
+        if kext is not None:
+            body["kext_coverage"] = {"kext_id": kext, "kcov_device": "/dev/pishi"}
+        if name:
+            body["executor_name"] = name
+        p = self.dir / ("%s.cfg" % stem)
+        p.write_text(json.dumps(body))
+        return str(p)
+
+    def _new(self, configs, **over):
+        kw = dict(budget_hours=1.0, loop=False, poll_seconds=1,
+                  hang_after_seconds=1, max_crashes=1, min_free_gb=1.0,
+                  keep_cores=1, force=True)
+        kw.update(over)
+        fc.cmd_new("c", configs, **kw)
+        return json.loads((self.dir / "campaigns" / "c.json").read_text())
+
+    def test_kext_id_and_device_come_from_the_config(self):
+        d = self._new([self._cfg("fde", kext=256)])
+        self.assertEqual(d["triage"]["kext_id"], 256)
+        self.assertEqual(d["triage"]["kcov_device"], "/dev/pishi")
+
+    def test_explicit_flag_still_wins(self):
+        d = self._new([self._cfg("fde", kext=256)],
+                      triage_opts={"kext_id": 4, "kcov_device": None})
+        self.assertEqual(d["triage"]["kext_id"], 4)
+        # the unset one is still seeded from the config
+        self.assertEqual(d["triage"]["kcov_device"], "/dev/pishi")
+
+    def test_config_without_kext_coverage_seeds_nothing(self):
+        d = self._new([self._cfg("bare")])
+        self.assertNotIn("kext_id", d.get("triage", {}))
+
+    def test_executor_name_is_not_seeded_into_the_campaign(self):
+        # It is per-config and read at triage time by config_triage_flags; copying
+        # the first config's name onto a whole sweep would be wrong the moment the
+        # sweep spans drivers.
+        d = self._new([self._cfg("bt", kext=32, name="bluetoothd")])
+        self.assertNotIn("executor_name", d.get("triage", {}))
+
+
+class BoxBusyPrecision(unittest.TestCase):
+    """box_busy must match the program EXECUTED, not any mention of its name.
+
+    running_processes() substring-matches the whole command line, so a shell whose
+    argv merely contains "syz-manager" reads as a live campaign -- which is exactly
+    what a doctor run in a terminal looks like.
+    """
+
+    def _busy(self, table):
+        with mock.patch.object(fc, "running_processes", return_value=table):
+            return fc.box_busy()
+
+    def test_a_shell_mentioning_the_name_is_not_a_campaign(self):
+        self.assertEqual(self._busy([
+            (1, "/bin/zsh -c grep syz-manager /var/log/x"),
+            (2, "/bin/zsh -c ./scripts/fuzz-campaign.py run notes.txt"),
+        ]), [])
+
+    def test_a_real_manager_and_supervisor_are_found(self):
+        got = self._busy([
+            (10, "/Users/Shared/fuzz-run/bin/syz-manager -config /x.cfg"),
+            (11, "/usr/bin/python3 /Users/Shared/fuzz-run/scripts/fuzz-campaign.py run camp"),
+        ])
+        self.assertEqual([(w, p) for w, p, _ in got],
+                         [("syz-manager", 10), ("supervisor", 11)])
+
+    def test_our_own_process_is_skipped(self):
+        self.assertEqual(self._busy([
+            (os.getpid(), "/Users/Shared/fuzz-run/bin/syz-manager -config /x.cfg"),
+        ]), [])
+
+    def test_status_watch_is_not_a_running_campaign(self):
+        self.assertEqual(self._busy([
+            (12, "/usr/bin/python3 scripts/fuzz-campaign.py status camp -w"),
+            (13, "/usr/bin/python3 scripts/fuzz-campaign.py doctor camp"),
+        ]), [])
 
 
 if __name__ == "__main__":

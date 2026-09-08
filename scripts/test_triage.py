@@ -162,5 +162,67 @@ class StuckTest(unittest.TestCase):
         self.assertIn("DONE", triage.TERMINAL)
 
 
+
+
+class NoReproDiagnosis(unittest.TestCase):
+    """Tell "nothing ever reproduced" apart from "the candidate failed re-check".
+
+    Both end in STUCK, and reporting them identically is what let four
+    IOBluetoothFamily jobs spend 25,461 probes concluding "the bug needs
+    accumulated state" when the real answer was that syz-ring-repro ran without
+    the config's executor_name and never opened a single connection.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _state(self, memo):
+        p = self.tmp / "conn_state.json"
+        p.write_text(json.dumps({"kind": "connection", "n_units": 3,
+                                 "prog_hash": "abc", "memo": memo,
+                                 "exhausted": True}))
+        return str(p)
+
+    def test_zero_reproductions_is_an_environment_verdict(self):
+        # 3,651 probes, every one clean -- the t4 shape.
+        memo = {format(i, "x"): False for i in range(1, 8)}
+        self.assertTrue(triage.stage_no_repro(self._state(memo)))
+
+    def test_any_reproduction_is_a_bug_verdict(self):
+        memo = {"1": False, "2": True, "4": False}
+        self.assertFalse(triage.stage_no_repro(self._state(memo)))
+
+    def test_empty_and_missing_memo_are_not_claimed_as_no_repro(self):
+        # Nothing measured yet is not the same as "measured, found nothing"; the
+        # caller only consults this once the search reports itself exhausted.
+        self.assertTrue(triage.stage_no_repro(self._state({})))
+        self.assertFalse(triage.stage_no_repro(str(self.tmp / "absent.json")))
+
+
+class ExecutorNameFlag(unittest.TestCase):
+    """The process name has to survive into the syz-ring-repro argv."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _job(self, **flags):
+        return {"ringrepro": "/bin/rr", "executor": "/bin/ex", "flags": flags}
+
+    def test_name_becomes_a_ring_repro_flag(self):
+        cmd = triage.ringrepro_cmd(self._job(executor_name="bluetoothd"), "-minimize-conn")
+        self.assertIn("-executor_name", cmd)
+        self.assertEqual(cmd[cmd.index("-executor_name") + 1], "bluetoothd")
+
+    def test_absent_name_adds_no_flag(self):
+        cmd = triage.ringrepro_cmd(self._job(kext_id=32), "-minimize-conn")
+        self.assertNotIn("-executor_name", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
