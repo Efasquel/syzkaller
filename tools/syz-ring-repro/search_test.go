@@ -403,3 +403,41 @@ func TestExhaustedRoundTrips(t *testing.T) {
 		t.Error("Exhausted did not survive the checkpoint round trip")
 	}
 }
+
+// A hang is a different outcome from a crash and must be recorded separately.
+// Attempting recovered after a reboot means the subset PANICKED the box; Hanging
+// means it wedged a kernel thread without panicking. Conflating them would file a
+// hang as a crash and send triage hunting a panic report that does not exist.
+func TestHangingRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conn_state.json")
+	s := &ddState{Kind: "connection", NUnits: 4, ProgHash: "p",
+		Memo: map[string]bool{}, Hanging: "5", HangingAt: 1788000000}
+	if err := saveDdState(path, s); err != nil {
+		t.Fatal(err)
+	}
+	got := loadDdState(path, 4, "p", "")
+	if got.Hanging != "5" {
+		t.Errorf("Hanging = %q, want 5", got.Hanging)
+	}
+	if got.HangingAt == 0 {
+		t.Error("HangingAt did not survive the checkpoint")
+	}
+}
+
+// A recorded hang must not be recovered as a crash: it never panicked, so there
+// is no reboot to interpret and the memo must stay untouched.
+func TestHangingIsNotRecoveredAsACrash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conn_state.json")
+	s := &ddState{Kind: "connection", NUnits: 4, ProgHash: "p",
+		Memo: map[string]bool{}, Hanging: "5"}
+	if err := saveDdState(path, s); err != nil {
+		t.Fatal(err)
+	}
+	got := loadDdState(path, 4, "p", "")
+	if v, ok := got.Memo["5"]; ok {
+		t.Errorf("hung subset recorded in the memo as %v; it never panicked", v)
+	}
+	if _, _, ok := got.bestCulprit(); ok {
+		t.Error("a hung subset was offered as a crash culprit")
+	}
+}

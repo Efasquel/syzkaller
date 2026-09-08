@@ -205,6 +205,14 @@ type ddState struct {
 	// not hypothetical: a poisoned checkpoint burned six triage advances in a real
 	// campaign and would have consumed all forty.
 	Exhausted bool `json:"exhausted,omitempty"`
+	// Hanging is the mask whose program never returned, with the wall-clock epoch
+	// it started. Recorded separately from Attempting because it is a DIFFERENT
+	// outcome: Attempting recovered after a reboot means the subset panicked the
+	// box, while this one wedged a kernel thread without panicking. Conflating
+	// them would file a hang as a crash and send triage looking for a panic
+	// report that does not exist.
+	Hanging   string  `json:"hanging,omitempty"`
+	HangingAt float64 `json:"hanging_at,omitempty"`
 	// AttemptingAt / VerifyingAt are the wall-clock epochs the in-flight
 	// Attempting / Verifying subset started running, so a crash gate can scope its
 	// panic-report scan to reports produced by that subset's reboot. Zero when

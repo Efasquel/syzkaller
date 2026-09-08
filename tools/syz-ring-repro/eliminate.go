@@ -19,12 +19,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/csource"
@@ -183,6 +185,32 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		sub := red.extract(mask)
 		log.Logf(0, "Testing %s %v — %d calls ...", plural(popcount(mask), red.label), setBits(mask), len(sub.Calls))
 		if err := runProgramOnce(target, sub); err != nil {
+			// A hang is not an executor error and must not be counted as one.
+			// The program wedged a kernel thread, which on this target leaves the
+			// executor in uninterruptible sleep holding the coverage device: no
+			// further probe can run on this boot, so continuing would fabricate
+			// verdicts. Record the pending mask -- it is real evidence about THIS
+			// subset -- and stop, telling the caller what is required.
+			if errors.Is(err, errProgHang) {
+				state.Attempting = ""
+				state.AttemptingAt = 0
+				if state.Hanging == "" {
+					state.Hanging = key
+					state.HangingAt = gateNow()
+				}
+				if serr := saveDdState(statePath, state); serr != nil {
+					tool.Failf("checkpoint: %v", serr)
+				}
+				tool.Failf("subset %v HUNG: no result after %ds (a healthy program "+
+					"here takes ~2ms).\n"+
+					"The wedged executor is in uninterruptible sleep and holds the "+
+					"coverage device, so nothing further can run on this boot -- "+
+					"SIGKILL cannot reach it.\n"+
+					"Capture the stack before rebooting, it names the blocked call:\n"+
+					"  sudo fuzz-session.py diagnose-hang\n"+
+					"Then REBOOT; the checkpoint records this subset and the search "+
+					"resumes from it.", setBits(mask), *flagProgTimeout)
+			}
 			execErrStreak++
 			log.Logf(0, "  (executor error, box still up — NOT recorded, %d in a row: %v)",
 				execErrStreak, err)
@@ -321,6 +349,11 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 // than a program being flaky. Small: a healthy run has essentially none.
 const maxExecErrStreak = 10
 
+// errProgHang is returned when a program did not finish within flagProgTimeout.
+// It is a RESULT, not a failure: the program wedged a kernel thread and never
+// returned, which is exactly what a driver hang looks like from here.
+var errProgHang = errors.New("program did not return (hang)")
+
 func runProgramOnce(target *prog.Target, p *prog.Prog) error {
 	sandbox, err := flatrpc.SandboxToFlags(*flagSandbox)
 	if err != nil {
@@ -330,7 +363,14 @@ func runProgramOnce(target *prog.Target, p *prog.Prog) error {
 	if *flagDebug {
 		env |= flatrpc.ExecEnvDebug
 	}
-	rpcCtx, done := context.WithCancel(context.Background())
+	// A DEADLINE, not just a cancel. The context used to be cancelled only by the
+	// request's done callback, so a program that never completed left RunLocal
+	// blocked forever -- the minimizer would wedge indefinitely on any probe that
+	// hung, including during an ordinary crash minimization. A healthy program on
+	// this target runs in about 2ms, so the default is many hundreds of times the
+	// mean and only ever pays out on a genuine hang.
+	rpcCtx, done := context.WithTimeout(context.Background(),
+		time.Duration(*flagProgTimeout)*time.Second)
 	src := &singleProg{
 		prog: p,
 		done: done,
@@ -356,12 +396,18 @@ func runProgramOnce(target *prog.Target, p *prog.Prog) error {
 			KcovDevice: *flagKcovDevice,
 			KextID:     *flagKextID,
 		},
-		Executor:         *flagExecutor,
+		Executor:         resolveExecutor(),
 		HandleInterrupts: true,
 		MachineChecked:   src.machineChecked,
 		OutputWriter:     os.Stderr,
 	}
-	return rpcserver.RunLocal(rpcCtx, cfg)
+	err = rpcserver.RunLocal(rpcCtx, cfg)
+	// Distinguish "the deadline fired" from "the program finished and cancelled
+	// us". Both cancel the context, so the error alone cannot tell them apart.
+	if rpcCtx.Err() == context.DeadlineExceeded && !src.finished.Load() {
+		return errProgHang
+	}
+	return err
 }
 
 // singleProg is a queue.Source that yields exactly one program and then signals
@@ -370,8 +416,11 @@ type singleProg struct {
 	prog *prog.Prog
 	opts flatrpc.ExecOpts
 	done func()
-	mu   sync.Mutex
-	sent bool
+	// Set the moment the program's result comes back, so a deadline that fires
+	// during teardown is not misread as a hang.
+	finished atomic.Bool
+	mu       sync.Mutex
+	sent     bool
 }
 
 func (s *singleProg) machineChecked(features flatrpc.Feature, _ map[*prog.Syscall]bool) queue.Source {
@@ -388,6 +437,7 @@ func (s *singleProg) Next() *queue.Request {
 	s.sent = true
 	req := &queue.Request{Prog: s.prog}
 	req.OnDone(func(_ *queue.Request, _ *queue.Result) bool {
+		s.finished.Store(true)
 		s.done()
 		return true
 	})
