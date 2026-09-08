@@ -67,7 +67,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
 import timefmt  # noqa: E402
-from tablefmt import tabulate  # noqa: E402
+from tablefmt import render, tabulate  # noqa: E402
 
 # `syz-ring-repro -emit-json` translates a minimized culprit into the list of
 # IOConnectCallMethod syscall names to disable (JSON). Prefer the built binary;
@@ -124,6 +124,11 @@ DEFAULTS = {
     # it is decoupled from poll_seconds, which is expensive (an HTTP round trip
     # to the manager) and therefore rare.
     "stop_check_seconds": 5,
+    # One `syz-executor exec` process per program, so a healthy one lives
+    # milliseconds. Alive this long means a syscall that never returned -- a
+    # direct hang signal, rather than waiting hang_after_seconds to infer one
+    # from a stalled counter. Generous, so a legitimately slow program is safe.
+    "exec_stuck_seconds": 600,
     # A gap between the driver's last save and the next boot is reboot overhead.
     # Capped, because an unbounded gap is not overhead -- it is the rig sitting
     # idle while you were asleep, and charging that would make the wall clock a
@@ -398,6 +403,7 @@ def init_state(name):
         # the box to triage, benches the culprit, then resumes fuzzing.
         "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
         "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
+        "exhausted_sigs": [],
         # Start the watermark at the newest report that already exists, so the
         # campaign's first crash fingerprints one fresh panic instead of replaying
         # every historical report in the dir (they are ~2MB each).
@@ -477,6 +483,7 @@ def _newest_report_mtime():
 COORDINATOR_DEFAULTS = {
     "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
     "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
+        "exhausted_sigs": [],
     "panic_sig_watermark": 0.0,
     # Clocks added after the first campaigns ran; absent in their state files.
     "triage_seconds": 0.0, "overhead_seconds": 0.0,
@@ -643,11 +650,23 @@ def latest_panic_signature(s):
     return sig
 
 
-def config_kcov(cfg):
-    """The config's own coverage settings, as triage flag values.
+def config_triage_flags(cfg):
+    """The config's own device settings, as triage flag values.
 
-    Empty when the config has no kext_coverage block or cannot be read, so the
-    campaign-level triage defaults still apply."""
+    Minimization has to run in the SAME environment the crash was found in, or it
+    reduces a program that never reaches the driver. Two settings are per-config:
+
+      kext_coverage.{kext_id,kcov_device} -- each driver has its own Pishi id.
+      executor_name -- the process name the driver expects. Some IOKit drivers
+        gate their user client on p_comm: IOBluetoothHCIControllerUserClient
+        refuses every caller not named "bluetoothd" with kIOReturnUnsupported.
+        Without it every IOServiceOpen fails, every later call is inert, and the
+        search reports that nothing reproduces. That cost campaign drivers_260902
+        25,461 probes across four jobs before it was noticed.
+
+    Empty when the config has no such settings, so the campaign-level triage
+    defaults still apply.
+    """
     conf = read_json(cfg) if cfg else None
     kc = (conf or {}).get("kext_coverage") or {}
     out = {}
@@ -655,6 +674,9 @@ def config_kcov(cfg):
         out["kext_id"] = kc["kext_id"]
     if kc.get("kcov_device"):
         out["kcov_device"] = kc["kcov_device"]
+    name = ((conf or {}).get("executor_name") or "").strip()
+    if name:
+        out["executor_name"] = name
     return out
 
 
@@ -680,13 +702,24 @@ def begin_triage(s, d, sig):
     # id for all of them. Minimizing an IOSurface crash under AppleJPEGDriver's id
     # would configure coverage for the wrong kext. Take them from the config that
     # actually crashed and fall back to the campaign's block.
-    tri.update(config_kcov(s.get("current_config")))
+    # Fail closed. Triage inherits the crashing config's device settings; if that
+    # config cannot be read we would silently fall back to the campaign defaults
+    # and minimize in the wrong environment -- which produces a confident "nothing
+    # reproduces" from a search that never reached the driver. Refuse instead.
+    cfg_path = s.get("current_config")
+    if cfg_path and read_json(cfg_path) is None:
+        log("cannot triage %s: config %s is unreadable, so triage would run with "
+            "unknown device settings (kext_id / executor_name); resuming fuzzing"
+            % (sig, cfg_path))
+        return False
+    tri.update(config_triage_flags(cfg_path))
     # Pin the target signature so triage's crash gate is active from the first
     # subset (a second bug firing during minimization won't misdirect it).
     args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force"]
     for flag, key in (("--executor", "executor"), ("--ringrepro", "ringrepro"),
                       ("--kcov-device", "kcov_device"), ("--kext-id", "kext_id"),
-                      ("--sandbox", "sandbox"), ("--max-k", "max_k")):
+                      ("--sandbox", "sandbox"), ("--max-k", "max_k"),
+                      ("--executor-name", "executor_name")):
         if tri.get(key) is not None:
             args += [flag, str(tri[key])]
     rc, out = triage(*args, capture=True)
@@ -788,15 +821,33 @@ def advance_triage(s, d):
     # say plainly that it is unproven, and record it as unverified so the dossier
     # never presents a lead as a reproducer.
     verified = stage == "DONE"
-    if not verified:
+    # "Nothing reproduced, ever" is not a finding about the bug -- it means the
+    # search never reached the driver (see triage.py::stage_no_repro). Its culprit
+    # is the whole program by elimination, so benching from it would disable
+    # syscalls on the strength of a measurement that never happened. Record the
+    # signature instead so the same dead search is not run again: this bug was
+    # re-triaged three times in a row, 6,000 probes each, before that was noticed.
+    no_repro = (not verified) and st.get("stuck_kind") == "no-repro"
+    sig = s.get("triage_bug_sig")
+    if no_repro:
+        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
+        log("  NOT benching: a search that never reproduced anything is evidence "
+            "about the environment, not about the bug")
+        if sig and sig not in s.setdefault("exhausted_sigs", []):
+            s["exhausted_sigs"].append(sig)
+            log("  %s recorded as exhausted; it will not be re-triaged until the "
+                "environment changes (fuzz-campaign.py forget-exhausted %s)"
+                % (sig, s["name"]))
+    elif not verified:
         log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
         log("  benching its selectors anyway so fuzzing can continue, but the "
             "reproducer is UNVERIFIED -- it is a lead, not a proof")
 
     culprit = st.get("final_culprit") or st.get("conn_culprit")
-    sig = s.get("triage_bug_sig")
     cfg = s.get("current_config")
-    if culprit and Path(culprit).exists() and sig and cfg:
+    if no_repro:
+        pass
+    elif culprit and Path(culprit).exists() and sig and cfg:
         quarantine_apply_culprit(s, sig, cfg, culprit)
         # Write the reproducer back into the bug inventory. The quarantine knows
         # the culprit and triage holds the .syz, but the dossier -- the thing that
@@ -885,6 +936,11 @@ def handle_crash(s, d, info):
     if not sig:
         log("crash: no readable panic signature; resuming without a decision")
         return False
+    if sig in (s.get("exhausted_sigs") or []):
+        log("crash %s: already exhausted a full minimization that reproduced "
+            "nothing; not re-triaging (fuzz-campaign.py forget-exhausted %s to "
+            "retry after fixing the environment)" % (sig, s["name"]))
+        return False
     if quarantine_decide(s, sig) != "triage":
         return False
     return begin_triage(s, d, sig)
@@ -940,6 +996,55 @@ def reconcile_boot(s, d):
     if kind == "crash":
         handle_crash(s, d, info)   # may flip phase to triaging; the loop honours it
     save_state(s)
+
+
+def _etime_seconds(text):
+    """ps ELAPSED ([[dd-]hh:]mm:ss) -> seconds."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        d_, text = text.split("-", 1)
+        try:
+            days = int(d_)
+        except ValueError:
+            return None
+    parts = text.split(":")
+    try:
+        parts = [int(x) for x in parts]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def stuck_executor_seconds(d):
+    """Age of the longest-running `syz-executor exec`, if it exceeds the limit.
+
+    syz-executor forks one short-lived `exec` process per program, so a normal one
+    lives milliseconds. One alive for minutes means a syscall that never returned:
+    the box is wedged, whatever the manager's counters say.
+    """
+    limit = d.get("exec_stuck_seconds", DEFAULTS["exec_stuck_seconds"])
+    if not limit:
+        return None
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "etime,command"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    worst = 0
+    for line in (out or "").splitlines()[1:]:
+        line = line.strip()
+        if "syz-executor exec" not in line:
+            continue
+        secs = _etime_seconds(line.split(None, 1)[0])
+        if secs and secs > worst:
+            worst = secs
+    return worst if worst >= limit else None
 
 
 def wait_for_stop(s, d, seconds):
@@ -1012,8 +1117,27 @@ def supervise(s, d, sid, budget):
             last_et = et
             s["last_exec_total"] = et
             last_progress = now
-        elif et is not None and (now - last_progress) >= hang_after:
-            log("hang: exec_total stuck at %s for %ds" % (et, round(now - last_progress)))
+        elif (now - last_progress) >= hang_after:
+            # NOT gated on `et is not None`. It used to be, on both branches, so a
+            # manager that stopped reporting exec_total at all -- which is what a
+            # bad hang looks like -- could never be declared hung. The detector
+            # only caught a wedge mild enough for the manager to keep publishing a
+            # frozen number: the worse the hang, the more invisible it was. A box
+            # sat 38 minutes on one stuck program with nothing noticing.
+            log("hang: %s for %ds"
+                % ("exec_total stuck at %s" % et if et is not None
+                   else "exec_total UNREADABLE (manager not reporting)",
+                   round(now - last_progress)))
+            return "hang"
+        # A single program wedged in the kernel is a hang, and a far more direct
+        # signal than a stalled counter: syz-executor forks one `exec` process per
+        # program, so one alive for minutes is a syscall that never returned.
+        # Catches in exec_stuck_seconds what the counter takes hang_after to infer.
+        stuck = stuck_executor_seconds(d)
+        if stuck:
+            log("hang: syz-executor has been in one exec for %ds (limit %ds) -- "
+                "a program is wedged in the kernel"
+                % (round(stuck), d.get("exec_stuck_seconds", DEFAULTS["exec_stuck_seconds"])))
             return "hang"
         # SOFT-group rotation: advancing the disabled set needs a manager restart
         # (it re-reads disable_syscalls), so surface it as an outcome the loop
@@ -1232,6 +1356,17 @@ def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
     # falls back to its own defaults (no kcov device, no kext id), which is not
     # what the manual runs used -- so author them here, once, per campaign.
     tri = {k: v for k, v in (triage_opts or {}).items() if v is not None}
+    # Device settings belong to the CONFIG, so default them from it rather than
+    # making you retype what the config already says. Each driver has its own
+    # Pishi kext id (AppleJPEGDriver=1, AppleSSE=4 ... AppleFDEKeyStore=256), and
+    # a campaign told the wrong one triages a crash against the wrong kext. An
+    # explicit flag still wins, but not typing it is no longer a way to be wrong.
+    # Only the FIRST config seeds these: they are the campaign-level fallback, and
+    # begin_triage takes the real values per crash via config_triage_flags.
+    seeded = config_triage_flags(rel[0] if rel else None)
+    for k, v in seeded.items():
+        if k != "executor_name" and k not in tri:
+            tri[k] = v
     if tri:
         d["triage"] = tri
     # Breaker overrides sit at the top level and are merged over DEFAULTS by
@@ -1240,8 +1375,40 @@ def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
         if v is not None:
             d[k] = v
     write_json(path, d)
-    log("wrote %s (%d config(s), %.1fh each, loop=%s, triage=%s)"
-        % (path, len(rel), budget_hours, loop, tri or "defaults"))
+    log("wrote %s" % path)
+    # Show what each config brings, because the two ways to get a sweep wrong are
+    # invisible in the flags: configs sharing a workdir (then they share a corpus
+    # and the comparison measures nothing), and configs spanning kext ids (fine,
+    # but you should know you did it).
+    rows, kexts, workdirs = [], set(), []
+    for c in rel:
+        conf = read_json(c) or {}
+        kc = conf.get("kext_coverage") or {}
+        wd = (conf.get("workdir") or "").rstrip("/").rsplit("/", 1)[-1] or "-"
+        kexts.add(kc.get("kext_id"))
+        workdirs.append(wd)
+        rows.append([Path(c).name, str(kc.get("kext_id") or "-"),
+                     str(len(conf.get("enable_syscalls") or [])),
+                     conf.get("executor_name") or "-", wd])
+    for ln in render(rows, ["config", "kext", "syscalls", "exec name", "workdir"]):
+        print("  " + ln)
+    # budget_hours is PER CONFIG. "24" on a three-config sweep is 72 hours, and
+    # that is the kind of thing you find out the next morning.
+    total = budget_hours * len(rel)
+    print("  %d config(s), %.1fh EACH on the %s clock = %.1fh total%s"
+          % (len(rel), budget_hours, d.get("budget_clock", DEFAULTS["budget_clock"]),
+             total, " per lap, looping" if loop else ""))
+    if len(rel) > 1 and len(set(workdirs)) < len(workdirs):
+        print("  WARNING: configs share a workdir, so they share a corpus -- a "
+              "comparison between them measures nothing")
+    if len(kexts) > 1:
+        print("  note: configs span %d kext ids; the campaign-level kext_id (%s) is "
+              "only a fallback -- triage takes it from the config that crashed"
+              % (len(kexts), tri.get("kext_id")))
+    if any(r[3] == "-" for r in rows):
+        print("  note: a config sets no executor_name. If its driver gates the user "
+              "client on p_comm, every IOServiceOpen fails and both fuzzing and "
+              "minimization silently do nothing.")
     print("  pre-flight:  ./scripts/fuzz-campaign.py doctor %s" % name)
     print("  run it:      ./scripts/fuzz-campaign.py run %s" % name)
     print("  or install:  sudo ./scripts/fuzz-campaign.py install %s --agent --user fuzz" % name)
@@ -1400,6 +1567,10 @@ def status_lines(name, prev=None):
         row("triaging", "job %s, bug %s (advance %d/%d)"
             % (s.get("triage_job"), s.get("triage_bug_sig"),
                s.get("triage_boots", 0), d["triage_max_boots"]))
+    if s.get("exhausted_sigs"):
+        row("exhausted", "%d sig(s) reproduced NOTHING under minimization -- "
+            "environment, not bug (%s)"
+            % (len(s["exhausted_sigs"]), ", ".join(s["exhausted_sigs"][-3:])))
     if s.get("suppressed_sigs"):
         row("benched sigs", "%d (%s)"
             % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
@@ -1468,6 +1639,19 @@ def cmd_doctor(name):
     else:
         add("OK", "brake clear (set it with `touch %s`; from Recovery: `touch \"%s\"`)"
             % (GLOBAL_BRAKE, recovery_hint()))
+
+    # Campaigns share /dev/pishi, so a second one does not queue behind the first,
+    # it collides: the new session's executor dies with EBUSY and the run looks
+    # broken for no reason anyone would connect to "something else was running".
+    busy = box_busy()
+    if busy:
+        add("FAIL", "something is already using the box -- campaigns share "
+                    "/dev/pishi and a second one collides with EBUSY "
+                    "(stop it first: fuzz-campaign.py halt <name>)")
+        for what, pid, cmd in busy:
+            add("FAIL", "  pid %s  %s  %s" % (pid, what, cmd[:80]))
+    else:
+        add("OK", "nothing else holding /dev/pishi")
 
     # Coordinator's own binary. A daemon can't use the `go run` fallback (minimal
     # PATH), so the built binary is required there; foreground can go run.
@@ -1584,7 +1768,7 @@ def cmd_doctor(name):
     # use, and say plainly when a config cannot supply one.
     seen = []
     for it in d["items"]:
-        kc = config_kcov(it["config"])
+        kc = config_triage_flags(it["config"])
         seen.append((config_id(it["config"]), kc.get("kext_id"), kc.get("kcov_device")))
     if len({k for _, k, _ in seen if k is not None}) > 1:
         add("OK", "multi-driver campaign: kext_id taken per config (%s)"
@@ -1636,7 +1820,9 @@ def cmd_doctor(name):
     # their mtimes says nothing.
     execbin = REPO_ROOT / "bin/darwin_arm64/syz-executor"
     if not _is_dir(REPO_ROOT / ".git"):
-        add("INFO", "descriptions-drift check skipped (not a build tree)")
+        add("INFO", "descriptions-drift check skipped (not a build tree) -- run "
+                    "`./scripts/fuzz-campaign.py doctor %s` from the syzkaller repo "
+                    "to get this one" % name)
     elif execbin.exists():
         try:
             ebuilt = execbin.stat().st_mtime
@@ -2011,6 +2197,38 @@ def stop_campaign_session(name):
 
 
 # --- the reliable stop ------------------------------------------------------
+def box_busy():
+    """[(what, pid, cmd)] of processes actually driving the box.
+
+    running_processes() substring-matches the whole command line. That is right
+    for the stop paths, which filter again by binary path, and wrong here: a shell
+    whose argv merely mentions "syz-manager" reads as a live campaign. Match the
+    EXECUTED program instead (argv[0]'s basename) and skip our own process tree.
+    """
+    mine = {os.getpid(), os.getppid()}
+    out = []
+    for pid, cmd in running_processes(""):
+        if pid in mine:
+            continue
+        parts = cmd.split()
+        base = Path(parts[0]).name if parts else ""
+        if base == "syz-manager":
+            out.append(("syz-manager", pid, cmd))
+            continue
+        # A supervisor is an interpreter (or the shebang'd script) running THIS
+        # script's `run` subcommand. Requiring argv[0] to be one of those keeps a
+        # `zsh -c "... fuzz-campaign.py run ..."` -- whose real supervisor shows up
+        # as its own process anyway -- from being counted twice, and keeps `status`
+        # and `doctor` from being counted at all.
+        if not (base.lower().startswith("python") or base == "fuzz-campaign.py"):
+            continue
+        for i, tok in enumerate(parts[:-1]):
+            if tok.endswith("fuzz-campaign.py") and parts[i + 1] == "run":
+                out.append(("supervisor", pid, cmd))
+                break
+    return out
+
+
 def running_processes(pattern):
     """[(pid, command)] of live processes whose command contains `pattern`.
 
@@ -2047,11 +2265,27 @@ def campaign_processes(s):
     session's scratch directory, and otherwise left alone.
     """
     cfg = s.get("current_config") or ""
-    sid = s.get("session_id") or ""
     managers = [p for p in running_processes("syz-manager") if cfg and cfg in p[1]]
-    executors = [p for p in running_processes("syz-executor")
-                 if sid and sid in p[1]]
+    # Executors are matched on OUR executor binary, not on the session id: a
+    # session id never appears in an executor's argv (it is only the cwd), so
+    # matching on it found nothing and stop reported "all processes gone" while
+    # two executors were still running -- one of them unkillable and holding the
+    # coverage device. Only one campaign runs at a time (they share /dev/pishi),
+    # so every executor under our tree belongs to it.
+    exe = str(REPO_ROOT / "bin" / "darwin_arm64" / "syz-executor")
+    executors = [p for p in running_processes("syz-executor") if exe in p[1]]
     return managers, executors
+
+
+def proc_stat(pid):
+    """ps STAT for a pid, or "". 'U' is uninterruptible sleep -- unkillable."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(int(pid))],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=5).stdout.strip()
+        return out.split()[0] if out else ""
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
 
 
 def _signal(pid, sig, what):
@@ -2124,11 +2358,17 @@ def cmd_stop(name, grace=30, keep_agent=False):
         time.sleep(1)
     managers, executors = campaign_processes(s)
     for pid, cmd in managers + executors:
+        if proc_stat(pid).startswith("U"):
+            log("  pid %d is wedged in the kernel (STAT U); signalling is futile"
+                % pid)
+            continue
         log("  still alive after %ds: pid %d  %s" % (grace, pid, cmd[:70]))
         _signal(pid, signal.SIGINT, "process")
     if managers or executors:
         time.sleep(3)
         for pid, cmd in campaign_processes(s)[0] + campaign_processes(s)[1]:
+            if proc_stat(pid).startswith("U"):
+                continue        # unreachable by any signal; reported below
             log("  SIGKILL pid %d (did not exit on SIGINT)" % pid)
             _signal(pid, signal.SIGKILL, "process")
 
@@ -2137,11 +2377,21 @@ def cmd_stop(name, grace=30, keep_agent=False):
     #    one that reports failure.
     managers, executors = campaign_processes(s)
     if managers or executors:
+        wedged = [(pid, cmd) for pid, cmd in managers + executors
+                  if proc_stat(pid).startswith("U")]
         log("STOP INCOMPLETE: %d manager(s), %d executor(s) still running"
             % (len(managers), len(executors)))
         for pid, cmd in managers + executors:
-            log("  pid %d  %s" % (pid, cmd[:80]))
-        log("  they are probably owned by another user -- re-run with sudo")
+            log("  pid %d [%s]  %s" % (pid, proc_stat(pid) or "?", cmd[:70]))
+        if wedged:
+            log("  pid(s) %s are in uninterruptible sleep: wedged inside a kernel "
+                "call that never returns. SIGKILL cannot reach them and they hold "
+                "the coverage device until the machine REBOOTS."
+                % ", ".join(str(p) for p, _ in wedged))
+            log("  capture the stack first -- it names the blocked call:")
+            log("    sudo %s diagnose-hang" % SESSION)
+        else:
+            log("  they are probably owned by another user -- re-run with sudo")
         return 1
     log("campaign %r stopped: no manager, no executor, nothing holding the "
         "coverage device" % name)
@@ -2591,6 +2841,35 @@ def cmd_include(name, syscalls, config=None, all_=False, dry_run=False):
     return 0
 
 
+def cmd_forget_exhausted(name, sig=None):
+    """Clear signatures recorded as exhausted so they can be triaged again.
+
+    A signature lands there when a full minimization reproduced NOTHING, which
+    means the search could not reach the driver. Once the environment is fixed
+    (the usual cause is a missing executor_name), the bug is worth another pass --
+    but only then, which is why this is a deliberate command and not automatic.
+    """
+    s = load_state(name)
+    if not s:
+        die("no campaign '%s'" % name)
+    have = s.get("exhausted_sigs") or []
+    if not have:
+        print("campaign %s has no exhausted signatures" % name)
+        return 0
+    if sig:
+        if sig not in have:
+            die("%s is not recorded as exhausted for %s (have: %s)"
+                % (sig, name, ", ".join(have)))
+        have.remove(sig)
+        print("forgot %s; it will be triaged again on its next crash" % sig)
+    else:
+        print("forgot %d signature(s): %s" % (len(have), ", ".join(have)))
+        have = []
+    s["exhausted_sigs"] = have
+    save_state(s)
+    return 0
+
+
 def cmd_brake(name, global_=False, reason=None, clear=False, where=False):
     """Set or clear the brake. Setting one does not stop a running driver by
     itself -- it stops the NEXT one, which is the case a running driver cannot
@@ -2666,7 +2945,7 @@ def main():
                          % DEFAULTS["triage_max_boots"])
     sp.add_argument("--budget-clock", choices=BUDGET_CLOCKS,
                     help="what --budget-hours measures: 'fuzz' charges session "
-                         "uptime (NOT time executing programs -- expect ~55-60%% "
+                         "uptime (NOT time executing programs -- expect ~55-60%%%% "
                          "of it), 'wall' also charges minimization and reboots "
                          "(default %s)" % DEFAULTS["budget_clock"])
 
@@ -2682,6 +2961,12 @@ def main():
                     help="leave the launchd job loaded (it will relaunch the "
                          "supervisor, which then sees the halt and exits)")
     sp.set_defaults(func=None)
+
+    sp = sub.add_parser("forget-exhausted",
+                        help="allow re-triage of bugs whose minimization reproduced "
+                             "nothing (do this after fixing the environment)")
+    sp.add_argument("name")
+    sp.add_argument("--sig", help="one signature to forget (default: all)")
 
     sp = sub.add_parser("brake",
                         help="set/clear the file brake that stops a campaign even "
@@ -2772,6 +3057,8 @@ def main():
         cmd_halt(args.name)
     elif args.cmd == "resume":
         cmd_resume(args.name)
+    elif args.cmd == "forget-exhausted":
+        sys.exit(cmd_forget_exhausted(args.name, args.sig))
     elif args.cmd == "install":
         cmd_install(args.name, args.user, args.agent)
     elif args.cmd == "uninstall":

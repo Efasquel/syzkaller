@@ -241,6 +241,30 @@ def stage_exhausted(state_json):
     return bool(s and s.get("exhausted"))
 
 
+def stage_no_repro(state_json):
+    """True when NOT ONE probe in the whole search reproduced the crash.
+
+    This separates two outcomes that both end in STUCK and used to be reported
+    identically:
+
+      hits > 0, verification failed -- a real result about the bug: subsets DO
+        crash, but only on state an earlier probe left behind.
+      hits == 0 -- nothing was ever reproduced, which for a bug that demonstrably
+        panicked the box during fuzzing means the minimization environment cannot
+        reach the driver at all. The measured instance: syz-ring-repro ran without
+        the executor_name the config sets, IOBluetoothHCIControllerUserClient
+        refused every IOServiceOpen with kIOReturnUnsupported, and four jobs
+        burned 25,461 probes concluding "the bug needs accumulated state" when the
+        truth was "we never opened a connection".
+
+    Free to compute: the memo is already on disk, so this costs no device run.
+    """
+    s = read_json(state_json)
+    if not s:
+        return False
+    return not any((s.get("memo") or {}).values())
+
+
 def run_merge(st):
     """Offline: concatenate + statically reduce the ring buffer into merged.syz.
     No device, so this never reboots; it either succeeds or fails outright."""
@@ -327,11 +351,25 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
             st[out_key] = _stabilize(culprit, job_dir(st) / ("%s.syz" % out_key))
             st["stage"] = STUCK
             st["stuck_at"] = stage
-            st["stuck_reason"] = (
-                "no %s subset reproduces in isolation; the bug needs accumulated "
-                "state. The saved culprit is the smallest sequence seen to crash "
-                "DURING the search, so treat it as a lead, not a proof."
-                % ("connection" if "CONN" in stage else "call"))
+            unit = "connection" if "CONN" in stage else "call"
+            if stage_no_repro(state_json):
+                st["stuck_kind"] = "no-repro"
+                st["stuck_reason"] = (
+                    "NOT ONE probe reproduced the crash -- not a single %s subset, "
+                    "ever. For a bug that panicked the box during fuzzing that is "
+                    "evidence about the ENVIRONMENT, not about the bug: the "
+                    "minimization run cannot reach the driver. Check that this job "
+                    "carries the same executor_name, kext_id, kcov_device and "
+                    "sandbox the config fuzzed under -- a missing executor_name "
+                    "makes every IOServiceOpen return kIOReturnUnsupported and "
+                    "every later call inert. The saved culprit is meaningless "
+                    "here: it is the whole program, by elimination." % unit)
+            else:
+                st["stuck_kind"] = "unverified"
+                st["stuck_reason"] = (
+                    "no %s subset reproduces in isolation; the bug needs accumulated "
+                    "state. The saved culprit is the smallest sequence seen to crash "
+                    "DURING the search, so treat it as a lead, not a proof." % unit)
             save_job(st)
             log("%s: STUCK -- %s" % (stage, st["stuck_reason"]))
             log("%s: unverified culprit preserved at %s" % (stage, st[out_key]))
@@ -413,7 +451,7 @@ def _print_summary(st):
 # --- job authoring + inspection ----------------------------------------------
 def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
             sandbox, max_k, os_name, arch, from_off, to_off, force,
-            target_sig=None):
+            target_sig=None, executor_name=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if state_path(name).exists() and not force:
         die("triage job %s already exists (use --force to overwrite)" % name)
@@ -434,6 +472,10 @@ def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
         flags["kext_id"] = kext_id
     if sandbox:
         flags["sandbox"] = sandbox
+    # The process name the driver expects. Without it a name-gated user client
+    # refuses every open and the whole search is a no-op -- see stage_no_repro.
+    if executor_name:
+        flags["executor_name"] = executor_name
     if max_k is not None:
         flags["max_k"] = max_k
 
@@ -570,6 +612,10 @@ def main():
     n.add_argument("name")
     n.add_argument("--ring", required=True, help="ring buffer dir (crashing programs)")
     n.add_argument("--executor", default=str(REPO_ROOT / "bin/darwin_arm64/syz-executor"))
+    n.add_argument("--executor-name", default=None,
+                   help="process name to run the executor under, matching the manager "
+                        "config's executor_name (e.g. bluetoothd). Required whenever the "
+                        "driver gates its user client on p_comm")
     n.add_argument("--ringrepro", default=str(REPO_ROOT / "bin/darwin_arm64/syz-ring-repro"))
     n.add_argument("--kcov-device", default=None)
     n.add_argument("--kext-id", type=int, default=None)
@@ -598,7 +644,7 @@ def main():
         cmd_new(args.name, args.ring, args.executor, args.ringrepro,
                 args.kcov_device, args.kext_id, args.sandbox, args.max_k,
                 args.os_name, args.arch, args.from_off, args.to_off, args.force,
-                args.target_sig)
+                args.target_sig, executor_name=args.executor_name)
     elif args.cmd == "run":
         cmd_run(args.name)
     elif args.cmd == "status":
