@@ -15,18 +15,19 @@ crashing until you rebuild, which you don't do mid-campaign):
   - Every new crash starts SUSPECT: recorded but NOT suppressed; the campaign
     resumes with it enabled. It is acted on only when its signature recurs in the
     same config (occurrence_count >= CONFIRM). Nothing is benched on a one-off.
-  - On confirmation, classify from the minimized sequence by (distinct selectors
-    D, call count N):
-      HARD        (D==1, N==1): the selector alone crashes  -> permanent disable.
-      REPETITION  (D==1, N>1):  single-selector state buildup -> TOLERATE (stay
+  - On confirmation, classify from the minimized sequence by (distinct calls D,
+    call count N). "Call" here is whatever syz-ring-repro blames -- an external
+    method or an IOConnectTrap; both are named syscalls and suppress identically:
+      HARD        (D==1, N==1): the call alone crashes      -> permanent disable.
+      REPETITION  (D==1, N>1):  single-call state buildup -> TOLERATE (stay
                                 enabled), escalate to disable only if it recurs
                                 TOLERATE_BUDGET times (cost outweighs coverage).
-      SOFT        (D>1):        multi-selector sequence -> a rotation group; keep
+      SOFT        (D>1):        multi-call sequence -> a rotation group; keep
                                 exactly one member disabled (crash can't fire),
                                 rotate which one so each keeps most of its coverage.
-  - disabled_set = HARD (+escalated) selectors, seeded into a greedy minimal cover
-    of the SOFT groups (a group already covered by a HARD selector, or by a shared
-    selector another group disabled, contributes nothing).
+  - disabled_set = HARD (+escalated) calls, seeded into a greedy minimal cover of
+    the SOFT groups (a group already covered by a HARD call, or by a shared call
+    another group disabled, contributes nothing).
   - Tolerated crashes are still catalogued (dedup, escalation, and reporting).
   - A crash that fires while we believed it suppressed is an ESCAPE: a new trigger
     path for the same signature -> classify and fold it in (a sig may own several
@@ -342,10 +343,11 @@ def count_calls(text, name):
 def culprit_sequence(culprit, log=None):
     """A minimized culprit as the selector sequence classify() consumes.
 
-    -emit-json gives the distinct connect-call selectors (grammar-accurate). For a
-    single-selector culprit we expand to N entries by counting its calls in the
-    program text, so HARD (one call) and REPETITION (many calls) are told apart.
-    With D>1 the count is irrelevant -- it is SOFT either way.
+    -emit-json gives the distinct connect-call names -- methods and traps alike
+    (grammar-accurate). For a single-call culprit we expand to N entries by
+    counting its calls in the program text, so HARD (one call) and REPETITION
+    (many calls) are told apart. With D>1 the count is irrelevant -- SOFT either
+    way.
     """
     names = emit_syscalls(culprit, log=log)
     if len(names) != 1:
@@ -418,10 +420,11 @@ def known_selectors(cfg_path):
 def check_seq(seq, cfg_path):
     """Reject selector names the config never enables.
 
-    This exists for one specific footgun: selector names contain a '$', so
+    This exists for one specific footgun: call names contain a '$', so
     --seq "syz_IOConnectCallMethod$Foo_5" in double quotes lets the shell expand
     $Foo_5 to nothing and silently quarantines the bare generic name. Use single
-    quotes. Returns a list of unknown names.
+    quotes. Returns a list of unknown names. Trap names have the same shape
+    (syz_IOConnectTrap2$Foo_7) and the same footgun.
     """
     known = known_selectors(cfg_path)
     if known is None:
@@ -464,8 +467,9 @@ def cmd_crash(args):
     unknown = check_seq(seq, _config_path(args, s))
     if unknown:
         sys.exit("--seq names not in the config's enable_syscalls: %s\n"
-                 "selector names contain '$' -- quote them with SINGLE quotes, "
-                 "e.g. --seq 'syz_IOConnectCallMethod$Driver_5'" % ", ".join(unknown))
+                 "call names contain '$' -- quote them with SINGLE quotes, "
+                 "e.g. --seq 'syz_IOConnectCallMethod$Driver_5' or "
+                 "'syz_IOConnectTrap2$Driver_7'" % ", ".join(unknown))
     res = on_crash(s, args.sig, seq)
     save_state(args.state, s)
     print("%-9s %s [%s] disabled=%s" % (

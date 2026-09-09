@@ -508,8 +508,9 @@ def cmd_attribute(args):
         "signature": args.sig or prev.get("signature"),
         "at": cf.now_iso(),
     }
-    # The selector IS the method for an IOKit external method, and the symbol
-    # map usually cannot supply it. Backfill so the dossier stops saying "?".
+    # The blamed syscall IS the entry point -- a selector for an external method,
+    # a trap index for IOConnectTrap -- and the symbol map usually cannot supply
+    # it. Backfill so the dossier stops saying "?".
     if selectors and not rec.get("method"):
         rec["method"] = selectors[0]
     write_dossier(args.bugs, rec)
@@ -556,7 +557,8 @@ def main():
     pa.add_argument("--which", help="BUG-id or bug_key (alternative to --sig)")
     pa.add_argument("--culprit", help="path to the minimized .syz reproducer")
     pa.add_argument("--selector", action="append",
-                    help="syscall the reproducer blames (repeatable)")
+                    help="syscall the reproducer blames -- an external method or "
+                         "an IOConnectTrap (repeatable)")
     pa.add_argument("--job", help="triage job that produced it")
     pa.add_argument("--verified", action="store_true",
                     help="the reproducer crashed standalone on isolated re-check")
