@@ -2182,6 +2182,22 @@ def cmd_rm(target):
 COV_TOKEN_RE = re.compile(r"^(cov|nocov)(?:-([a-z0-9]+))?$")
 BACKEND_DEVICE = {"pishi": "/dev/pishi", "kextfuzz": "/dev/kextfuzz", "ksancov": ""}
 
+# A "connect call" is anything that drives an already-open user client: the
+# external-method paths and the trap path (IOConnectTrap0..6). They differ in how
+# they reach the kernel, but for config bookkeeping they are the same thing -- a
+# call dispatched on a connection by an integer in arg 1.
+CONNECT_CALL_PREFIXES = ("syz_IOConnectCallMethod", "syz_IOConnectCallAsyncMethod",
+                         "syz_IOConnectTrap")
+# A grammar call names its dispatch value in a trailing _<digits> (optionally with
+# a _v<digits> shape variant): syz_IOConnectCallMethod$Foo_5, ..._5_v0, and now
+# syz_IOConnectTrap2$Foo_7. A generic call has no such suffix.
+DISPATCH_SUFFIX_RE = re.compile(r"_\d+(?:_v\d+)?$")
+
+
+def is_connect_call(name):
+    """Whether an enable_syscalls entry dispatches on an open connection."""
+    return name.startswith(CONNECT_CALL_PREFIXES)
+
 
 def parse_config_name(basename):
     """Split a config basename per the convention.
@@ -2359,10 +2375,17 @@ def cmd_lint():
     warns += _section("naming convention", lint)
 
     # --- grammar token vs the syscalls it claims ---
-    # nogram == 1 syz_IOServiceOpen + 1 syz_IOConnectCallMethod per UserClient,
-    # plus a single generic syz_IOServiceClose (which accepts any connection).
-    # So #open must equal #call. A mismatch means the syscall list does not match
-    # the name (e.g. per-selector call variants pasted into a 'nogram' config).
+    # nogram == 1 syz_IOServiceOpen + 1 generic syz_IOConnectCallMethod per
+    # UserClient, plus a single generic syz_IOServiceClose (which accepts any
+    # connection). So #open must equal #call, and no connect call may carry a
+    # per-dispatch suffix. Either violation means the syscall list does not match
+    # the name (e.g. per-selector method variants, or per-index IOConnectTrap
+    # variants, pasted into a 'nogram' config).
+    #
+    # Traps are policed by the suffix rule only, not by the open==call count: one
+    # open legitimately fronts up to seven generic traps (IOConnectTrap0..6), so
+    # there is no 1:1 relationship to check. The suffix rule still applies --
+    # syz_IOConnectTrap2$Foo_7 is as much a grammar call as ...CallMethod$Foo_7.
     grammar_issues = []
     for b, d in sorted(cfgs.items()):
         toks = b.split("_", 1)[1].split("_") if "_" in b else []
@@ -2376,6 +2399,12 @@ def cmd_lint():
         if n_open != n_call:
             grammar_issues.append("%s: 'nogram' implies 1 call per UC, but open=%d call=%d"
                                   % (b, n_open, n_call))
+        variants = [x for x in s
+                    if is_connect_call(x) and DISPATCH_SUFFIX_RE.search(x)]
+        if variants:
+            grammar_issues.append(
+                "%s: 'nogram' implies generic calls, but %d name a specific "
+                "selector/trap index (e.g. %s)" % (b, len(variants), variants[0]))
     warns += _section("grammar token vs syscalls", grammar_issues)
 
     # --- syscalls target the kext the config is named for ---
