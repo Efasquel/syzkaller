@@ -68,6 +68,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cfgutil  # noqa: E402
 import timefmt  # noqa: E402
 from fsutil import hardlink_or_copy  # noqa: E402
 
@@ -319,40 +320,10 @@ def config_for_id(sid):
 
 
 def load_config(path):
-    """Parse a syzkaller JSON config, tolerating //, #, and /* */ comments."""
-    text = Path(path).read_text()
-    out, i, n = [], 0, len(text)
-    in_str = False
-    while i < n:
-        c = text[i]
-        if in_str:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-        elif c == '"':
-            in_str = True
-            out.append(c)
-            i += 1
-        elif c == "/" and i + 1 < n and text[i + 1] == "/":
-            while i < n and text[i] != "\n":
-                i += 1
-        elif c == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-        elif c == "/" and i + 1 < n and text[i + 1] == "*":
-            i += 2
-            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
-                i += 1
-            i += 2
-        else:
-            out.append(c)
-            i += 1
-    return json.loads("".join(out))
+    """Parse a syzkaller JSON config, tolerating the '#' comments syz-manager
+    tolerates. See cfgutil for why this matches the Go rule exactly rather than
+    accepting every comment style."""
+    return cfgutil.load(path)
 
 
 def latest_bench(workdir):
