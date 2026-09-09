@@ -66,8 +66,14 @@ FUZZ_GROUP="${FUZZ_GROUP:-staff}"
 # tree missing any one of them dies on the first crash instead of at sync time.
 # tablefmt.py, fsutil.py and timefmt.py are imported by the CLIs above; omitting
 # any of them makes every published script fail at import with ModuleNotFoundError.
+# The six drivers plus every module they import. A missing import is not a
+# degraded feature here -- the tool dies at startup with ModuleNotFoundError for
+# the fuzz user, and the campaign stops at its first quarantine or session call.
+# Keep in sync with the imports in the drivers above (cfgutil, tablefmt, fsutil,
+# timefmt are the shared helpers).
 SCRIPTS=(fuzz-campaign.py fuzz-session.py triage.py quarantine.py
-         crash_fingerprint.py bug_registry.py tablefmt.py fsutil.py timefmt.py)
+         crash_fingerprint.py bug_registry.py
+         cfgutil.py tablefmt.py fsutil.py timefmt.py)
 # syz-manager itself validates that <syzkaller>/bin/<arch>/ holds BOTH syz-execprog
 # and syz-executor (pkg/mgrconfig/load.go:346-370) and exits FATAL at startup if
 # either is missing -- so syz-execprog belongs here even though nothing in these
