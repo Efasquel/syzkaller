@@ -57,7 +57,7 @@ syz_IOServiceClose(r0)
 	}
 }
 
-// freeSelector reports true for a fuzzable selector; a const[N] selector (its
+// freeDispatchArg reports true for a fuzzable dispatch arg; a const[N] one (its
 // value fixed in the variant name) returns false and warrants no warning.
 func TestFreeSelectorConst(t *testing.T) {
 	tgt, err := prog.GetTarget("darwin", "amd64")
@@ -81,7 +81,7 @@ func TestFreeSelectorConst(t *testing.T) {
 	}
 	fixed := prog.MakeConstArg(constType, prog.DirIn, constType.Val)
 	call := &prog.Call{Args: []prog.Arg{nil, fixed}}
-	if freeSelector(call) {
-		t.Errorf("freeSelector(const selector) = true, want false")
+	if freeDispatchArg(call) {
+		t.Errorf("freeDispatchArg(const selector) = true, want false")
 	}
 }

@@ -26,8 +26,9 @@ import (
 	"github.com/google/syzkaller/prog"
 )
 
-// identifyMethodCalls returns the indices of the IOConnectCallMethod (and async)
-// calls in p, in program order — the only calls this stage removes.
+// identifyMethodCalls returns the indices of the connect calls in p -- external
+// methods, async methods and traps -- in program order. They are the only calls
+// this stage removes.
 func identifyMethodCalls(p *prog.Prog) []int {
 	var m []int
 	for i, c := range p.Calls {
@@ -40,8 +41,9 @@ func identifyMethodCalls(p *prog.Prog) []int {
 
 // extractMethodCalls returns a self-contained program keeping every non-method
 // call plus the method calls selected by mask (bit i = methods[i]). Removing a
-// method never breaks a resource link: IOConnectCallMethod consumes the
-// connection handle but produces no resource that other calls reference.
+// method never breaks a resource link: a connect call consumes the connection
+// handle but produces no resource that other calls reference. Traps included --
+// IOConnectTrap returns only a kern_return_t.
 func extractMethodCalls(p *prog.Prog, methods []int, mask uint64) *prog.Prog {
 	drop := make(map[int]bool, len(methods))
 	for i, idx := range methods {
@@ -65,11 +67,11 @@ func describeMethodCall(p *prog.Prog, idx int) string {
 }
 
 // callReduction builds the call-level reduction for p: units are the
-// IOConnectCallMethod calls, and every open and close is kept.
+// connect calls (methods and traps), and every open and close is kept.
 func callReduction(p *prog.Prog) (reduction, error) {
 	methods := identifyMethodCalls(p)
 	if len(methods) == 0 {
-		return reduction{}, fmt.Errorf("no IOConnectCallMethod calls to minimize")
+		return reduction{}, fmt.Errorf("no method or trap calls to minimize")
 	}
 	return reduction{
 		label:    kindCall,
@@ -79,8 +81,8 @@ func callReduction(p *prog.Prog) (reduction, error) {
 	}, nil
 }
 
-// runMinimizeCalls reduces the program to the smallest set of IOConnectCallMethod
-// calls that still crashes, keeping all opens and closes. Intended to run after
+// runMinimizeCalls reduces the program to the smallest set of connect calls
+// (methods and traps) that still crashes, keeping all opens and closes. Intended to run after
 // -minimize-conn, pointed at the connection-minimized culprit.
 func runMinimizeCalls(target *prog.Target, progFile string) error {
 	p, err := readProg(target, progFile)
