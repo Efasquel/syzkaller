@@ -126,13 +126,19 @@ func describeConnection(p *prog.Prog, c connection) string {
 	return strings.Join(parts, ", ")
 }
 
-// describeCall renders one call as "Kind #idx", appending the method selector
-// (the driver entry point being hit) for IOConnectCallMethod calls.
+// describeCall renders one call as "Kind #idx", appending the driver entry point
+// being hit: a method's selector (sel=) or a trap's index (idx=). The two are
+// distinct namespaces -- selector 3 and trap 3 are different code -- so they are
+// labelled differently rather than both being called a selector.
 func describeCall(call *prog.Call, idx int) string {
 	s := callKind(call.Meta.Name)
 	if isConnectCall(call.Meta.Name) && len(call.Args) > 1 {
 		if sel, ok := call.Args[1].(*prog.ConstArg); ok {
-			s += fmt.Sprintf("(sel=0x%x)", sel.Val)
+			label := "sel"
+			if isTrapCall(call.Meta.Name) {
+				label = "idx"
+			}
+			s += fmt.Sprintf("(%s=0x%x)", label, sel.Val)
 		}
 	}
 	return fmt.Sprintf("%s #%d", s, idx)
@@ -144,7 +150,9 @@ func callKind(name string) string {
 		return "Open"
 	case isCloseCall(name):
 		return "Close"
-	case isConnectCall(name):
+	case isTrapCall(name):
+		return "Trap"
+	case isMethodCall(name):
 		return "Method"
 	}
 	return name

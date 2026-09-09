@@ -40,11 +40,12 @@ type disableList struct {
 	Syscalls []string `json:"syscalls"`
 }
 
-// freeSelector reports whether an IOConnectCallMethod's selector (arg 1) is a
-// fuzzable value rather than a grammar-fixed const. Disabling such a call by name
-// removes all of its selectors, so the caller warns. A call we cannot read is
-// treated as free (warn rather than over-promise).
-func freeSelector(c *prog.Call) bool {
+// freeDispatchArg reports whether a connect call's dispatch argument (arg 1 --
+// a method's selector or a trap's index) is a fuzzable value rather than a
+// grammar-fixed const. Disabling such a call by name removes every selector or
+// index it can reach, so the caller warns. A call we cannot read is treated as
+// free (warn rather than over-promise).
+func freeDispatchArg(c *prog.Call) bool {
 	if len(c.Args) < 2 {
 		return true
 	}
@@ -56,8 +57,9 @@ func freeSelector(c *prog.Call) bool {
 	return !isConst
 }
 
-// emitSyscalls returns the culprit's distinct IOConnectCallMethod names (in first-
-// seen order) and one warning per generic call whose disable is wholesale.
+// emitSyscalls returns the culprit's distinct connect-call names -- external
+// methods and traps alike (in first-seen order) -- and one warning per generic
+// call whose disable is wholesale.
 func emitSyscalls(p *prog.Prog) (names, warnings []string) {
 	seen := make(map[string]bool)
 	for _, c := range p.Calls {
@@ -66,9 +68,13 @@ func emitSyscalls(p *prog.Prog) (names, warnings []string) {
 		}
 		seen[c.Meta.Name] = true
 		names = append(names, c.Meta.Name)
-		if freeSelector(c) {
-			warnings = append(warnings, fmt.Sprintf("%s has a fuzzable selector; disabling "+
-				"it drops ALL its selectors, not just the crashing one", c.Meta.Name))
+		if freeDispatchArg(c) {
+			what, plural := "selector", "selectors"
+			if isTrapCall(c.Meta.Name) {
+				what, plural = "trap index", "trap indices"
+			}
+			warnings = append(warnings, fmt.Sprintf("%s has a fuzzable %s; disabling "+
+				"it drops ALL its %s, not just the crashing one", c.Meta.Name, what, plural))
 		}
 	}
 	return names, warnings
@@ -95,7 +101,7 @@ func runEmitSyscalls(target *prog.Target, progFile string) error {
 	}
 	names, warnings := emitSyscalls(p)
 	if len(names) == 0 {
-		return fmt.Errorf("no IOConnectCallMethod calls in %s: nothing to disable "+
+		return fmt.Errorf("no method or trap calls in %s: nothing to disable "+
 			"(is this the minimized culprit?)", progFile)
 	}
 	for _, w := range warnings {

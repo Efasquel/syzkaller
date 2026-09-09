@@ -46,9 +46,34 @@ type staticRemoval struct {
 	reason string
 }
 
-func isConnectCall(name string) bool {
+// isMethodCall matches the external-method paths: the call reaches the driver
+// through IOUserClient::externalMethod and dispatches on a selector.
+func isMethodCall(name string) bool {
 	return strings.HasPrefix(name, "syz_IOConnectCallMethod") ||
 		strings.HasPrefix(name, "syz_IOConnectCallAsyncMethod")
+}
+
+// isTrapCall matches the trap path: the call reaches the driver through the
+// iokit_user_client_trap mach trap and dispatches on a trap index. The two
+// halves are distinguished only where arg 1 is reported, since a selector and a
+// trap index are different namespaces -- selector 3 is not trap 3.
+func isTrapCall(name string) bool {
+	return strings.HasPrefix(name, "syz_IOConnectTrap")
+}
+
+// isConnectCall is the union of the two, and it is a behavioural category rather
+// than a naming one: a call that drives an already-open user client, consuming
+// an io_connect_t as arg 0 and producing no resource. That is precisely what
+// makes it safe to drop without breaking a resource link, and groupable under
+// the open that produced its handle -- so every stage that reduces a program
+// tests this rather than either half, and a new call of this shape is covered by
+// changing one function.
+//
+// The category has a real edge: a syz_IOConnectMapMemory would NOT belong here.
+// It consumes a connection but produces a mapping later calls reference, so it
+// is not freely removable.
+func isConnectCall(name string) bool {
+	return isMethodCall(name) || isTrapCall(name)
 }
 
 // isOpenCall / isCloseCall match IOServiceOpen / IOServiceClose and their
