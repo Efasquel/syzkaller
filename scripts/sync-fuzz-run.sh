@@ -121,9 +121,14 @@ cfg_n=0
 for c in "$SRC"/config/*.cfg; do
   cfg_n=$((cfg_n + 1))
   base="$(basename "$c")"
-  /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" "${C_CYAN:+1}" <<'PY'
+  /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" "${C_CYAN:+1}" "$SRC/scripts" <<'PY'
 import json, os, sys
 src, dst, old, new = sys.argv[1:5]
+# Read configs exactly as syz-manager does: it strips whole-line '#' comments
+# (pkg/config/config.go), and the campaign configs use them to record what an
+# experiment excluded. cfgutil is the single source of that rule.
+sys.path.insert(0, sys.argv[6])
+import cfgutil
 # Colour is decided once, by the shell, from isatty + NO_COLOR. Deciding it again
 # here would emit escapes into a redirected log.
 _c = len(sys.argv) > 5 and sys.argv[5] == "1"
@@ -131,10 +136,12 @@ YEL = "\033[33m" if _c else ""
 CYN = "\033[36m" if _c else ""
 RST = "\033[0m" if _c else ""
 try:
-    cfg = json.load(open(src))
+    cfg = cfgutil.load(src)
 except ValueError as e:
-    # A hand-edited config that no longer parses can't be loaded by syz-manager
-    # either. Warn and skip it rather than aborting the whole publish.
+    # Genuinely malformed -- syz-manager could not load it either. Warn and skip
+    # rather than aborting the whole publish. Note this is NOT the case for a
+    # '#'-commented config: those parse fine, and used to be skipped here, which
+    # silently froze the published copy at whatever it was last time.
     sys.stderr.write("    %sSKIP%s %s: not valid JSON (%s)\n"
                      % (YEL, RST, os.path.basename(src), e))
     raise SystemExit(0)
@@ -145,7 +152,7 @@ for k, v in list(cfg.items()):
 # has no idea which selectors the campaign has benched since; clobbering it would
 # silently re-enable every crasher the loop already paid a reboot to find.
 try:
-    prev = json.load(open(dst)).get("disable_syscalls")
+    prev = cfgutil.load(dst).get("disable_syscalls")
 except (OSError, ValueError):
     prev = None
 if prev:
@@ -197,7 +204,11 @@ step "permissions"
 # would rewrite the OS's own file in /Library/Logs/DiagnosticReports, and fails
 # anyway because those files are root-owned. Prune those paths from the walk;
 # they are evidence, and nothing needs to write them.
-find "$DST" -path "$DST/campaigns/bugs/*/reports" -prune -o \
+# triage/*/exec is pruned for cost, not correctness: it holds one empty
+# syzkaller.XXXXXX per minimization probe and nothing ever reads it, but it was
+# 92% of this tree's 444k files -- three walks over it dominated every publish.
+# triage.py now clears it when a job finishes; this keeps an in-flight job cheap.
+find "$DST" \( -path "$DST/campaigns/bugs/*/reports" -o -path "$DST/triage/*/exec" \) -prune -o \
      -exec chgrp "$FUZZ_GROUP" {} + 2>/dev/null || true
 chmod -R g+rX "$DST"/scripts "$DST"/bin "$DST"/sys
 # 775, not 755: this is the launchd job's WorkingDirectory, so it is the cwd of
@@ -211,9 +222,10 @@ chmod g+rw "$DST"/config/*.cfg 2>/dev/null || true
 # The state the campaign has already written belongs to whoever wrote it; keep it
 # group-writable so a later sync (or the other account) can still touch it.
 find "$DST/campaigns" "$DST/sessions" "$DST/workdir" "$DST/triage" \
+     -path "$DST/triage/*/exec" -prune -o \
      -type d -exec chmod g+w {} + 2>/dev/null || true
 find "$DST/campaigns" "$DST/sessions" "$DST/triage" \
-     -path "$DST/campaigns/bugs/*/reports" -prune -o \
+     \( -path "$DST/campaigns/bugs/*/reports" -o -path "$DST/triage/*/exec" \) -prune -o \
      -type f -exec chmod g+rw {} + 2>/dev/null || true
 
 ok "tree root 775 (it is the launchd job's cwd), state dirs group-writable"
