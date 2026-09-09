@@ -98,3 +98,48 @@ static long __attribute__((unused)) syz_IOConnectCallAsyncMethod(volatile long a
 		return -1;
 	return 0;
 }
+
+// Traps hand six raw words straight to the handler with no marshalling, so
+// unlike IOConnectCallMethod there is deliberately no check_input() here.
+// All seven arities are defined so descriptions can name any of them.
+#define SYZ_IOCONNECT_TRAP(call)    \
+	kern_return_t kr = (call);  \
+	errno = kr;                 \
+	if (kr != kIOReturnSuccess) \
+		return -1;          \
+	return 0;
+
+static long __attribute__((unused)) syz_IOConnectTrap0(volatile long port, volatile long index)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap0((io_connect_t)port, (uint32)index))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap1(volatile long port, volatile long index, volatile long p1)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap1((io_connect_t)port, (uint32)index, (uintptr_t)p1))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap2(volatile long port, volatile long index, volatile long p1, volatile long p2)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap2((io_connect_t)port, (uint32)index, (uintptr_t)p1, (uintptr_t)p2))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap3(volatile long port, volatile long index, volatile long p1, volatile long p2, volatile long p3)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap3((io_connect_t)port, (uint32)index, (uintptr_t)p1, (uintptr_t)p2, (uintptr_t)p3))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap4(volatile long port, volatile long index, volatile long p1, volatile long p2, volatile long p3, volatile long p4)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap4((io_connect_t)port, (uint32)index, (uintptr_t)p1, (uintptr_t)p2, (uintptr_t)p3, (uintptr_t)p4))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap5(volatile long port, volatile long index, volatile long p1, volatile long p2, volatile long p3, volatile long p4, volatile long p5)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap5((io_connect_t)port, (uint32)index, (uintptr_t)p1, (uintptr_t)p2, (uintptr_t)p3, (uintptr_t)p4, (uintptr_t)p5))
+}
+
+static long __attribute__((unused)) syz_IOConnectTrap6(volatile long port, volatile long index, volatile long p1, volatile long p2, volatile long p3, volatile long p4, volatile long p5, volatile long p6)
+{
+	SYZ_IOCONNECT_TRAP(IOConnectTrap6((io_connect_t)port, (uint32)index, (uintptr_t)p1, (uintptr_t)p2, (uintptr_t)p3, (uintptr_t)p4, (uintptr_t)p5, (uintptr_t)p6))
+}
