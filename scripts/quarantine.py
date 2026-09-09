@@ -43,6 +43,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cfgutil  # noqa: E402
 import timefmt  # noqa: E402
 
 
@@ -375,8 +376,8 @@ def _config_path(args, state):
 
 
 def read_config(path):
-    with open(path) as f:
-        return json.load(f)
+    """Parse a manager config the way syz-manager does (see cfgutil)."""
+    return cfgutil.load(path)
 
 
 def write_disable_syscalls(cfg_path, want):

@@ -299,3 +299,50 @@ class EscapePaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommentedConfig(unittest.TestCase):
+    """syzkaller strips whole-line '#' comments from a manager config before
+    parsing (pkg/config/config.go, LoadData), and the campaign configs use them
+    to record which selectors an experiment excluded. Reading one with a plain
+    json.load() raises, and known_selectors() swallows that into None -- which
+    reads as "no explicit list", silently disabling --seq validation for exactly
+    the configs someone took the trouble to annotate."""
+
+    def _write(self, text):
+        fd, path = tempfile.mkstemp(suffix=".cfg")
+        os.write(fd, text.encode())
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_hash_comments_are_stripped(self):
+        p = self._write('{\n'
+                        '  "target": "darwin/arm64",\n'
+                        '  "enable_syscalls": [\n'
+                        '    "syz_IOConnectCallMethod$Foo_1",\n'
+                        '    # "syz_IOConnectCallMethod$Foo_2",\n'
+                        '    "syz_IOConnectTrap2$Foo_7"\n'
+                        '  ]\n'
+                        '}\n')
+        cfg = q.read_config(p)
+        self.assertEqual(cfg["enable_syscalls"],
+                         ["syz_IOConnectCallMethod$Foo_1", "syz_IOConnectTrap2$Foo_7"])
+
+    def test_commented_config_still_validates_seq(self):
+        # The regression: a commented-out entry must not make every name look
+        # plausible. The excluded selector is rejected, the live trap accepted.
+        p = self._write('{\n'
+                        '  "enable_syscalls": [\n'
+                        '    # "syz_IOConnectCallMethod$Foo_2",\n'
+                        '    "syz_IOConnectTrap2$Foo_7"\n'
+                        '  ]\n'
+                        '}\n')
+        self.assertIsNotNone(q.known_selectors(p))
+        self.assertEqual(q.check_seq(["syz_IOConnectTrap2$Foo_7"], p), [])
+        self.assertEqual(q.check_seq(["syz_IOConnectCallMethod$Foo_2"], p),
+                         ["syz_IOConnectCallMethod$Foo_2"])
+
+    def test_plain_json_is_unchanged(self):
+        p = self._write(json.dumps({"enable_syscalls": ["syz_IOServiceClose"]}))
+        self.assertEqual(q.read_config(p), {"enable_syscalls": ["syz_IOServiceClose"]})
