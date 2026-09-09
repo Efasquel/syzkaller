@@ -107,6 +107,12 @@ DEFAULTS = {
     #              PLUS minimization PLUS reboot overhead. "Give this config 24
     #              hours of machine time", which is what a comparison between
     #              configurations needs, and the default for that reason.
+    #   "real"  -- elapsed time since the config started, counting EVERYTHING:
+    #              halts, reboots, the machine being off. The only clock that
+    #              answers "start at 2pm, stop at 4pm", because it is the only
+    #              one that keeps running while the campaign is not. Survives the
+    #              panic-reboots: the start stamp is persisted, not re-taken on
+    #              relaunch, so a crash does not restart the window.
     #   "fuzz"  -- session uptime only, so a long triage does not eat the budget.
     #              Note this is uptime, NOT time spent executing programs: the
     #              manager also starts up, triages the corpus and waits on RPC,
@@ -136,7 +142,7 @@ DEFAULTS = {
     "max_boot_gap_seconds": 900.0,
 }
 
-BUDGET_CLOCKS = ("fuzz", "wall")
+BUDGET_CLOCKS = ("fuzz", "wall", "real")
 
 
 # --- small utilities ---------------------------------------------------------
@@ -267,9 +273,32 @@ def wall_seconds(s):
             + s.get("overhead_seconds", 0.0))
 
 
+def real_seconds(s):
+    """Elapsed time since the current config started, by the wall clock on the
+    wall -- not the campaign's occupancy of the rig.
+
+    Unlike wall_seconds this keeps running while the campaign does not: through a
+    halt, a panic-reboot, a crashloop pause, the box being powered off. That is
+    the point. It is the only clock that can express a window ("2pm to 4pm"),
+    because a window elapses whether or not anything is fuzzing.
+
+    Reads config_started_at, which is stamped once when a config starts and NOT
+    re-taken when the coordinator relaunches. That matters here more than
+    anywhere: this rig reboots on every panic, so a stamp refreshed on relaunch
+    would restart the window at each crash and the budget would never expire.
+    """
+    t0 = timefmt.to_epoch(s.get("config_started_at"))
+    if not t0:
+        return 0.0
+    return max(0.0, time.time() - t0)
+
+
 def budget_spent(s, d):
     """The clock --budget is measured against (see DEFAULTS["budget_clock"])."""
-    return wall_seconds(s) if d.get("budget_clock") == "wall" else s.get("active_seconds", 0.0)
+    clock = d.get("budget_clock")
+    if clock == "real":
+        return real_seconds(s)
+    return wall_seconds(s) if clock == "wall" else s.get("active_seconds", 0.0)
 
 
 def fmt_hms(sec):
@@ -293,6 +322,9 @@ def roll_budget_clocks(s):
         s[tot] = s.get(tot, 0.0) + s.get(cur, 0.0)
         s[cur] = 0.0
     s["run_active_base"] = 0.0
+    # The "real" clock's origin is per-config too: dropping it here makes the
+    # next config stamp a fresh one when it starts.
+    s["config_started_at"] = None
 
 
 def lifetime(s, key):
@@ -1272,6 +1304,12 @@ def cmd_run(name):
                 return
         item = d["items"][s["cursor"]]
         cfg, budget = item["config"], item["budget_seconds"]
+        # Stamp the real clock's origin once per config. Guarded on absence, not
+        # overwritten: every panic-reboot relaunches this loop, and re-stamping
+        # would restart the window on each crash.
+        if not s.get("config_started_at"):
+            s["config_started_at"] = now_iso()
+            save_state(s)
         remaining = budget - budget_spent(s, d)
         log("config %d/%d: %s (%.0f min left of %.1fh %s budget; "
             "fuzz %s, triage %s, reboots %s)"
@@ -2946,7 +2984,10 @@ def main():
     sp.add_argument("--budget-clock", choices=BUDGET_CLOCKS,
                     help="what --budget-hours measures: 'fuzz' charges session "
                          "uptime (NOT time executing programs -- expect ~55-60%%%% "
-                         "of it), 'wall' also charges minimization and reboots "
+                         "of it), 'wall' also charges minimization and reboots, "
+                         "'real' is elapsed time since the config started and "
+                         "keeps running through halts, reboots and downtime -- "
+                         "the one that means 'stop 2h from now' "
                          "(default %s)" % DEFAULTS["budget_clock"])
 
     sp = sub.add_parser("stop",

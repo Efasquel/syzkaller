@@ -1150,3 +1150,42 @@ class BoxBusyPrecision(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealClock(unittest.TestCase):
+    """The 'real' budget clock: elapsed time since the config started, counting
+    everything. Neither 'fuzz' nor 'wall' can express a window like 2pm-4pm --
+    wall_seconds is occupancy (active+triage+overhead) and explicitly excludes
+    time halted or idle, so a halted campaign's budget simply stops moving."""
+
+    def _state(self, started_at=None, **clocks):
+        s = {"config_started_at": started_at}
+        s.update(clocks)
+        return s
+
+    def test_real_measures_elapsed_not_occupancy(self):
+        # Started 90 minutes ago, but the campaign only ever ran 1 minute of
+        # anything -- the rest was halted, rebooting, or powered off.
+        from datetime import datetime, timezone
+        stamp = datetime.fromtimestamp(
+            time.time() - 5400, timezone.utc).astimezone().isoformat()
+        s = self._state(stamp, active_seconds=60.0)
+        d = {"budget_clock": "real"}
+        self.assertAlmostEqual(fc.budget_spent(s, d), 5400, delta=5)
+        # the other clocks see only the minute that was actually spent
+        self.assertEqual(fc.budget_spent(s, {"budget_clock": "fuzz"}), 60.0)
+        self.assertEqual(fc.budget_spent(s, {"budget_clock": "wall"}), 60.0)
+
+    def test_missing_stamp_is_zero_not_a_crash(self):
+        self.assertEqual(fc.budget_spent(self._state(None), {"budget_clock": "real"}), 0.0)
+        self.assertEqual(fc.budget_spent(self._state("garbage"), {"budget_clock": "real"}), 0.0)
+
+    def test_advancing_config_clears_the_origin(self):
+        # Each config gets its own window; roll_budget_clocks drops the stamp so
+        # the next config stamps a fresh one.
+        s = {"config_started_at": fc.now_iso(), "active_seconds": 10.0}
+        fc.roll_budget_clocks(s)
+        self.assertIsNone(s["config_started_at"])
+
+    def test_real_is_a_valid_clock_choice(self):
+        self.assertIn("real", fc.BUDGET_CLOCKS)
