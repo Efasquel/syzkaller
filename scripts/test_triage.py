@@ -226,3 +226,44 @@ class ExecutorNameFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecScratchPrune(unittest.TestCase):
+    """A minimization probe leaves an empty ./syzkaller.XXXXXX behind (created by
+    executor/common.h under the cwd exec_dir hands it). Nothing removed them, so
+    finished jobs accumulated one per probe -- 407k empty dirs across four jobs,
+    which came to 92% of the published tree and dominated every sync's chmod
+    walk. They are pruned when a job reaches a terminal stage."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.st = {"name": "j", "dir": str(self.tmp)}
+        self.exec_dir = triage.job_dir(self.st) / "exec"
+        self.exec_dir.mkdir(parents=True)
+
+    def test_empty_scratch_is_removed(self):
+        for i in range(5):
+            (self.exec_dir / ("syzkaller.%06d" % i)).mkdir()
+        self.assertEqual(triage.prune_exec_scratch(self.st), 5)
+        self.assertEqual(list(self.exec_dir.glob("syzkaller.*")), [])
+
+    def test_non_empty_scratch_is_kept(self):
+        # Conservative on purpose: a probe that left evidence keeps it.
+        keep = self.exec_dir / "syzkaller.KEEPME"
+        keep.mkdir()
+        (keep / "core").write_text("evidence")
+        (self.exec_dir / "syzkaller.000001").mkdir()
+        self.assertEqual(triage.prune_exec_scratch(self.st), 1)
+        self.assertTrue((keep / "core").exists())
+
+    def test_unrelated_entries_are_untouched(self):
+        (self.exec_dir / "notes.txt").write_text("x")
+        (self.exec_dir / "other-dir").mkdir()
+        triage.prune_exec_scratch(self.st)
+        self.assertTrue((self.exec_dir / "notes.txt").exists())
+        self.assertTrue((self.exec_dir / "other-dir").is_dir())
+
+    def test_missing_exec_dir_is_not_an_error(self):
+        shutil.rmtree(self.exec_dir)
+        self.assertEqual(triage.prune_exec_scratch(self.st), 0)

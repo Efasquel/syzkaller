@@ -386,6 +386,36 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     log("%s done -> %s (verified)" % (stage, st[out_key]))
 
 
+
+def prune_exec_scratch(st):
+    """Remove the executor scratch a finished job leaves behind. Returns a count.
+
+    Every minimization probe spawns an executor, and executor/common.h creates a
+    ./syzkaller.XXXXXX directory under its cwd -- which exec_dir() deliberately
+    points at the job dir, since the shared tree root is not writable by the
+    fuzzing user. Nothing ever removed them, so a job that ran 137k probes left
+    137k empty directories behind. They cost no space, but they dominate every
+    later tree walk: they were 92% of the published tree's 444k files, and
+    sync-fuzz-run.sh chmods that tree on every publish.
+
+    Only *empty* syzkaller.* directories are removed, so a probe that somehow
+    left a file behind keeps both the file and its directory. Best-effort by
+    design: the job has reached a terminal stage either way, and failing to tidy
+    is not a reason to report the triage as failed.
+    """
+    d = job_dir(st) / "exec"
+    if not d.is_dir():
+        return 0
+    n = 0
+    for p in d.glob("syzkaller.*"):
+        try:
+            p.rmdir()            # refuses on a non-empty dir, which is the point
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
 # --- the orchestrator --------------------------------------------------------
 def advance(st):
     """Do one boot's worth of work: reconcile panics, run the current stage."""
@@ -414,6 +444,9 @@ def cmd_run(name):
             % (name, st["stage"], st.get("final_culprit") or st.get("conn_culprit") or "?"))
         if st["stage"] == STUCK:
             log("  %s" % st.get("stuck_reason", ""))
+        pruned = prune_exec_scratch(st)
+        if pruned:
+            log("  pruned %d executor scratch dir(s)" % pruned)
         return
     log("triage %s: stage=%s dir=%s" % (name, st["stage"], st["dir"]))
     # Advance repeatedly within this boot: offline stages (MERGE) fall straight
@@ -424,6 +457,9 @@ def cmd_run(name):
         last = st["stage"]
         advance(st)
         st = load_job(name)          # advance persisted; reload the fresh state
+    pruned = prune_exec_scratch(st)
+    if pruned:
+        log("triage %s: pruned %d executor scratch dir(s)" % (name, pruned))
     if st["stage"] == STUCK:
         log("triage %s STUCK at %s -> %s"
             % (name, st.get("stuck_at"), st.get("conn_culprit") or st.get("final_culprit")))
