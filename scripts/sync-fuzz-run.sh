@@ -64,16 +64,16 @@ FUZZ_GROUP="${FUZZ_GROUP:-staff}"
 # The whole coordinator, not just the two drivers: fuzz-campaign shells out to
 # triage.py and bug_registry.py and imports crash_fingerprint + quarantine, so a
 # tree missing any one of them dies on the first crash instead of at sync time.
-# tablefmt.py, fsutil.py and timefmt.py are imported by the CLIs above; omitting
-# any of them makes every published script fail at import with ModuleNotFoundError.
-# The six drivers plus every module they import. A missing import is not a
-# degraded feature here -- the tool dies at startup with ModuleNotFoundError for
-# the fuzz user, and the campaign stops at its first quarantine or session call.
-# Keep in sync with the imports in the drivers above (cfgutil, tablefmt, fsutil,
-# timefmt are the shared helpers).
+# A missing driver is not a degraded feature -- the tool dies at startup with
+# ModuleNotFoundError for the fuzz user, and the campaign stops at its first
+# quarantine or session call.
 SCRIPTS=(fuzz-campaign.py fuzz-session.py triage.py quarantine.py
-         crash_fingerprint.py bug_registry.py
-         cfgutil.py tablefmt.py fsutil.py timefmt.py)
+         crash_fingerprint.py bug_registry.py)
+# The shared-library package the drivers import as `from lib import ...`. It is
+# copied as a package (with __init__.py) into $DST/scripts/lib/ so the published
+# drivers resolve it the same way the dev tree does; omitting any member makes
+# every published driver fail at import with ModuleNotFoundError.
+LIBS=(__init__.py cfgutil.py tablefmt.py fsutil.py timefmt.py)
 # syz-manager itself validates that <syzkaller>/bin/<arch>/ holds BOTH syz-execprog
 # and syz-executor (pkg/mgrconfig/load.go:346-370) and exits FATAL at startup if
 # either is missing -- so syz-execprog belongs here even though nothing in these
@@ -112,6 +112,13 @@ for f in "${SCRIPTS[@]}"; do
 done
 ok "${#SCRIPTS[@]} script(s): ${SCRIPTS[*]}"
 
+mkdir -p "$DST/scripts/lib"
+for f in "${LIBS[@]}"; do
+  [ -f "$SRC/scripts/lib/$f" ] || fail "missing $SRC/scripts/lib/$f"
+  cp_atomic "$SRC/scripts/lib/$f" "$DST/scripts/lib/$f"
+done
+ok "${#LIBS[@]} lib module(s): ${LIBS[*]}"
+
 step "binaries"
 for b in "${BINS[@]}"; do
   [ -f "$SRC/$b" ] || fail "missing $SRC/$b -- run \`make target\` / \`make manager\`"
@@ -134,7 +141,7 @@ src, dst, old, new = sys.argv[1:5]
 # (pkg/config/config.go), and the campaign configs use them to record what an
 # experiment excluded. cfgutil is the single source of that rule.
 sys.path.insert(0, sys.argv[6])
-import cfgutil
+from lib import cfgutil
 # Colour is decided once, by the shell, from isatty + NO_COLOR. Deciding it again
 # here would emit escapes into a redirected log.
 _c = len(sys.argv) > 5 and sys.argv[5] == "1"

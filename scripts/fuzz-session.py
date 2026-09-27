@@ -68,9 +68,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import cfgutil  # noqa: E402
-import timefmt  # noqa: E402
-from fsutil import hardlink_or_copy  # noqa: E402
+from lib import cfgutil  # noqa: E402
+from lib import timefmt  # noqa: E402
+from lib.fsutil import hardlink_or_copy  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent

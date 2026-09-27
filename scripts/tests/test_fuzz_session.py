@@ -15,7 +15,7 @@ from unittest import mock
 
 
 def _load():
-    path = Path(__file__).resolve().parent / "fuzz-session.py"
+    path = Path(__file__).resolve().parent.parent / "fuzz-session.py"
     spec = importlib.util.spec_from_file_location("fuzz_session", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

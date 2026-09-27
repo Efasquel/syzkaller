@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bug_registry as br  # noqa: E402
-import fsutil  # noqa: E402
+from lib import fsutil  # noqa: E402
 
 
 def analyzed(report, key="Drv:m:READ", sig="aaaa", fault="READ"):

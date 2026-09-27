@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 
-import cfgutil
+from lib import cfgutil
 
 
 class GoRuleParity(unittest.TestCase):

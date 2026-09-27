@@ -25,7 +25,7 @@ import re
 import sys
 from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import timefmt  # noqa: E402
+from lib import timefmt  # noqa: E402
 
 
 # For `match-since` (the syz-ring-repro crash gate): report globs + a grace

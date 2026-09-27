@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import timefmt as tf  # noqa: E402
+from lib import timefmt as tf  # noqa: E402
 
 
 class StoredFormTest(unittest.TestCase):

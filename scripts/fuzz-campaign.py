@@ -66,8 +66,8 @@ BUGS_DIR = CAMPAIGN_DIR / "bugs"
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
-import timefmt  # noqa: E402
-from tablefmt import render, tabulate  # noqa: E402
+from lib import timefmt  # noqa: E402
+from lib.tablefmt import render, tabulate  # noqa: E402
 
 # `syz-ring-repro -emit-json` translates a minimized culprit into the list of
 # IOConnectCallMethod syscall names to disable (JSON). Prefer the built binary;

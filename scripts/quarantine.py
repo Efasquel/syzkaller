@@ -44,8 +44,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cfgutil  # noqa: E402
-import timefmt  # noqa: E402
+from lib import cfgutil  # noqa: E402
+from lib import timefmt  # noqa: E402
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent

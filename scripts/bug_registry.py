@@ -38,9 +38,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import crash_fingerprint as cf  # noqa: E402
-from tablefmt import render as _render_table  # noqa: E402
-from fsutil import hardlink_or_copy  # noqa: E402
-import timefmt  # noqa: E402
+from lib.tablefmt import render as _render_table  # noqa: E402
+from lib.fsutil import hardlink_or_copy  # noqa: E402
+from lib import timefmt  # noqa: E402
 
 # Investigation gates, in order. A dossier advances through these; the registry
 # records the current one so a bug is never "where was I?" again.
