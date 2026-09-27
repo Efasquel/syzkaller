@@ -2,7 +2,8 @@
 
 Last updated: 09/09/2026
 
-This document aims at providing all commands useful to run a campaign.
+This document aims at providing all commands useful to run a campaign. For a map
+of every script and library in this directory, see [docs/OVERVIEW.md](docs/OVERVIEW.md).
 
 ## Create a campaign
 

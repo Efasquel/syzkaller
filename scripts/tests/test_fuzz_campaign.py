@@ -19,7 +19,7 @@ from unittest import mock
 
 
 def _load_campaign():
-    path = Path(__file__).resolve().parent / "fuzz-campaign.py"
+    path = Path(__file__).resolve().parent.parent / "fuzz-campaign.py"
     spec = importlib.util.spec_from_file_location("fuzz_campaign", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

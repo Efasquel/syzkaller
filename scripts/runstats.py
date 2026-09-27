@@ -46,8 +46,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import timefmt  # noqa: E402
-from tablefmt import tabulate  # noqa: E402
+from lib import timefmt  # noqa: E402
+from lib.tablefmt import tabulate  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
