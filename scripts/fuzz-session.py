@@ -81,6 +81,13 @@ KEXT_MAP_PATH = Path(os.environ.get("SYZ_KEXT_MAP", CONFIG_DIR / "kext_ids.json"
 MANAGER_BIN = Path(os.environ.get("SYZ_MANAGER_BIN", REPO_ROOT / "bin" / "syz-manager"))
 EXECUTOR_BIN = Path(os.environ.get(
     "SYZ_EXECUTOR_BIN", REPO_ROOT / "bin" / "darwin_arm64" / "syz-executor"))
+# binfreq lives in a sibling repo. Its --stream recorders run alongside the
+# campaign and append a crash-durable clock trace per DVFS cluster; recording is
+# optional instrumentation, so a missing binary warns and is skipped rather than
+# blocking the run. One recorder per clock domain (Apple silicon has two).
+BINFREQ_BIN = Path(os.environ.get(
+    "SYZ_BINFREQ_BIN", Path.home() / "Documents" / "fthM2" / "binfreq"))
+FREQ_CLUSTERS = ("p", "e")
 REGISTRY_DIR = REPO_ROOT / "sessions"
 # Executor scratch dirs: the executor does mkdtemp("./syzkaller.XXXXXX") relative
 # to its cwd for per-program sandboxing, so we run it from here to keep those
@@ -1120,6 +1127,73 @@ def live_executors(state):
             if pid_alive(e.get("pid"), e.get("boot_epoch"))]
 
 
+def live_recorders(state):
+    return [r for r in state.get("recorders", [])
+            if pid_alive(r.get("pid"), r.get("boot_epoch"))]
+
+
+def launch_recorder(state, cluster):
+    """Start one binfreq --stream recorder for a DVFS cluster (p|e), appending a
+    crash-durable clock trace to <workdir>/freq/<cluster>.csv. Each sample is
+    fsynced, so a kernel panic leaves the trace intact up to the last sample."""
+    freqdir = Path(state["workdir"]) / "freq"
+    freqdir.mkdir(parents=True, exist_ok=True)
+    out = freqdir / ("%s.csv" % cluster)
+    logf = str(Path(state["workdir"]) / "results" / ("recorder-%s.log" % cluster))
+    log_fh = open(logf, "w")
+    proc = subprocess.Popen(
+        [str(BINFREQ_BIN), "--stream", "-c", cluster, "--out", str(out)],
+        stdout=log_fh, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        warn("freq recorder (%s) exited immediately; see %s" % (cluster, logf))
+        return None
+    state.setdefault("recorders", []).append(
+        {"pid": proc.pid, "boot_epoch": boot_epoch(), "cluster": cluster,
+         "out": str(out), "log": logf})
+    print("  recorder %s: pid %s -> freq/%s.csv" % (cluster, proc.pid, cluster))
+    return proc.pid
+
+
+def start_recorders(state):
+    """Bring up one passive frequency recorder per cluster. A missing or
+    unstartable binfreq warns and is skipped -- recording never blocks fuzzing.
+    Recorders that survived a soft restart (same boot) are left as-is; they
+    append to the same file, and each (re)start writes its own session marker."""
+    if not BINFREQ_BIN.exists() or not os.access(BINFREQ_BIN, os.X_OK):
+        warn("binfreq not found at %s; frequency recording disabled "
+             "(build it or set SYZ_BINFREQ_BIN)" % BINFREQ_BIN)
+        return
+    existing = {r["cluster"] for r in live_recorders(state)}
+    for cluster in FREQ_CLUSTERS:
+        if cluster not in existing:
+            launch_recorder(state, cluster)
+    save_state(state)
+
+
+def stop_recorders(state):
+    """Stop all frequency recorders of a session. Their CSVs persist on disk
+    (every sample was fsynced), so a stop -- like a panic -- leaves the trace."""
+    recs = state.get("recorders", [])
+    stopped = 0
+    for r in recs:
+        pid = r.get("pid")
+        if not pid_alive(pid, r.get("boot_epoch")):
+            continue
+        try:
+            os.killpg(os.getpgid(int(pid)), signal.SIGINT)
+        except OSError:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        stopped += 1
+    if stopped:
+        print("  stopped %d freq recorder(s)" % stopped)
+    state["recorders"] = []
+
+
 # A scratch dir holds one `syzkaller.XXXXXX` subdir PER EXECUTED PROGRAM, so a
 # long run leaves millions of them. Deleting that inline made `stop` take minutes
 # -- during which the manager was still running and the state file still said
@@ -1608,13 +1682,17 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
         "status": "running", "pid": proc.pid, "boot_epoch": boot_epoch(),
         "bench": bench, "stdout": logf,
         "started_at": now_iso(), "stopped_at": None, "run_count": run_count,
-        "exec_count": exec_count, "executors": [],
+        "exec_count": exec_count, "executors": [], "recorders": [],
     }
     save_state(state)
     print("  pid    : %s" % proc.pid)
     if http:
         print("  http   : http://%s" % http)
     print("  log    : %s" % logf)
+
+    # Start the passive frequency recorders before the executors: they need no
+    # rpc port, so they can begin capturing the clock through manager warm-up.
+    start_recorders(state)
 
     if exec_count > 0:
         start_executors(state, exec_count)
@@ -1645,6 +1723,7 @@ def stop_one(sid):
     if not pid_alive(pid, boot):
         print("'%s' is not running" % sid)
         stop_executors(state)  # reap any orphaned executors + scratch dirs
+        stop_recorders(state)
         if state.get("status") == "running":
             state["status"] = "crashed"
         save_state(state)
@@ -1653,6 +1732,7 @@ def stop_one(sid):
         return
     # Stop executors first so they detach cleanly before the manager goes away.
     stop_executors(state)
+    stop_recorders(state)
     save_state(state)
     print("stopping '%s' (pid %s, graceful SIGINT, up to %ds)..." % (sid, pid, STOP_TIMEOUT))
     try:
@@ -1987,6 +2067,8 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     grab(results / "manager.log", "logs")
     for exe in sorted(results.glob("executor-*.log")):
         grab(exe, "logs")
+    for rec in sorted(results.glob("recorder-*.log")):
+        grab(rec, "logs")
     grab(latest_bench(workdir), "logs")
     grab(state_file(sid))                       # the registry record
     # Basic-block coverage: the crashing run's cover_log (fsync'd, survives the
@@ -2005,6 +2087,10 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     # Self-contained replay material (user opted in; may be large).
     grab(workdir / "corpus.db")
     grab(workdir / "ring_buffer")
+    # The crash-precursor pair: ring_buffer holds the program that was executing
+    # at the panic, freq/ holds the fsync'd clock trace whose tail (aligned by
+    # ref_ticks) shows what the frequency was doing going into it.
+    grab(workdir / "freq")
     # The grammar tree is already deduplicated by fingerprint (save_grammar keeps
     # one directory per distinct description set), so linking it costs nothing
     # and keeps the bundle self-contained.
