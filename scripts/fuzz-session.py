@@ -1545,7 +1545,8 @@ def save_grammar(workdir, conf, stamp, dedupe=True):
 
 
 # ---- commands --------------------------------------------------------------
-def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
+def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False,
+              record_freq=None):
     if not MANAGER_BIN.exists() or not os.access(MANAGER_BIN, os.X_OK):
         die("syz-manager not built at %s (run: make manager)" % MANAGER_BIN)
     # The coverage device is exclusive, and a wedged executor holds it forever.
@@ -1683,6 +1684,10 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
         "bench": bench, "stdout": logf,
         "started_at": now_iso(), "stopped_at": None, "run_count": run_count,
         "exec_count": exec_count, "executors": [], "recorders": [],
+        # Frequency recording is opt-in. None on this call inherits the previous
+        # run's choice, so resume/restart keep recording (or not) without re-flagging.
+        "record_freq": bool(record_freq) if record_freq is not None
+                       else bool(prev.get("record_freq")) if prev else False,
     }
     save_state(state)
     print("  pid    : %s" % proc.pid)
@@ -1692,7 +1697,9 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
 
     # Start the passive frequency recorders before the executors: they need no
     # rpc port, so they can begin capturing the clock through manager warm-up.
-    start_recorders(state)
+    # Opt-in via --freq (persisted, so resume/restart inherit the choice).
+    if state.get("record_freq"):
+        start_recorders(state)
 
     if exec_count > 0:
         start_executors(state, exec_count)
@@ -1786,7 +1793,8 @@ def cmd_stop(target):
     stop_one(resolve_id(target))
 
 
-def cmd_resume(target, executors=None, allow_concurrent=False, force=False):
+def cmd_resume(target, executors=None, allow_concurrent=False, force=False,
+               record_freq=None):
     sid = resolve_id(target)
     state = refresh_status(sid)
     if state and state.get("status") == "running":
@@ -1806,16 +1814,17 @@ def cmd_resume(target, executors=None, allow_concurrent=False, force=False):
     if executors is None:
         executors = state.get("exec_count", DEFAULT_EXECUTORS) if state else DEFAULT_EXECUTORS
     cmd_start(str(cfg), executors=executors, allow_concurrent=allow_concurrent,
-              force=force)
+              force=force, record_freq=record_freq)
 
 
-def cmd_restart(target, executors=None, allow_concurrent=False, force=False):
+def cmd_restart(target, executors=None, allow_concurrent=False, force=False,
+                record_freq=None):
     sid = resolve_id(target)
     state = load_state(sid)
     if state and state_pid_alive(state):
         stop_one(sid)
     cmd_resume(sid, executors=executors, allow_concurrent=allow_concurrent,
-               force=force)
+               force=force, record_freq=record_freq)
 
 
 def cmd_exec_start(target, count):
@@ -2995,6 +3004,11 @@ def main():
     sp.add_argument("--force", action="store_true",
                     help="start even if the previous run was never collected "
                          "(its ring buffer will be overwritten)")
+    sp.add_argument("--freq", dest="record_freq", action="store_const", const=True,
+                    default=None,
+                    help="record per-cluster CPU frequency (binfreq) alongside the run")
+    sp.add_argument("--no-freq", dest="record_freq", action="store_const", const=False,
+                    help="do not record frequency (default)")
     sp = sub.add_parser("stop", help="graceful stop (id|config|all)")
     sp.add_argument("target")
     sp = sub.add_parser("resume", help="relaunch from the recorded config")
@@ -3004,12 +3018,20 @@ def main():
     sp.add_argument("--allow-concurrent", action="store_true")
     sp.add_argument("--force", action="store_true",
                     help="start even if the previous run was never collected")
+    sp.add_argument("--freq", dest="record_freq", action="store_const", const=True,
+                    default=None, help="record frequency (default: same as last run)")
+    sp.add_argument("--no-freq", dest="record_freq", action="store_const", const=False,
+                    help="do not record frequency")
     sp = sub.add_parser("restart", help="stop then resume")
     sp.add_argument("target")
     sp.add_argument("-e", "--executors", type=int, default=None, metavar="N")
     sp.add_argument("--allow-concurrent", action="store_true")
     sp.add_argument("--force", action="store_true",
                     help="start even if the previous run was never collected")
+    sp.add_argument("--freq", dest="record_freq", action="store_const", const=True,
+                    default=None, help="record frequency (default: same as last run)")
+    sp.add_argument("--no-freq", dest="record_freq", action="store_const", const=False,
+                    help="do not record frequency")
     sp = sub.add_parser("exec-start", help="add executor(s) to a running session")
     sp.add_argument("target")
     sp.add_argument("-n", type=int, default=1, metavar="N", help="how many to add (default 1)")
@@ -3102,15 +3124,18 @@ def main():
             sys.exit(1)
     elif args.cmd == "start":
         cmd_start(args.config, executors=args.executors,
-                  allow_concurrent=args.allow_concurrent, force=args.force)
+                  allow_concurrent=args.allow_concurrent, force=args.force,
+                  record_freq=args.record_freq)
     elif args.cmd == "stop":
         cmd_stop(args.target)
     elif args.cmd == "resume":
         cmd_resume(args.target, executors=args.executors,
-                   allow_concurrent=args.allow_concurrent, force=args.force)
+                   allow_concurrent=args.allow_concurrent, force=args.force,
+                   record_freq=args.record_freq)
     elif args.cmd == "restart":
         cmd_restart(args.target, executors=args.executors,
-                    allow_concurrent=args.allow_concurrent, force=args.force)
+                    allow_concurrent=args.allow_concurrent, force=args.force,
+                    record_freq=args.record_freq)
     elif args.cmd == "exec-start":
         cmd_exec_start(args.target, args.n)
     elif args.cmd == "exec-stop":
