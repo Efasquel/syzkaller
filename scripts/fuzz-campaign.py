@@ -93,6 +93,7 @@ DEFAULTS = {
     "max_crashes": 20,          # total incidents before the breaker halts
     "min_free_gb": 20.0,        # halt if root disk drops below this
     "keep_cores": 3,            # cores retained after pruning
+    "record_freq": False,       # run binfreq frequency recorders alongside the campaign
     # The crash-loop breaker exists to catch a PATHOLOGICAL loop -- a config that
     # cannot fuzz at all (manager dies on startup, corpus poisoned so the very
     # first program re-panics) -- not productive fuzzing. On this target a healthy
@@ -140,6 +141,13 @@ DEFAULTS = {
     # idle while you were asleep, and charging that would make the wall clock a
     # measure of your schedule rather than the campaign's.
     "max_boot_gap_seconds": 900.0,
+    # Quarantine scheduler knobs (see quarantine.DEFAULT_PARAMS for what each
+    # does). Surfaced here so a campaign definition can tune suppression per run
+    # -- e.g. confirm=1 to bench on the first occurrence for a short run. A def
+    # may set the whole dict or just the keys it wants to change; load_def fills
+    # the rest from DEFAULT_PARAMS. These reach the per-config quarantine ledger
+    # via load_qstate on first touch.
+    "quarantine_params": dict(qm.DEFAULT_PARAMS),
 }
 
 BUDGET_CLOCKS = ("fuzz", "wall", "real")
@@ -401,6 +409,14 @@ def load_def(name):
         die("no campaign %r (looked in %s)" % (name, def_path(name)))
     merged = dict(DEFAULTS)
     merged.update(d)
+    # quarantine_params is the one nested knob dict: a def may set only the keys
+    # it wants changed, so overlay them on the full DEFAULT_PARAMS rather than
+    # letting merged.update() replace the whole dict with a partial one (which
+    # would drop the unspecified knobs and make _p fall back per-key anyway, but
+    # leave the ledger's params incomplete).
+    qp = dict(qm.DEFAULT_PARAMS)
+    qp.update(d.get("quarantine_params") or {})
+    merged["quarantine_params"] = qp
     # Normalise configs to [{config, budget_seconds}] with per-item override.
     items = []
     for c in merged["configs"]:
@@ -904,17 +920,23 @@ def advance_triage(s, d):
 
 
 # --- the loop ----------------------------------------------------------------
-def ensure_running(s, cfg):
+def ensure_running(s, cfg, record_freq=False):
     """Make sure a live session exists for cfg; resume if a record exists.
 
     Returns the inspect dict for the (now running) session. Resets the
     per-run exec-total baseline so the hang detector starts clean.
+
+    record_freq (from the campaign def) is passed explicitly to every session
+    start/resume so the campaign stays authoritative: the frequency recorders
+    come back on every reboot, not just when a prior session state happened to
+    remember them.
     """
+    freq_flag = "--freq" if record_freq else "--no-freq"
     # The running config must reflect the current quarantine state (a fresh
     # escalation or a rotation changed disable_syscalls). Apply before start/resume
     # so syz-manager reads it and FilterCandidates prunes the corpus accordingly.
     try:
-        apply_disabled(cfg, load_qstate(cfg))
+        apply_disabled(cfg, load_qstate(cfg, s.get("quarantine_params")))
     except RuntimeError as e:
         log("quarantine apply skipped for %s: %s" % (config_id(cfg), e))
     # New run: exec_total resets to 0, so reset the coverage-stall rotation clock.
@@ -931,11 +953,11 @@ def ensure_running(s, cfg):
     else:
         verb = "resume" if info.get("found") else "start"
         target = sid if verb == "resume" else cfg
-        rc, _ = session(verb, target, "--force")
+        rc, _ = session(verb, target, "--force", freq_flag)
         if rc != 0:
             # fall back to a fresh start if resume failed (e.g. no record)
             if verb == "resume":
-                rc, _ = session("start", cfg, "--force")
+                rc, _ = session("start", cfg, "--force", freq_flag)
             if rc != 0:
                 raise RuntimeError("could not start session for %s" % cfg)
         info = inspect(sid)
@@ -1223,6 +1245,11 @@ def cmd_run(name):
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
         s.setdefault(k, v)
+    # The def is the source of truth for the quarantine knobs. Re-seed the state's
+    # copy from it every boot so an edited definition (after a re-sync) takes
+    # effect, and so the coordinator functions -- which are threaded `s`, not `d`
+    # -- can hand these to load_qstate.
+    s["quarantine_params"] = d["quarantine_params"]
     if s["status"] in ("done", "halted"):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
@@ -1318,7 +1345,7 @@ def cmd_run(name):
                fmt_hms(s.get("active_seconds")), fmt_hms(s.get("triage_seconds")),
                fmt_hms(s.get("overhead_seconds"))))
         try:
-            ensure_running(s, cfg)
+            ensure_running(s, cfg, d.get("record_freq"))
         except RuntimeError as e:
             s["status"] = "halted"
             s["halt_reason"] = str(e)
@@ -2586,10 +2613,29 @@ def qstate_path(cfg):
     return STATE_DIR / ("quarantine_%s.json" % config_id(cfg))
 
 
-def load_qstate(cfg):
+def load_qstate(cfg, params=None):
+    """Load the per-config quarantine ledger, optionally seeding its scheduler
+    knobs from the campaign definition.
+
+    quarantine.load_state backfills params from DEFAULT_PARAMS; when `params` is
+    given (the def's quarantine_params, threaded through the campaign state), it
+    is the source of truth for the knobs and is written over the ledger's params,
+    saving only when something actually changed. Callers with no def context
+    (read-only inspection) pass nothing and get the ledger untouched -- so a
+    status command never reverts a def-tuned ledger back to defaults.
+    """
     qs = qm.load_state(str(qstate_path(cfg)))
     if not qs.get("config"):
         qs["config"] = str(cfg)
+    if params:
+        changed = False
+        for k, v in params.items():
+            if qs["params"].get(k) != v:
+                qs["params"][k] = v
+                changed = True
+        if changed:
+            save_qstate(cfg, qs)
+            log("quarantine: params for %s <- %s" % (config_id(cfg), qs["params"]))
     return qs
 
 
@@ -2640,7 +2686,7 @@ def quarantine_decide(s, sig):
     cfg = s.get("current_config")
     if not cfg:
         return "resume"
-    qs = load_qstate(cfg)
+    qs = load_qstate(cfg, s.get("quarantine_params"))
     rec = qs["catalog"].get(sig)
     if rec is None:
         qm.on_crash(qs, sig, None)             # SUSPECT, occ 1, seq deferred
@@ -2671,7 +2717,7 @@ def quarantine_decide(s, sig):
 
 def quarantine_apply_culprit(s, sig, cfg, culprit):
     """At triage DONE: classify the culprit and write the config's disabled set."""
-    qs = load_qstate(cfg)
+    qs = load_qstate(cfg, s.get("quarantine_params"))
     try:
         seq = culprit_sequence(culprit)
     except RuntimeError as e:
@@ -2800,7 +2846,7 @@ def quarantine_rotate_due(s):
     cfg = s.get("current_config")
     if not cfg:
         return False
-    qs = load_qstate(cfg)
+    qs = load_qstate(cfg, s.get("quarantine_params"))
     if not qs["soft_groups"]:
         return False
     info = inspect(s.get("session_id")) if s.get("session_id") else {}
@@ -2961,6 +3007,9 @@ def main():
     sp.add_argument("--max-crashes", type=int, default=DEFAULTS["max_crashes"])
     sp.add_argument("--min-free-gb", type=float, default=DEFAULTS["min_free_gb"])
     sp.add_argument("--keep-cores", type=int, default=DEFAULTS["keep_cores"])
+    sp.add_argument("--freq", action="store_true",
+                    help="record per-cluster CPU frequency (binfreq) during the "
+                         "campaign; recorders restart with the session across reboots")
     sp.add_argument("--force", action="store_true")
     # Baked into the def's "triage" block and replayed to `triage.py new` on every
     # bug the coordinator decides to minimize. Mirror what the manual runs used.
@@ -3079,7 +3128,8 @@ def main():
                 {"crashloop_limit": args.crashloop_limit,
                  "crashloop_window_seconds": args.crashloop_window_seconds,
                  "triage_max_boots": args.triage_max_boots,
-                 "budget_clock": args.budget_clock})
+                 "budget_clock": args.budget_clock,
+                 "record_freq": args.freq or None})
     elif args.cmd == "stop":
         sys.exit(cmd_stop(args.name, args.grace, args.keep_agent))
     elif args.cmd == "brake":
