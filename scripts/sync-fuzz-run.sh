@@ -158,8 +158,18 @@ except ValueError as e:
     sys.stderr.write("    %sSKIP%s %s: not valid JSON (%s)\n"
                      % (YEL, RST, os.path.basename(src), e))
     raise SystemExit(0)
+# old/new carry a trailing slash so path *prefixes* swap cleanly. But a value
+# that is the checkout root itself (e.g. "syzkaller") equals old without the
+# slash, so match that exact case too -- otherwise syz-manager is pointed back
+# into the 0700 build tree the fuzz user cannot traverse.
+old_root = old.rstrip("/")
+new_root = new.rstrip("/")
 for k, v in list(cfg.items()):
-    if isinstance(v, str) and v.startswith(old):
+    if not isinstance(v, str):
+        continue
+    if v == old_root:
+        cfg[k] = new_root
+    elif v.startswith(old):
         cfg[k] = new + v[len(old):]
 # Carry the live quarantine set across a re-sync. The authored config in the repo
 # has no idea which selectors the campaign has benched since; clobbering it would

@@ -1,0 +1,42 @@
+# diskext: 6dbe842
+# kext: AppleT8112CLPC
+# uuid: 9AE61611037337228C1FCD74A996A108
+# kext-version: 1454.120.4.0.0
+# grammar-level: l3
+# emitted: 2026-09-30T08:39:28Z
+
+resource io_connect_t_AppleCLPCUserClient[io_connect_t]
+
+syz_IOServiceOpen$AppleCLPC_AppleCLPCUserClient(service ptr[in, string["AppleCLPC"]], type int32, connection ptr[out, io_connect_t_AppleCLPCUserClient])
+
+syz_IOConnectCallMethod$AppleCLPCUserClient_2_input {
+	scalar_0	int64
+	scalar_1	const[5, int64]
+	scalar_2	int64
+}
+syz_IOConnectCallMethod$AppleCLPCUserClient_4_input {
+	scalar_0	const[8, int64]
+	scalar_1	int64
+	scalar_2	int64
+	scalar_3	int64
+	scalar_4	int64
+	scalar_5	int64
+}
+syz_IOConnectCallMethod$AppleCLPCUserClient_8_input_1_flags = 4, 5, 12
+syz_IOConnectCallMethod$AppleCLPCUserClient_8_input {
+	scalar_0	int64
+	scalar_1	flags[syz_IOConnectCallMethod$AppleCLPCUserClient_8_input_1_flags, int64]
+	scalar_2	int64
+}
+
+# AppleCLPCUserClient
+syz_IOConnectCallMethod$AppleCLPCUserClient_0(connection io_connect_t_AppleCLPCUserClient, selector const[0], input intptr[0:0], inputCnt const[0], inputStruct buffer[in], inputStructCnt bytesize[inputStruct], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct buffer[out], outputStructCnt ptr[inout, bytesize[outputStruct, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_1(connection io_connect_t_AppleCLPCUserClient, selector const[1], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_2(connection io_connect_t_AppleCLPCUserClient, selector const[2], input ptr[in, syz_IOConnectCallMethod$AppleCLPCUserClient_2_input], inputCnt const[3], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_3(connection io_connect_t_AppleCLPCUserClient, selector const[3], input ptr[in, array[int64, 3]], inputCnt const[3], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_4(connection io_connect_t_AppleCLPCUserClient, selector const[4], input ptr[in, syz_IOConnectCallMethod$AppleCLPCUserClient_4_input], inputCnt const[6], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_5(connection io_connect_t_AppleCLPCUserClient, selector const[5], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 4]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_6(connection io_connect_t_AppleCLPCUserClient, selector const[6], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct buffer[out], outputStructCnt ptr[inout, bytesize[outputStruct, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_7(connection io_connect_t_AppleCLPCUserClient, selector const[7], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct buffer[out], outputStructCnt ptr[inout, bytesize[outputStruct, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_8(connection io_connect_t_AppleCLPCUserClient, selector const[8], input ptr[in, syz_IOConnectCallMethod$AppleCLPCUserClient_8_input], inputCnt const[3], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleCLPCUserClient_9(connection io_connect_t_AppleCLPCUserClient, selector const[9], input ptr[in, array[int64, 1]], inputCnt const[1], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
