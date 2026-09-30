@@ -128,6 +128,22 @@ for b in "${BINS[@]}"; do
 done
 ok "${#BINS[@]} binary/binaries"
 
+# binfreq lives in a separate repo (fthM2), outside this checkout. Copy it into
+# the tree so the fuzz user -- which cannot traverse the 0700 build tree -- can
+# run the frequency recorders. Its location is not fixed, so resolve it from
+# (in order) BINFREQ_SRC, then SYZ_BINFREQ_BIN (the same override fuzz-session
+# reads, so both agree), then a sibling checkout as a last-resort convenience.
+# Missing/unbuilt binfreq is not fatal: recording is best-effort and
+# fuzz-session skips it with a warning.
+BINFREQ_SRC="${BINFREQ_SRC:-${SYZ_BINFREQ_BIN:-$SRC/../fthM2/binfreq}}"
+if [ -x "$BINFREQ_SRC" ]; then
+  cp_atomic "$BINFREQ_SRC" "$DST/bin/binfreq"
+  chmod +x "$DST/bin/binfreq"
+  info "binfreq  $(/usr/bin/stat -f '%z bytes, built %Sm' -t '%d/%m %H:%M' "$BINFREQ_SRC" 2>/dev/null)"
+else
+  info "binfreq not found at $BINFREQ_SRC -- frequency recording will be skipped (build fthM2, or point BINFREQ_SRC/SYZ_BINFREQ_BIN at the binary)"
+fi
+
 # --- configs (repoint paths; keep the destination's quarantine decisions) -----
 step "configs"
 cfg_n=0
@@ -161,16 +177,24 @@ except ValueError as e:
 # old/new carry a trailing slash so path *prefixes* swap cleanly. But a value
 # that is the checkout root itself (e.g. "syzkaller") equals old without the
 # slash, so match that exact case too -- otherwise syz-manager is pointed back
-# into the 0700 build tree the fuzz user cannot traverse.
+# into the 0700 build tree the fuzz user cannot traverse. Recurse into nested
+# values (e.g. kext_coverage.cover_log) -- walking only top-level keys used to
+# leave the nested log paths in the 0700 tree, halting the fuzz user on start.
 old_root = old.rstrip("/")
 new_root = new.rstrip("/")
-for k, v in list(cfg.items()):
-    if not isinstance(v, str):
-        continue
-    if v == old_root:
-        cfg[k] = new_root
-    elif v.startswith(old):
-        cfg[k] = new + v[len(old):]
+def repoint(x):
+    if isinstance(x, str):
+        if x == old_root:
+            return new_root
+        if x.startswith(old):
+            return new + x[len(old):]
+        return x
+    if isinstance(x, dict):
+        return {k: repoint(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [repoint(v) for v in x]
+    return x
+cfg = repoint(cfg)
 # Carry the live quarantine set across a re-sync. The authored config in the repo
 # has no idea which selectors the campaign has benched since; clobbering it would
 # silently re-enable every crasher the loop already paid a reboot to find.
