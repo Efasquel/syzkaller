@@ -85,8 +85,17 @@ EXECUTOR_BIN = Path(os.environ.get(
 # campaign and append a crash-durable clock trace per DVFS cluster; recording is
 # optional instrumentation, so a missing binary warns and is skipped rather than
 # blocking the run. One recorder per clock domain (Apple silicon has two).
+# Resolve binfreq without assuming any fixed absolute location. Order: an
+# explicit SYZ_BINFREQ_BIN override; then a copy synced into this tree
+# (bin/binfreq), which is how the fuzz user gets it since it cannot traverse the
+# 0700 build tree; then a sibling checkout derived from the tree root (not $HOME)
+# -- ../fthM2/binfreq -- matching sync-fuzz-run.sh's fallback so the two agree.
+_tree_root = Path(__file__).resolve().parent.parent
+_tree_binfreq = _tree_root / "bin" / "binfreq"
 BINFREQ_BIN = Path(os.environ.get(
-    "SYZ_BINFREQ_BIN", Path.home() / "Documents" / "fthM2" / "binfreq"))
+    "SYZ_BINFREQ_BIN",
+    _tree_binfreq if _tree_binfreq.exists()
+    else _tree_root.parent / "fthM2" / "binfreq"))
 FREQ_CLUSTERS = ("p", "e")
 REGISTRY_DIR = REPO_ROOT / "sessions"
 # Executor scratch dirs: the executor does mkdtemp("./syzkaller.XXXXXX") relative
