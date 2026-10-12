@@ -68,7 +68,7 @@ FUZZ_GROUP="${FUZZ_GROUP:-staff}"
 # ModuleNotFoundError for the fuzz user, and the campaign stops at its first
 # quarantine or session call.
 SCRIPTS=(fuzz-campaign.py fuzz-session.py triage.py quarantine.py
-         crash_fingerprint.py bug_registry.py)
+         crash_fingerprint.py bug_registry.py freq-replay.py freq-runner.sh)
 # The shared-library package the drivers import as `from lib import ...`. It is
 # copied as a package (with __init__.py) into $DST/scripts/lib/ so the published
 # drivers resolve it the same way the dev tree does; omitting any member makes
@@ -79,7 +79,9 @@ LIBS=(__init__.py cfgutil.py tablefmt.py fsutil.py timefmt.py)
 # either is missing -- so syz-execprog belongs here even though nothing in these
 # scripts calls it directly. syz-ring-repro is the minimizer triage drives; a
 # headless agent cannot fall back to `go run`, so it must be published too.
+# syz-db is how freq-replay.py unpacks a corpus.db into per-program files.
 BINS=(bin/syz-manager
+      bin/syz-db
       bin/darwin_arm64/syz-executor
       bin/darwin_arm64/syz-execprog
       bin/darwin_arm64/syz-ring-repro)
