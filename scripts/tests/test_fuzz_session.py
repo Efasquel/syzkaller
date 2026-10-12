@@ -332,5 +332,25 @@ class DiagnoseHangTest(unittest.TestCase):
         self.assertTrue(any("IOAVB" in f for f in res[0][2]))
 
 
+class FreqWritableTest(unittest.TestCase):
+    def test_unwritable_trace_is_reported(self):
+        """A CSV left owned by root kept every recorder from opening it, and
+        the campaign fuzzed for ten days with --freq on and nothing recorded."""
+        with tempfile.TemporaryDirectory() as wd:
+            fd = Path(wd) / "freq"
+            fd.mkdir()
+            (fd / "p.csv").write_text("x\n")
+            self.assertEqual(fs.freq_unwritable(wd), [])
+            real = os.access
+            with mock.patch.object(fs.os, "access",
+                                   lambda p, m: False if str(p).endswith("p.csv")
+                                   else real(p, m)):
+                self.assertEqual(fs.freq_unwritable(wd), [fd / "p.csv"])
+
+    def test_missing_trace_dir_is_fine(self):
+        with tempfile.TemporaryDirectory() as wd:
+            self.assertEqual(fs.freq_unwritable(wd), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

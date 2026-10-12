@@ -1163,6 +1163,24 @@ def live_recorders(state):
             if pid_alive(r.get("pid"), r.get("boot_epoch"))]
 
 
+def freq_unwritable(workdir):
+    """Trace files (or the freq/ dir) this user cannot append to.
+
+    Checked before the manager starts, because launch_recorder can only warn:
+    binfreq exits on the open, and a campaign that asked for --freq goes on
+    fuzzing with no trace. A CSV left owned by root from one `sudo` run did
+    exactly that, silently, for ten days."""
+    freqdir = Path(workdir) / "freq"
+    bad = []
+    if freqdir.exists() and not os.access(freqdir, os.W_OK | os.X_OK):
+        bad.append(freqdir)
+    for cluster in FREQ_CLUSTERS:
+        f = freqdir / ("%s.csv" % cluster)
+        if f.exists() and not os.access(f, os.W_OK):
+            bad.append(f)
+    return bad
+
+
 def launch_recorder(state, cluster):
     """Start one binfreq --stream recorder for a DVFS cluster (p|e), appending a
     crash-durable clock trace to <workdir>/freq/<cluster>.csv. Each sample is
@@ -1681,6 +1699,17 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False,
                 % (sid, pending["run_started"], pending["slots"],
                    pending["last_collect"], sys.argv[0], sid, sys.argv[0], cfg_arg))
 
+    want_freq = (bool(record_freq) if record_freq is not None
+                 else bool(prev.get("record_freq")) if prev else False)
+    if want_freq:
+        bad = freq_unwritable(workdir)
+        if bad:
+            die("--freq is on but this user cannot write the frequency trace:\n%s\n"
+                "  fix: sudo chown %s %s\n"
+                "  or start without recording: --no-freq"
+                % ("\n".join("  %s (owner uid %d)" % (b, b.stat().st_uid) for b in bad),
+                   os.environ.get("USER", "$USER"), " ".join(str(b) for b in bad)))
+
     # Session isn't running, so any leftover scratch dirs are stale — clear them
     # so executor indices restart at 0 instead of climbing across runs.
     stale = clean_scratch(sid)
@@ -1759,8 +1788,7 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False,
         "exec_count": exec_count, "executors": [], "recorders": [],
         # Frequency recording is opt-in. None on this call inherits the previous
         # run's choice, so resume/restart keep recording (or not) without re-flagging.
-        "record_freq": bool(record_freq) if record_freq is not None
-                       else bool(prev.get("record_freq")) if prev else False,
+        "record_freq": want_freq,
     }
     save_state(state)
     print("  pid    : %s" % proc.pid)
