@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -209,6 +210,23 @@ def boot_epoch():
     return _BOOT_EPOCH or None
 
 
+# kern.boottime is not a constant: macOS derives it as wall-clock minus uptime,
+# so every NTP correction moves it. A record one second off the current value was
+# written on THIS boot -- treating it as a previous one made a live manager read
+# as dead, and the next resume then killed its executor as an "orphan" and
+# started a second manager that could never bind the http port. A real reboot
+# moves the boot epoch by at least the time the reboot took, far more than this.
+BOOT_EPOCH_SLACK = 60
+
+
+def same_boot(rec_boot, cur=None):
+    """Was `rec_boot` recorded on the current boot? Unknown counts as yes."""
+    if rec_boot is None:
+        return True
+    cur = boot_epoch() if cur is None else cur
+    return cur is None or abs(int(rec_boot) - cur) <= BOOT_EPOCH_SLACK
+
+
 def pid_alive(pid, rec_boot=None):
     """Is `pid` live AND the same process we recorded?
 
@@ -220,10 +238,8 @@ def pid_alive(pid, rec_boot=None):
     """
     if not pid:
         return False
-    if rec_boot is not None:
-        cur = boot_epoch()
-        if cur is not None and int(rec_boot) != cur:
-            return False
+    if not same_boot(rec_boot):
+        return False
     try:
         os.kill(int(pid), 0)
         return True
@@ -333,8 +349,14 @@ def latest_bench(workdir):
 
 
 def latest_run_log(workdir):
+    """The most recently STARTED run's log, by the run-<ts> in its name.
+
+    Not by mtime: a manager that outlives its record keeps appending to its own
+    log, so mtime names that old run as the latest forever. The campaign derives
+    a run's start from this, and with the wrong log every incident measured the
+    run from hours earlier and re-added that span to the fuzzing budget."""
     results = Path(workdir) / "results"
-    logs = sorted(results.glob("run-*.log"), key=lambda p: p.stat().st_mtime)
+    logs = sorted(results.glob("run-*.log"), key=lambda p: (p.name, p.stat().st_mtime))
     return logs[-1] if logs else None
 
 
@@ -1471,6 +1493,38 @@ def save_grammar(workdir, conf, stamp, dedupe=True):
 
 
 # ---- commands --------------------------------------------------------------
+def port_in_use(http):
+    """pid (or True) if something is listening on the config's http host:port.
+
+    Probes with a bind rather than a connect: a manager that is wedged still
+    holds the port but may not accept, and a bind fails either way. SO_REUSEADDR
+    matches what Go's net.Listen sets, so TIME_WAIT leftovers from a manager that
+    was just stopped do not read as a live one -- only a listener does."""
+    if not http or ":" not in http:
+        return None
+    host, port = http.rsplit(":", 1)
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host or "127.0.0.1", port))
+        return None
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            return None
+    finally:
+        sock.close()
+    try:
+        out = subprocess.run(["lsof", "-nP", "-t", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        return int(out[0]) if out else True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+
+
 def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     if not MANAGER_BIN.exists() or not os.access(MANAGER_BIN, os.X_OK):
         die("syz-manager not built at %s (run: make manager)" % MANAGER_BIN)
@@ -1496,6 +1550,16 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     http = conf.get("http", "")
     if not workdir:
         die('config has no "workdir": %s' % cfg)
+
+    # Last line of defence against a manager nothing tracks any more: it holds
+    # the http port, so a new one would die at startup -- after its executor was
+    # already launched against it. Refuse with the reason instead.
+    holder = port_in_use(http)
+    if holder:
+        die("http %s is already in use%s; another syz-manager is probably still "
+            "running. Find it with: lsof -nP -iTCP:%s -sTCP:LISTEN"
+            % (http, " (pid %s)" % holder if holder is not True else "",
+               http.rsplit(":", 1)[-1]))
 
     prev = refresh_status(sid)
     if prev and prev.get("status") == "running":

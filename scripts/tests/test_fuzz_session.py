@@ -62,6 +62,54 @@ class PidAliveTest(unittest.TestCase):
         with mock.patch.object(fs, "boot_epoch", lambda: 1000):
             self.assertTrue(fs.pid_alive(os.getpid(), rec_boot=1000))
 
+    def test_ntp_drift_of_the_boot_epoch_is_the_same_boot(self):
+        """kern.boottime is wall clock minus uptime, so an NTP correction moves
+        it. A one-second drift made a live manager read as dead: the next resume
+        killed its executor as an orphan and started a second manager that died
+        on the http port, every ten minutes, for over an hour."""
+        with mock.patch.object(fs, "boot_epoch", lambda: 1791805751):
+            self.assertTrue(fs.pid_alive(os.getpid(), rec_boot=1791805750))
+            self.assertTrue(fs.pid_alive(os.getpid(),
+                                         rec_boot=1791805751 - fs.BOOT_EPOCH_SLACK))
+            self.assertFalse(fs.pid_alive(os.getpid(),
+                                          rec_boot=1791805750 - fs.BOOT_EPOCH_SLACK))
+
+
+class LatestRunLogTest(unittest.TestCase):
+    def test_latest_started_run_wins_over_latest_written(self):
+        """A manager that outlived its record keeps appending to its own log;
+        by mtime its run stayed 'latest' and every incident re-measured from it,
+        adding the same hours to the fuzzing budget again and again."""
+        with tempfile.TemporaryDirectory() as wd:
+            res = Path(wd) / "results"
+            res.mkdir()
+            old = res / "run-20261012-140038.log"
+            new = res / "run-20261012-144336.log"
+            new.write_text("died at startup\n")
+            old.write_text("still running\n")
+            os.utime(new, (1000, 1000))
+            os.utime(old, (2000, 2000))           # the old one was written last
+            self.assertEqual(fs.latest_run_log(wd), new)
+
+
+class PortInUseTest(unittest.TestCase):
+    def test_listener_is_reported_and_free_port_is_not(self):
+        import socket
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            self.assertTrue(fs.port_in_use("127.0.0.1:%d" % port))
+        finally:
+            srv.close()
+        self.assertIsNone(fs.port_in_use("127.0.0.1:%d" % port))
+
+    def test_no_http_is_not_checked(self):
+        self.assertIsNone(fs.port_in_use(""))
+        self.assertIsNone(fs.port_in_use("bogus"))
+
 
 class RetireScratchTest(unittest.TestCase):
     """Scratch dirs live in sticky /tmp, so only their owner can rename them."""
