@@ -766,6 +766,35 @@ class HangDetectionTest(unittest.TestCase):
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             self.assertEqual(fc.supervise(s, d, "sid", budget=0), "budget")
 
+    def test_budget_wakes_at_the_deadline_not_the_next_poll(self):
+        """A check that lands 54s short of the budget must not sleep a full
+        600s poll: a 1h campaign ran to 1h09m that way."""
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg"})
+        d = dict(fc.DEFAULTS, hang_after_seconds=9999, poll_seconds=600, name="camp")
+        clock = [3546.0]
+        waits = []
+
+        def fake_wait(st, dd, seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+            return None
+
+        alive = {"found": True, "pid_alive": True, "exec_total": 1,
+                 "run_started_epoch": time.time()}
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "wait_for_stop", fake_wait), \
+             mock.patch.object(fc, "budget_spent", lambda st, dd: clock[0]), \
+             mock.patch.object(fc, "inspect", lambda sid: alive), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            self.assertEqual(fc.supervise(s, d, "sid", budget=3600), "budget")
+        self.assertEqual(waits, [54.0])
+
     def test_a_wedged_executor_is_a_hang_regardless_of_counters(self):
         """One `syz-executor exec` per program, so one alive for minutes is a
         syscall that never returned -- direct evidence, not an inference."""

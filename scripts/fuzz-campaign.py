@@ -1124,7 +1124,12 @@ def supervise(s, d, sid, budget):
         # in one go coupled them, so `halt` took up to ten minutes to be seen --
         # long enough to feel broken and to invite killing the driver instead,
         # which is how a half-stopped campaign gets left behind.
-        stop = wait_for_stop(s, d, poll)
+        #
+        # Never sleep past the budget either. The polls are phased from when
+        # supervision started, not from the deadline, so a check that lands just
+        # short of it used to buy a whole extra poll: a 1h campaign checked at
+        # 59m06s and ran to 1h09m.
+        stop = wait_for_stop(s, d, min(poll, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
             log("campaign halted by user")
             session("stop", sid)
