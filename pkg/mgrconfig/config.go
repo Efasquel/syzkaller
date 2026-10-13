@@ -34,6 +34,11 @@ type Config struct {
 	// (VM-less); with VMs the built-in reproduction loop handles crash capture.
 	// Set to 0 (default) to disable.
 	RingBufferSize int `json:"ring_buffer_size,omitempty"`
+	// Bracket every executed program with a CPU frequency measure (VM-less only).
+	// Saves each program, runs binfreq before and after it, and appends both
+	// measures plus every call's result to <workdir>/freqlab/records.jsonl.
+	// Keeps one program in flight, so expect a few executions per second.
+	FreqLab *FreqLabConfig `json:"freq_lab,omitempty"`
 	// Process name to run the executor under. Some IOKit drivers only accept
 	// clients whose process name matches an expected userspace program, so the
 	// runner is launched from a copy of syz-executor renamed to this. Darwin
@@ -334,4 +339,12 @@ type CovFilterCfg struct {
 	Files     []string `json:"files,omitempty"`
 	Functions []string `json:"functions,omitempty"`
 	RawPCs    []string `json:"pcs,omitempty"`
+}
+
+type FreqLabConfig struct {
+	// Path to the binfreq binary (required).
+	Binfreq string `json:"binfreq"`
+	// binfreq arguments for one measure; must print JSON. Default: -F -b -j
+	// (fast estimate of the P then the E cluster, ~0.18s).
+	Args []string `json:"args,omitempty"`
 }

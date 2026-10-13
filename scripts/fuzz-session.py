@@ -882,6 +882,22 @@ def executor_binary(state, scratch):
     return dest
 
 
+def executor_env(state):
+    """The executor's environment. A config with freq_lab gets the darwin IOKit
+    wrappers' output log, next to the manager's freq_lab records: the manager
+    never sees call outputs, only error codes, so the executor writes them."""
+    env = dict(os.environ)
+    try:
+        conf = load_config(Path(state["config"]))
+    except (OSError, ValueError, KeyError):
+        return env
+    if conf.get("freq_lab"):
+        freqlab = Path(state["workdir"]) / "freqlab"
+        freqlab.mkdir(parents=True, exist_ok=True)
+        env["SYZ_IOKIT_OUTPUT_LOG"] = str(freqlab / "outputs.jsonl")
+    return env
+
+
 def launch_executor(state, index, port):
     """Start one 'syz-executor runner <index> 127.0.0.1 <port>' from a scratch dir."""
     if not EXECUTOR_BIN.exists() or not os.access(EXECUTOR_BIN, os.X_OK):
@@ -894,7 +910,7 @@ def launch_executor(state, index, port):
     proc = subprocess.Popen(
         [str(binary), "runner", str(index), "127.0.0.1", str(port)],
         stdout=log_fh, stderr=subprocess.STDOUT,
-        cwd=str(scratch), start_new_session=True,
+        cwd=str(scratch), start_new_session=True, env=executor_env(state),
     )
     time.sleep(0.5)
     if proc.poll() is not None:

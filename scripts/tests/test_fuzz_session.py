@@ -5,6 +5,7 @@ Both bugs covered here produced the same class of failure: a healthy thing
 reported as dead, or an impossible cleanup reported as work."""
 
 import errno
+import json
 import importlib.util
 import os
 import sys
@@ -350,6 +351,28 @@ class FreqWritableTest(unittest.TestCase):
     def test_missing_trace_dir_is_fine(self):
         with tempfile.TemporaryDirectory() as wd:
             self.assertEqual(fs.freq_unwritable(wd), [])
+
+
+class ExecutorEnvTest(unittest.TestCase):
+    def _state(self, wd, conf):
+        cfg = Path(wd) / "x.cfg"
+        cfg.write_text(json.dumps(conf))
+        return {"config": str(cfg), "workdir": wd}
+
+    def test_freq_lab_config_gets_the_output_log(self):
+        """The manager only sees call error codes; without this variable the
+        executor writes no IOKit outputs and freq_lab records half a story."""
+        with tempfile.TemporaryDirectory() as wd:
+            env = fs.executor_env(self._state(wd, {"freq_lab": {"binfreq": "/b"}}))
+            self.assertEqual(env["SYZ_IOKIT_OUTPUT_LOG"],
+                             str(Path(wd) / "freqlab" / "outputs.jsonl"))
+
+    def test_plain_config_leaves_it_unset(self):
+        with tempfile.TemporaryDirectory() as wd, \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SYZ_IOKIT_OUTPUT_LOG", None)
+            env = fs.executor_env(self._state(wd, {"workdir": wd}))
+            self.assertNotIn("SYZ_IOKIT_OUTPUT_LOG", env)
 
 
 if __name__ == "__main__":

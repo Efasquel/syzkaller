@@ -56,6 +56,7 @@ type Config struct {
 	Workdir        string
 	LogFile        string
 	RingBufferSize int
+	FreqLab        *mgrconfig.FreqLabConfig
 	pcBase         uint64
 	localModules   []*vminfo.KernelModule
 
@@ -98,6 +99,7 @@ type server struct {
 	timeouts  targets.Timeouts
 	checker   *vminfo.Checker
 	ringBuf   *RingBuffer
+	freqLab   *FreqLab
 
 	infoOnce         sync.Once
 	checkDone        atomic.Bool
@@ -191,6 +193,13 @@ func New(cfg *RemoteConfig) (Server, error) {
 			return nil, fmt.Errorf("ring buffer: %w", err)
 		}
 	}
+	var freqLab *FreqLab
+	if cfg.VMLess && cfg.FreqLab != nil {
+		freqLab, err = NewFreqLab(filepath.Join(cfg.Workdir, "freqlab"), cfg.FreqLab.Binfreq, cfg.FreqLab.Args)
+		if err != nil {
+			return nil, err
+		}
+	}
 	serv := newImpl(&Config{
 		Config: vminfo.Config{
 			Target:     cfg.Target,
@@ -220,10 +229,12 @@ func New(cfg *RemoteConfig) (Server, error) {
 		Workdir:           cfg.Workdir,
 		LogFile:           cfg.LogFile,
 		RingBufferSize:    cfg.RingBufferSize,
+		FreqLab:           cfg.FreqLab,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager)
 	serv.ringBuf = ringBuf
+	serv.freqLab = freqLab
 	return serv, nil
 }
 
@@ -261,6 +272,7 @@ func newImpl(cfg *Config, mgr Manager) *server {
 
 func (serv *server) Close() error {
 	serv.ringBuf.Close()
+	serv.freqLab.Close()
 	return serv.serv.Close()
 }
 
@@ -659,6 +671,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec:   MakeLastExecuting(prog.MaxPids, 6),
 		ringBuf:    serv.ringBuf,
+		freqLab:    serv.freqLab,
 		stats:      serv.runnerStats,
 		procs:      serv.cfg.Procs,
 		kcovDevice: serv.cfg.KcovDevice,

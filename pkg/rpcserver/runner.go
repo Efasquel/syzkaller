@@ -47,6 +47,7 @@ type Runner struct {
 	hanged        map[int64]bool
 	lastExec      *LastExecuting
 	ringBuf       *RingBuffer
+	freqLab       *FreqLab
 	updInfo       dispatcher.UpdateInfo
 	resultCh      chan error
 
@@ -179,7 +180,7 @@ func (runner *Runner) ConnectionLoop() error {
 			default:
 			}
 		}
-		for len(runner.requests)-len(runner.executing) < 2*runner.procs {
+		for runner.canSendMore() {
 			req := runner.source.Next(runner.id)
 			if req == nil {
 				break
@@ -351,8 +352,19 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 	runner.requests[id] = req
 	if req.Type == flatrpc.RequestTypeProgram {
 		runner.ringBuf.WriteSync(int(id), req.Prog.Serialize())
+		runner.freqLab.Before(id, req.Prog)
 	}
 	return flatrpc.Send(runner.conn, msg)
+}
+
+// canSendMore keeps 2*procs requests queued on the executor, so a proc never
+// idles between programs. FreqLab needs the opposite: exactly one program in
+// flight, so that the measures on either side of it bracket it alone.
+func (runner *Runner) canSendMore() bool {
+	if runner.freqLab != nil {
+		return len(runner.requests) == 0
+	}
+	return len(runner.requests)-len(runner.executing) < 2*runner.procs
 }
 
 func (runner *Runner) handleExecutingMessage(msg *flatrpc.ExecutingMessage) error {
@@ -456,6 +468,9 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 			runner.lastExec.Hanged(int(msg.Id), int(msg.Proc), req.Prog.Serialize(), osutil.MonotonicNano())
 		}
 		runner.hanged[msg.Id] = true
+	}
+	if req.Type == flatrpc.RequestTypeProgram {
+		runner.freqLab.After(msg.Id, req.Prog, msg.Info, freqLabStatus(status))
 	}
 	req.Done(&queue.Result{
 		Executor: queue.ExecutorID{
