@@ -42,9 +42,16 @@ static long check_input(long scalar_input, long scalar_inputCnt, long inband_inp
 		return 1;
 	if ((const void*)inband_input == NULL && (size_t)inband_inputCnt != 0)
 		return 1;
-	if ((uint64*)scalar_output == NULL && (uint32*)scalar_outputCnt != NULL)
+	// A NULL output with a count pointer is how a selector says "no output":
+	// IOKit only writes through the buffer when the count is non-zero. Rejecting
+	// on the pointer alone dropped every grammar-valid call to such selectors
+	// before it reached the kernel. Reading the count is safe here: the call runs
+	// under NONFAILING, so a bad count pointer faults recoverably.
+	if ((uint64*)scalar_output == NULL && (uint32*)scalar_outputCnt != NULL &&
+	    *(uint32*)scalar_outputCnt != 0)
 		return 1;
-	if ((void*)ool_output == NULL && (size_t*)ool_output_size != NULL)
+	if ((void*)ool_output == NULL && (size_t*)ool_output_size != NULL &&
+	    *(size_t*)ool_output_size != 0)
 		return 1;
 	return 0;
 }
@@ -56,8 +63,12 @@ static long __attribute__((unused)) syz_IOConnectCallMethod(volatile long arg0, 
 	long ret;
 
 	// Avoid SIGSEG
-	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9))
+	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)) {
+		// Say so: otherwise errno is whatever the last call left behind, and a
+		// rejected call reads in the log as a kernel error it never produced.
+		errno = EINVAL;
 		return -1;
+	}
 
 	ret = IOConnectCallMethod((mach_port_t)arg0, (uint32)arg1,
 				  (const uint64*)arg2, (uint32)arg3,
@@ -84,8 +95,12 @@ static long __attribute__((unused)) syz_IOConnectCallAsyncMethod(volatile long a
 	async_ref.port = p;
 
 	// Avoid SIGSEG
-	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9))
+	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)) {
+		// Say so: otherwise errno is whatever the last call left behind, and a
+		// rejected call reads in the log as a kernel error it never produced.
+		errno = EINVAL;
 		return -1;
+	}
 
 	ret = IOConnectCallAsyncMethod((mach_port_t)arg0, (uint32)arg1,
 				       p, (uint64*)&async_ref, 1,
