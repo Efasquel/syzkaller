@@ -156,6 +156,31 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sorted(n for n in names if n != fr.CONTROL),
                          ["a", "b", "slow1"])
 
+    def test_relative_replay_dir_still_runs_programs(self):
+        """The runner cd's into exec/ before writing its log and marker; with a
+        relative replay dir every trial failed and nothing was measured."""
+        (self.d / "progs" / "boom").unlink()
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            fr.cmd_run(Path("replay"), "screen", "p,p", batch=100, seed=1,
+                       calib_trials=4, reps=3, k=4, active_sweeps=8,
+                       sandbox="none", force=True)
+        finally:
+            os.chdir(cwd)
+        recs = fr.read_jsonl(self.d / "screen.jsonl")
+        self.assertTrue(recs)
+        self.assertTrue(all(r["call_status"] == 0 for r in recs))
+
+    def test_a_runner_that_never_runs_anything_stops_the_run(self):
+        fr.EXECPROG = self._exe("execprog", "#!/bin/sh\nexit 3\n")
+        with self.assertRaises(SystemExit):
+            self._run("screen")
+
+    def test_failed_trials_are_not_measurements(self):
+        recs = [rec(fr.CONTROL, 0.0), dict(rec("x", 0.5), call_status=1)]
+        self.assertEqual([r["name"] for r in fr.measured(recs)], [fr.CONTROL])
+
     def test_runner_output_never_reaches_the_record_stream(self):
         with self.assertRaises(SystemExit):
             self._run("screen")

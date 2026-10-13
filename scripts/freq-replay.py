@@ -129,6 +129,13 @@ def read_jsonl(path):
     return out
 
 
+def measured(recs):
+    """Trials whose program actually ran. A runner that failed (bad path, missing
+    binary, executor refused) still gets a binfreq record -- a PRE and POST around
+    nothing -- and judging those as measurements reads silence as "no effect"."""
+    return [r for r in recs if r.get("call_status", 0) == 0]
+
+
 def append_jsonl(path, rec):
     with open(path, "a") as f:
         f.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -196,10 +203,10 @@ def is_hit(rec, fl, k):
 def phase_floor(d, phase):
     """The floor a phase is judged against: its own interleaved controls when
     there are enough of them (they share the run's drift), else calibrate's."""
-    recs = read_jsonl(Path(d) / ("%s.jsonl" % phase))
+    recs = measured(read_jsonl(Path(d) / ("%s.jsonl" % phase)))
     ctl = [r for r in recs if r.get("name") == CONTROL]
     if len(ctl) < MIN_CONTROLS and phase != "calibrate":
-        ctl = [r for r in read_jsonl(Path(d) / "calibrate.jsonl")
+        ctl = [r for r in measured(read_jsonl(Path(d) / "calibrate.jsonl"))
                if r.get("name") == CONTROL]
     if len(ctl) < MIN_CONTROLS:
         return None
@@ -279,7 +286,7 @@ def build_schedule(d, phase, seed, calib_trials, reps, k):
         fl = phase_floor(d, "screen")
         if fl is None:
             die("confirm needs a screen run with >= %d controls" % MIN_CONTROLS)
-        hits = screen_hits(read_jsonl(d / "screen.jsonl"), fl, k)
+        hits = screen_hits(measured(read_jsonl(d / "screen.jsonl")), fl, k)
         if not hits:
             die("screen has no hits at k=%g; nothing to confirm" % k)
         log("confirm: %d screen hit(s) x %d reps" % (len(hits), reps))
@@ -311,7 +318,9 @@ def note_suspect(d, phase, sched_by_idx, done):
 
 
 def run_batch(d, phase, trials, channels, active_sweeps, sandbox):
-    d = Path(d)
+    # Absolute: the runner cd's into exec/ before it writes the log and marker,
+    # so a relative replay dir would point them nowhere and every trial would fail.
+    d = Path(d).resolve()
     scratch = d / "exec"
     scratch.mkdir(exist_ok=True)
     env = dict(os.environ,
@@ -334,7 +343,7 @@ def run_batch(d, phase, trials, channels, active_sweeps, sandbox):
                              stderr=errf, env=env, text=True, bufsize=1) as proc:
         proc.stdin.write("".join(lines))
         proc.stdin.close()
-        got = 0
+        got = ok = 0
         for line in proc.stdout:
             if not line.startswith("{"):
                 continue
@@ -348,8 +357,9 @@ def run_batch(d, phase, trials, channels, active_sweeps, sandbox):
             rec.update(idx=t["idx"], name=t["name"], phase=phase)
             append_jsonl(results, rec)
             got += 1
+            ok += rec.get("call_status", 0) == 0
         rc = proc.wait()
-    return got, rc
+    return got, ok, rc
 
 
 def last_line(path):
@@ -380,7 +390,7 @@ def note_failure(d, phase, sched_by_idx, rc):
 
 def cmd_run(d, phase, channels, batch, seed, calib_trials, reps, k,
             active_sweeps, sandbox, force):
-    d = Path(d)
+    d = Path(d).resolve()
     if not (d / "progs").is_dir():
         die("%s is not prepared (run: freq-replay.py prepare)" % d)
     for b in (BINFREQ_BIN, EXECPROG, EXECUTOR):
@@ -412,7 +422,11 @@ def cmd_run(d, phase, channels, batch, seed, calib_trials, reps, k,
     stalled = 0
     while todo:
         chunk = todo[:batch]
-        got, rc = run_batch(d, phase, chunk, channels, active_sweeps, sandbox)
+        got, ok, rc = run_batch(d, phase, chunk, channels, active_sweeps, sandbox)
+        if got and not ok:
+            die("the runner failed on all %d trial(s) of this batch -- no program "
+                "ran, so nothing was measured; see %s and %s"
+                % (got, d / "runner.log", d / "binfreq.log"))
         log("%s: batch from %d -> %d record(s)%s"
             % (phase, chunk[0]["idx"], got, "" if rc == 0 else ", binfreq rc=%d" % rc))
         if rc < 0:
@@ -455,7 +469,7 @@ def cmd_report(d, k, m, write_corpus, corpus_out):
     d = Path(d)
     cal = phase_floor(d, "calibrate")
     if cal:
-        ctl = [r for r in read_jsonl(d / "calibrate.jsonl") if r.get("name") == CONTROL]
+        ctl = [r for r in measured(read_jsonl(d / "calibrate.jsonl")) if r.get("name") == CONTROL]
         fp = sum(1 for r in ctl if is_hit(r, cal, k))
         print("calibrate  n=%d  passive floor %.4f +/- %.4f GHz  active %.4f +/- %.4f"
               % (cal["passive"]["n"], cal["passive"]["median"], cal["passive"]["sigma"],
@@ -463,14 +477,14 @@ def cmd_report(d, k, m, write_corpus, corpus_out):
         print("           false positives at k=%g: %d/%d controls" % (k, fp, len(ctl)))
     fl = phase_floor(d, "screen") if (d / "screen.jsonl").exists() else None
     if fl:
-        recs = read_jsonl(d / "screen.jsonl")
+        recs = measured(read_jsonl(d / "screen.jsonl"))
         hits = screen_hits(recs, fl, k)
         ncand = sum(1 for r in recs if r.get("name") != CONTROL)
         print("screen     %d program(s) measured, %d hit(s) at k=%g" % (ncand, len(hits), k))
     fl = phase_floor(d, "confirm") if (d / "confirm.jsonl").exists() else None
     if not fl:
         return
-    verdicts = confirm_verdicts(read_jsonl(d / "confirm.jsonl"), fl, k, m)
+    verdicts = confirm_verdicts(measured(read_jsonl(d / "confirm.jsonl")), fl, k, m)
     rows = [[v["name"][:16], v["reps"], v["hits"], "yes" if v["confirmed"] else "",
              "%+.1f" % v["median_z_passive"], "%+.4f" % v["median_delta_passive_ghz"],
              "%+.4f" % v["median_delta_active_ghz"], ",".join(v["classes"])]
@@ -479,7 +493,7 @@ def cmd_report(d, k, m, write_corpus, corpus_out):
                     "d_act GHz", "classes"])
     if write_corpus:
         out = Path(corpus_out) if corpus_out else d / "freq-corpus"
-        recs = read_jsonl(d / "confirm.jsonl")
+        recs = measured(read_jsonl(d / "confirm.jsonl"))
         n = 0
         for v in verdicts:
             if not v["confirmed"]:
