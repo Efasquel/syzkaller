@@ -80,6 +80,11 @@ var (
 	// Note, however, that we do not have to do the same for `syz-prog2c`, as `collide` was there false
 	// by default.
 	_ = flag.Bool("collide", false, "(DEPRECATED) collide syscalls to provoke data races")
+
+	// freq_lab: bracket every program with a binfreq measure (see pkg/rpcserver/freq_lab.go).
+	flagFreqLabDir     = flag.String("freq_lab_dir", "", "freq_lab output dir (progs/, records.jsonl); enables freq_lab")
+	flagFreqLabBinfreq = flag.String("freq_lab_binfreq", "binfreq", "freq_lab: path to binfreq")
+	flagFreqLabArgs    = flag.String("freq_lab_args", "", "freq_lab: binfreq arguments (default: -F -b -j)")
 )
 
 func main() {
@@ -179,10 +184,22 @@ func main() {
 			Slowdown: *flagSlowdown,
 		},
 		Executor:         *flagExecutor,
+		FreqLabDir:       *flagFreqLabDir,
 		HandleInterrupts: true,
 		GDB:              *flagGDB,
 		MachineChecked:   ctx.machineChecked,
 		OutputWriter:     os.Stderr,
+	}
+	if *flagFreqLabDir != "" {
+		// Bracket every program with a frequency measure, exactly as the
+		// manager's freq_lab does, so a replay produces the same records.
+		if *flagProcs != 1 {
+			tool.Failf("-freq_lab_dir needs -procs 1: measures must bracket one program")
+		}
+		cfg.FreqLab = &mgrconfig.FreqLabConfig{Binfreq: *flagFreqLabBinfreq}
+		if *flagFreqLabArgs != "" {
+			cfg.FreqLab.Args = strings.Fields(*flagFreqLabArgs)
+		}
 	}
 	if err := rpcserver.RunLocal(rpcCtx, cfg); err != nil {
 		tool.Fail(err)

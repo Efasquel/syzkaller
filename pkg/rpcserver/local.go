@@ -34,6 +34,8 @@ type LocalConfig struct {
 	MaxSignal      []uint64
 	CoverFilter    []uint64
 	MachineChecked func(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) queue.Source
+	// With Config.FreqLab set, where freq_lab writes progs/, records.jsonl.
+	FreqLabDir string
 }
 
 func RunLocal(ctx context.Context, cfg *LocalConfig) error {
@@ -79,6 +81,13 @@ func setupLocal(ctx context.Context, cfg *LocalConfig) (*local, context.Context,
 		setupDone: make(chan bool),
 	}
 	serv := newImpl(&cfg.Config, localCtx)
+	if cfg.FreqLab != nil {
+		freqLab, err := NewFreqLab(cfg.FreqLabDir, cfg.FreqLab.Binfreq, cfg.FreqLab.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		serv.freqLab = freqLab
+	}
 	if err := serv.Listen(); err != nil {
 		return nil, nil, err
 	}
