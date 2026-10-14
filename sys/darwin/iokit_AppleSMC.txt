@@ -1,0 +1,38 @@
+# diskext: 6dbe842
+# kext: AppleSMC
+# uuid: E766C24EE45F3D6C889FCCE2955B8EE6
+# kext-version: 752.100.20.0.0
+# grammar-level: l3
+# emitted: 2026-10-14T13:41:43Z
+
+resource io_connect_t_AppleSMCClient[io_connect_t]
+resource io_connect_t_AppleSMCSensorDispatcherUserClient[io_connect_t]
+
+syz_IOServiceOpen$AppleSMCKeysEndpoint_AppleSMCClient(service ptr[in, string["AppleSMCKeysEndpoint"]], type int32, connection ptr[out, io_connect_t_AppleSMCClient])
+syz_IOServiceOpen$AppleSMC_AppleSMCClient(service ptr[in, string["AppleSMC"]], type int32, connection ptr[out, io_connect_t_AppleSMCClient])
+syz_IOServiceOpen$AppleSMCSensorDispatcher_AppleSMCSensorDispatcherUserClient(service ptr[in, string["AppleSMCSensorDispatcher"]], type int32, connection ptr[out, io_connect_t_AppleSMCSensorDispatcherUserClient])
+
+syz_IOConnectCallMethod$AppleSMCClient_2_inputStruct {
+	field_0	int32
+	pad_4	array[int8, 24]
+	field_1c	int32[0:33]
+	pad_20	array[int8, 10]
+	field_2a	int8
+}
+syz_IOConnectCallMethod$AppleSMCClient_2_outputStruct {
+	pad_0	array[int8, 40]
+	field_28	int8
+}
+
+# AppleSMCClient
+syz_IOConnectCallMethod$AppleSMCClient_0(connection io_connect_t_AppleSMCClient, selector const[0], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCClient_1(connection io_connect_t_AppleSMCClient, selector const[1], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCClient_2(connection io_connect_t_AppleSMCClient, selector const[2], input intptr[0:0], inputCnt const[0], inputStruct ptr[in, syz_IOConnectCallMethod$AppleSMCClient_2_inputStruct], inputStructCnt int32[0:4096], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct ptr[out, syz_IOConnectCallMethod$AppleSMCClient_2_outputStruct], outputStructCnt ptr[inout, int32[0:4096]])
+# AppleSMCSensorDispatcherUserClient
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_0(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[0], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_1(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[1], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct ptr[out, array[int8, 60]], outputStructCnt ptr[inout, const[60, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_2(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[2], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct ptr[out, array[int8, 60]], outputStructCnt ptr[inout, const[60, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_3(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[3], input intptr[0:0], inputCnt const[0], inputStruct ptr[in, array[int8, 88]], inputStructCnt const[88], output intptr[0:0], outputCnt ptr[inout, const[0, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_4(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[4], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_5(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[5], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
+syz_IOConnectCallMethod$AppleSMCSensorDispatcherUserClient_6(connection io_connect_t_AppleSMCSensorDispatcherUserClient, selector const[6], input intptr[0:0], inputCnt const[0], inputStruct intptr[0:0], inputStructCnt const[0], output ptr[inout, array[int64, 1]], outputCnt ptr[inout, len[output, int32]], outputStruct intptr[0:0], outputStructCnt ptr[inout, const[0, int32]])
