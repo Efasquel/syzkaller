@@ -1218,3 +1218,50 @@ class RealClock(unittest.TestCase):
 
     def test_real_is_a_valid_clock_choice(self):
         self.assertIn("real", fc.BUDGET_CLOCKS)
+
+
+class ResultsCommitTest(unittest.TestCase):
+    """fuzz-campaign hands results to fuzz-results.py, never blocking on it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = mock.patch.object(fc, "STATE_DIR", Path(self._tmp.name))
+        self.state_dir.start()
+        self.s = {"name": "C", "current_config": "/cfg/K_x.cfg", "active_seconds": 10.0}
+        self.d = {"results_repo": "/repo", "items": [{"config": "/cfg/K_x.cfg"}]}
+
+    def tearDown(self):
+        self.state_dir.stop()
+        self._tmp.cleanup()
+
+    def test_off_without_results_repo(self):
+        with mock.patch.object(fc.subprocess, "run") as run, \
+                mock.patch.object(fc.subprocess, "Popen") as popen:
+            fc.results_commit(self.s, {"items": []}, "start")
+            fc.results_commit(self.s, None, "start")
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_restart_is_synchronous_and_skips_freq(self):
+        with mock.patch.object(fc.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            fc.results_commit(self.s, self.d, "restart")
+        cmd = run.call_args[0][0]
+        self.assertIn("--no-freq", cmd)
+        self.assertEqual(cmd[cmd.index("--event") + 1], "restart")
+        self.assertEqual(cmd[cmd.index("--tag-prefix") + 1], "C")
+        self.assertEqual(cmd[cmd.index("--push") + 1], "detach")
+
+    def test_poll_is_detached(self):
+        with mock.patch.object(fc.subprocess, "Popen") as popen:
+            fc.results_commit(self.s, self.d, "corpus", detach=True)
+        self.assertTrue(popen.call_args[1]["start_new_session"])
+
+    def test_multi_config_tags_are_per_config(self):
+        self.d["items"].append({"config": "/cfg/K_y.cfg"})
+        with mock.patch.object(fc.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            fc.results_commit(self.s, self.d, "end")
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--tag-prefix") + 1], "C/K_x")
+        self.assertEqual(cmd[cmd.index("--push") + 1], "wait")

@@ -69,6 +69,8 @@ FUZZ_GROUP="${FUZZ_GROUP:-staff}"
 # quarantine or session call.
 SCRIPTS=(fuzz-campaign.py fuzz-session.py triage.py quarantine.py
          crash_fingerprint.py bug_registry.py)
+# fuzz-campaign.py runs it to commit results when the campaign sets results_repo.
+SCRIPTS+=(fuzz-results.py)
 # The shared-library package the drivers import as `from lib import ...`. It is
 # copied as a package (with __init__.py) into $DST/scripts/lib/ so the published
 # drivers resolve it the same way the dev tree does; omitting any member makes
@@ -83,6 +85,8 @@ BINS=(bin/syz-manager
       bin/darwin_arm64/syz-executor
       bin/darwin_arm64/syz-execprog
       bin/darwin_arm64/syz-ring-repro)
+# fuzz-results.py unpacks corpus.db into per-program files with syz-db.
+BINS+=(bin/syz-db)
 # Runtime state the campaign writes. config/ is here too: the quarantine rewrites
 # disable_syscalls into the live config on every decision.
 WRITABLE=(campaigns campaigns/.state campaigns/bugs sessions workdir

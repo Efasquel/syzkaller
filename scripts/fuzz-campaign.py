@@ -49,6 +49,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SESSION = SCRIPT_DIR / "fuzz-session.py"
 TRIAGE = SCRIPT_DIR / "triage.py"
+RESULTS = SCRIPT_DIR / "fuzz-results.py"
 BUG_REGISTRY = SCRIPT_DIR / "bug_registry.py"
 CAMPAIGN_DIR = REPO_ROOT / "campaigns"
 STATE_DIR = CAMPAIGN_DIR / ".state"
@@ -140,6 +141,11 @@ DEFAULTS = {
     # idle while you were asleep, and charging that would make the wall clock a
     # measure of your schedule rather than the campaign's.
     "max_boot_gap_seconds": 900.0,
+    # Clone of the results repo (fuzz-results.py). Unset: no results commits.
+    # Set: a commit before every session (re)start -- before the manager
+    # re-triages corpus.db and drops what no longer reproduces -- one per poll
+    # when the corpus or coverage moved, one per incident, and one at the end.
+    "results_repo": None,
 }
 
 BUDGET_CLOCKS = ("fuzz", "wall", "real")
@@ -610,6 +616,42 @@ def record_incident(s, d, kind, info):
 def collect_and_prune(s, d, kind):
     session("collect", s["session_id"], kind)
     prune_cores(d["keep_cores"])
+    results_commit(s, d, kind, detach=True)
+
+
+def results_commit(s, d, event, cfg=None, detach=False):
+    """Record the current config's results in the results repo (fuzz-results.py).
+
+    Best effort by construction: a results failure is logged and fuzzing goes
+    on. detach=True returns at once (polls and incidents must not stall the
+    loop); the synchronous calls are the (re)start, which must capture corpus.db
+    before the manager re-triages it, and the end, after which nothing runs."""
+    repo = (d or {}).get("results_repo")
+    cfg = cfg or s.get("current_config")
+    if not repo or not cfg:
+        return
+    prefix = s["name"] if len(d["items"]) <= 1 else "%s/%s" % (s["name"], config_id(cfg))
+    cmd = [sys.executable, str(RESULTS), "--repo", repo, "commit", cfg,
+           "--event", event, "--campaign", s["name"], "--tag-prefix", prefix,
+           "--campaign-def", str(def_path(s["name"])),
+           "--wall-seconds", str(round(lifetime_wall(s))),
+           "--push", "detach" if event in ("restart", "corpus", "crash", "hang") else "wait"]
+    if event in ("start", "restart"):
+        cmd.append("--no-freq")         # fast path: the manager is waiting on us
+    out = open(STATE_DIR / ("%s.results.log" % s["name"]), "a")
+    try:
+        if detach:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        else:
+            rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, timeout=600).returncode
+            if rc != 0:
+                log("results commit (%s) failed; see %s" % (event, out.name))
+    except (OSError, subprocess.SubprocessError) as e:
+        log("results commit (%s) failed: %s" % (event, e))
+    finally:
+        out.close()
 
 
 # --- coordinator: crash -> triage -> bench -> resume -------------------------
@@ -904,7 +946,7 @@ def advance_triage(s, d):
 
 
 # --- the loop ----------------------------------------------------------------
-def ensure_running(s, cfg):
+def ensure_running(s, cfg, d=None):
     """Make sure a live session exists for cfg; resume if a record exists.
 
     Returns the inspect dict for the (now running) session. Resets the
@@ -931,6 +973,12 @@ def ensure_running(s, cfg):
     else:
         verb = "resume" if info.get("found") else "start"
         target = sid if verb == "resume" else cfg
+        # Before the manager starts: it re-triages corpus.db and silently drops
+        # every program that no longer reproduces, which is how a whole corpus
+        # was lost once. This commit is the copy that survives that.
+        first = not s.get("results_started")
+        results_commit(s, d, "start" if first else "restart", cfg=cfg)
+        s["results_started"] = True
         rc, _ = session(verb, target, "--force")
         if rc != 0:
             # fall back to a fresh start if resume failed (e.g. no record)
@@ -1181,6 +1229,8 @@ def supervise(s, d, sid, budget):
         # handles by re-applying the config and resuming the same config.
         if quarantine_rotate_due(s):
             return "rotate"
+        # Commits only when the corpus or coverage moved (fuzz-results decides).
+        results_commit(s, d, "corpus", detach=True)
         if budget_spent(s, d) >= budget:
             return "budget"
         # breaker can trip mid-run (disk), so re-check each poll
@@ -1323,7 +1373,7 @@ def cmd_run(name):
                fmt_hms(s.get("active_seconds")), fmt_hms(s.get("triage_seconds")),
                fmt_hms(s.get("overhead_seconds"))))
         try:
-            ensure_running(s, cfg)
+            ensure_running(s, cfg, d)
         except RuntimeError as e:
             s["status"] = "halted"
             s["halt_reason"] = str(e)
@@ -1335,12 +1385,15 @@ def cmd_run(name):
 
         if outcome == "halted":
             log("HALT: %s" % s.get("halt_reason"))
+            results_commit(s, d, "halt", cfg=cfg)
             return
         if outcome == "budget":
             log("budget spent on %s; snapshot + advance" % config_id(cfg))
             session("collect", s["session_id"], "snapshot")
             session("stop", s["session_id"])
+            results_commit(s, d, "end", cfg=cfg)
             s["cursor"] += 1
+            s["results_started"] = False
             roll_budget_clocks(s)
             s["session_id"] = None
             s["last_exec_total"] = None
