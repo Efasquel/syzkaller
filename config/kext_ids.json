@@ -1,3 +1,4 @@
 {
-    "com.apple.driver.AppleT8112CLPC": 2
+    "com.apple.driver.AppleT8112CLPC": 2,
+    "com.apple.driver.AppleSMC": 2
 }
