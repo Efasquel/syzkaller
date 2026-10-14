@@ -69,6 +69,8 @@ FUZZ_GROUP="${FUZZ_GROUP:-staff}"
 # quarantine or session call.
 SCRIPTS=(fuzz-campaign.py fuzz-session.py triage.py quarantine.py
          crash_fingerprint.py bug_registry.py freq-replay.py freq-runner.sh)
+# fuzz-campaign.py runs it to commit results when the campaign sets results_repo.
+SCRIPTS+=(fuzz-results.py)
 # The shared-library package the drivers import as `from lib import ...`. It is
 # copied as a package (with __init__.py) into $DST/scripts/lib/ so the published
 # drivers resolve it the same way the dev tree does; omitting any member makes
