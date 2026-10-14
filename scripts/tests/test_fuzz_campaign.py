@@ -938,7 +938,7 @@ class HangDetectionTest(unittest.TestCase):
             return None
 
         alive = {"found": True, "pid_alive": True, "exec_total": 1,
-                 "run_started_epoch": time.time()}
+                 "run_started_epoch": time.time(), "fuzz_started_epoch": time.time()}
         with mock.patch.object(fc, "STATE_DIR", self.dir), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "save_state", lambda st: None), \
@@ -950,7 +950,10 @@ class HangDetectionTest(unittest.TestCase):
              mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             self.assertEqual(fc.supervise(s, d, "sid", budget=3600), "budget")
-        self.assertEqual(waits, [54.0])
+        # The first wait is the short startup poll (supervise has not yet seen
+        # the first exec); the deadline still lands exactly, not a poll later.
+        self.assertEqual(sum(waits), 54.0)
+        self.assertLessEqual(max(waits), 54.0)
 
     def test_a_wedged_executor_is_a_hang_regardless_of_counters(self):
         """One `syz-executor exec` per program, so one alive for minutes is a
@@ -959,6 +962,200 @@ class HangDetectionTest(unittest.TestCase):
                  "run_started_epoch": time.time()}
         self.assertEqual(self._supervise([alive], hang_after=9999, stuck=2398),
                          "hang")
+
+
+class BreakerTest(unittest.TestCase):
+    """Area 2: which limits halt the campaign and which only move it on."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _supervise(self, info, s=None):
+        s = s or fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg"})
+        d = dict(fc.DEFAULTS, poll_seconds=600, name="camp")
+        waits = []
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "wait_for_stop",
+                               lambda st, dd, sec: waits.append(sec)), \
+             mock.patch.object(fc, "inspect", lambda sid: info), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            return fc.supervise(s, d, "sid", budget=10 ** 9), waits
+
+    def test_a_manager_dead_before_its_first_exec_is_a_startup_failure(self):
+        dead = {"found": True, "pid_alive": False, "panic_evidence": False,
+                "fuzz_started_epoch": None}
+        outcome, waits = self._supervise(dead)
+        self.assertEqual(outcome, "startup")
+        # noticed at the startup poll, not after a whole 10-minute poll
+        self.assertEqual(waits, [fc.DEFAULTS["startup_poll_seconds"]])
+
+    def test_a_manager_that_fuzzed_then_died_is_still_a_hang(self):
+        dead = {"found": True, "pid_alive": False, "panic_evidence": False,
+                "fuzz_started_epoch": 123.0}
+        self.assertEqual(self._supervise(dead)[0], "hang")
+
+    def test_a_panic_before_the_first_exec_is_a_crash(self):
+        dead = {"found": True, "pid_alive": False, "panic_evidence": True,
+                "fuzz_started_epoch": None}
+        self.assertEqual(self._supervise(dead)[0], "crash")
+
+    def test_repeated_startup_failures_halt_with_the_reason(self):
+        s = fc.init_state("camp")
+        s.update({"startup_failures": 3,
+                  "last_startup_error": "[FATAL] bind: address already in use"})
+        with mock.patch.object(fc, "free_gb", lambda: 1e9):
+            why = fc.breaker(s, dict(fc.DEFAULTS))
+        self.assertIn("address already in use", why)
+
+    def test_max_crashes_counts_one_config_not_the_campaign(self):
+        s = fc.init_state("camp")
+        s.update({"crashes": 50, "config_incidents": 3})
+        d = dict(fc.DEFAULTS, max_crashes=20)
+        with mock.patch.object(fc, "free_gb", lambda: 1e9):
+            self.assertIsNone(fc.breaker(s, d))
+        self.assertIsNone(fc.config_breaker(s, d))
+        s["config_incidents"] = 20
+        self.assertIn("max_crashes", fc.config_breaker(s, d))
+
+    def test_advancing_resets_the_config_counters(self):
+        s = fc.init_state("camp")
+        s.update({"config_incidents": 20, "consec_fast_crashes": 4,
+                  "startup_failures": 2, "crashes": 20})
+        fc.advance_config(s)
+        self.assertEqual((s["cursor"], s["config_incidents"], s["consec_fast_crashes"],
+                          s["startup_failures"]), (1, 0, 0, 0))
+        self.assertEqual(s["crashes"], 20)          # lifetime total kept
+
+    def _run(self, s, items, loop=False):
+        d = dict(fc.DEFAULTS, loop=loop, name="camp",
+                 items=[{"config": c, "budget_seconds": 3600} for c in items])
+        started = []
+
+        def fake_ensure(st, cfg, dd=None):
+            started.append(cfg)
+            st["status"] = "halted"           # stop after one start
+            raise RuntimeError("stop here")
+
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "ensure_running", fake_ensure):
+            fc.cmd_run("camp")
+        return started
+
+    def test_a_config_over_max_crashes_is_abandoned_and_the_next_runs(self):
+        s = fc.init_state("camp")
+        s["config_incidents"] = fc.DEFAULTS["max_crashes"]
+        started = self._run(s, ["/a.cfg", "/b.cfg"])
+        self.assertEqual(started, ["/b.cfg"])
+        self.assertEqual([a["config"] for a in s["abandoned"]], ["/a.cfg"])
+
+    def test_a_loop_skips_abandoned_configs(self):
+        s = fc.init_state("camp")
+        s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"], loop=True), ["/b.cfg"])
+
+    def test_nothing_left_to_run_halts(self):
+        s = fc.init_state("camp")
+        s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
+        self.assertEqual(self._run(s, ["/a.cfg"], loop=True), [])
+        self.assertEqual(s["status"], "halted")
+        self.assertIn("abandoned", s["halt_reason"])
+
+    def test_startup_failures_are_collected_and_halt_at_the_limit(self):
+        log = self.dir / "run-20261009-093353.log"
+        log.write_text("2026/10/09 09:33:55 serving rpc on tcp://49209\n"
+                       "2026/10/09 09:33:55 [FATAL] failed to serve HTTP: listen tcp "
+                       "127.0.0.1:56741: bind: address already in use\n")
+        s = fc.init_state("camp")
+        d = dict(fc.DEFAULTS, name="camp",
+                 items=[{"config": "/a.cfg", "budget_seconds": 3600}])
+        dead = {"found": True, "pid_alive": False, "run_log": str(log),
+                "run_started_epoch": 100.0, "last_activity_epoch": 102.0,
+                "boot_epoch": 1}
+        collected, retries = [], []
+
+        def fake_ensure(st, cfg, dd=None):
+            st.update({"session_id": "a", "current_config": cfg,
+                       "run_prep_started": 99.0})
+
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "free_gb", lambda: 1e9), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "ensure_running", fake_ensure), \
+             mock.patch.object(fc, "supervise", lambda *a: "startup"), \
+             mock.patch.object(fc, "inspect", lambda sid: dead), \
+             mock.patch.object(fc, "wait_for_stop",
+                               lambda st, dd, sec: retries.append(sec)), \
+             mock.patch.object(fc, "session",
+                               lambda *a, **k: collected.append(a) or (0, "")):
+            fc.cmd_run("camp")
+        self.assertEqual(s["status"], "halted")
+        self.assertIn("address already in use", s["halt_reason"])
+        self.assertEqual(collected.count(("collect", "a", "startup")), 3)
+        self.assertEqual(len(retries), 2)               # no pause after the last
+        self.assertEqual(s["hangs"], 0)                 # not filed as hangs
+        self.assertEqual([i["kind"] for i in s["incidents"]], ["startup"] * 3)
+
+    def _crash(self, s, execs, run_s=123.0, fuzz_s=3.0):
+        t = 10_000.0
+        fc.record_incident(s, dict(fc.DEFAULTS), "crash",
+                           {"run_started_epoch": t, "fuzz_started_epoch": t + run_s - fuzz_s,
+                            "last_activity_epoch": t + run_s, "boot_epoch": 1,
+                            "exec_total": execs, "panic_evidence": True})
+
+    def test_a_crash_after_a_long_compile_is_still_fast(self):
+        """Two minutes of grammar compile, then a panic before anything ran:
+        measured over the manager's life it read 123s and was never fast."""
+        s = fc.init_state("camp")
+        s["current_config"] = "/x.cfg"
+        self._crash(s, execs=12)
+        self.assertEqual(s["consec_fast_crashes"], 1)
+        self.assertEqual(s["incidents"][-1]["fuzzed_seconds"], 3)
+        self.assertEqual(s["config_incidents"], 1)
+
+    def test_a_quick_real_bug_is_not_a_crash_loop(self):
+        """The time window's false positive: a healthy run that panics 15s into
+        fuzzing has executed hundreds of programs. It is a bug, not a loop."""
+        s = fc.init_state("camp")
+        s["current_config"] = "/x.cfg"
+        s["consec_fast_crashes"] = 14
+        self._crash(s, execs=650, run_s=45.0, fuzz_s=15.0)
+        self.assertEqual(s["consec_fast_crashes"], 0)
+
+    def test_no_stat_line_at_all_counts_as_fast(self):
+        s = fc.init_state("camp")
+        s["current_config"] = "/x.cfg"
+        self._crash(s, execs=None)
+        self.assertEqual(s["consec_fast_crashes"], 1)
+
+    def test_fifteen_fast_crashes_halt(self):
+        s = fc.init_state("camp")
+        s["current_config"] = "/x.cfg"
+        for _ in range(fc.DEFAULTS["crashloop_limit"]):
+            self._crash(s, execs=0)
+        with mock.patch.object(fc, "free_gb", lambda: 1e9):
+            self.assertIn("crash loop", fc.breaker(s, dict(fc.DEFAULTS)))
 
 
 class EtimeTest(unittest.TestCase):

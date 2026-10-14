@@ -92,17 +92,34 @@ DEFAULTS = {
     "loop": False,
     "poll_seconds": 600,        # how often to check exec total (10 min)
     "hang_after_seconds": 1800,  # frozen this long with manager alive => hang
-    "max_crashes": 20,          # total incidents before the breaker halts
+    # Incidents (crash + hang) on ONE config before that config is abandoned and
+    # the campaign moves to the next. It used to count the whole campaign and
+    # halt it, so a crash-heavy first config starved every config after it.
+    "max_crashes": 20,
     "min_free_gb": 20.0,        # halt if root disk drops below this
     "keep_cores": 3,            # cores retained after pruning
     # The crash-loop breaker exists to catch a PATHOLOGICAL loop -- a config that
     # cannot fuzz at all (manager dies on startup, corpus poisoned so the very
     # first program re-panics) -- not productive fuzzing. On this target a healthy
     # run panics the box every 30-110s, so the old 120s/5 pairing halted a working
-    # campaign within ten minutes of its first real bug. 20s is below anything that
-    # managed to execute programs; a startup failure dies in about a second.
-    "crashloop_window_seconds": 20,   # a run shorter than this never fuzzed anything
+    # campaign within ten minutes of its first real bug.
+    #
+    # "Never fuzzed anything" is measured as programs executed, not seconds. A
+    # time window was tried: both of its ends come from the manager's stat line,
+    # written every 10s, so the error (up to 20s) was as large as the window, and
+    # a healthy run with a quick real bug read as "fast". At 40-50 execs/s, five
+    # seconds of real fuzzing is far past 200; a poisoned corpus panics at 0-30.
+    # The count can be up to 10s stale, which only ever undercounts.
+    "crashloop_min_execs": 200,   # a crash before this many programs is "fast"
     "crashloop_limit": 15,      # this many consecutive such crashes => halt
+    # A manager that dies before executing a single program, with no panic --
+    # a held port, a bad config, a missing binary. Not a crash and not a hang:
+    # it used to be filed as a "hang" one poll (10 min) later and retried
+    # forever; one campaign did that 19 times. Watched closely until the first
+    # exec, halted after this many in a row.
+    "startup_fail_limit": 3,
+    "startup_poll_seconds": 15,     # poll this often until the first exec
+    "startup_retry_seconds": 30,    # pause before retrying a failed start
     "triage_max_boots": 40,     # give up (halt) if triage can't reach a culprit in this many advances
     # Pause before re-running a triage advance that returned without finishing.
     # A probe that reproduces reboots the box, so an advance only returns early
@@ -517,6 +534,9 @@ def init_state(name):
         "session_id": None, "current_config": None,
         "run_started": None, "last_exec_total": None,
         "crashes": 0, "hangs": 0, "consec_fast_crashes": 0,
+        # Per-config counters, reset when the campaign moves to the next config.
+        "config_incidents": 0, "startup_failures": 0,
+        "abandoned": [],            # configs max_crashes gave up on
         "incidents": [], "started_at": now_iso(), "updated_at": now_iso(),
         "halt_reason": None,
         # coordinator: fuzzing <-> triaging. On a new crash the campaign hands
@@ -610,6 +630,7 @@ COORDINATOR_DEFAULTS = {
     "total_active_seconds": 0.0, "total_triage_seconds": 0.0,
     "total_overhead_seconds": 0.0,
     "prep_seconds": 0.0, "total_prep_seconds": 0.0,
+    "config_incidents": 0, "startup_failures": 0, "abandoned": [],
 }
 
 
@@ -629,17 +650,58 @@ def free_gb():
 
 
 def breaker(s, d):
-    """Reason to halt the campaign, or None."""
-    total = s["crashes"] + s["hangs"]
-    if total >= d["max_crashes"]:
-        return "reached max_crashes (%d incidents)" % total
+    """Reason to halt the campaign, or None. Config-level limits are in
+    config_breaker: they move on to the next config instead."""
     fg = free_gb()
     if fg < d["min_free_gb"]:
         return "low disk (%.1fGB free < %.1fGB)" % (fg, d["min_free_gb"])
     if s["consec_fast_crashes"] >= d["crashloop_limit"]:
-        return ("crash loop (%d crashes under %ds of runtime)"
-                % (s["consec_fast_crashes"], d["crashloop_window_seconds"]))
+        return ("crash loop (%d crashes in a row before %d programs executed)"
+                % (s["consec_fast_crashes"], d["crashloop_min_execs"]))
+    limit = d.get("startup_fail_limit", DEFAULTS["startup_fail_limit"])
+    if s.get("startup_failures", 0) >= limit:
+        return ("syz-manager failed to start %d times in a row (died before "
+                "executing anything); last log line: %s"
+                % (s["startup_failures"], s.get("last_startup_error") or "?"))
     return None
+
+
+def config_breaker(s, d):
+    """Reason to abandon the current config and move on, or None."""
+    n = s.get("config_incidents", 0)
+    if n >= d["max_crashes"]:
+        return "reached max_crashes (%d incidents on this config)" % n
+    return None
+
+
+def reset_config_counters(s):
+    """Zero what is counted per config. Lifetime totals are left alone."""
+    s["config_incidents"] = 0
+    s["consec_fast_crashes"] = 0
+    s["startup_failures"] = 0
+
+
+def advance_config(s):
+    """Leave the current config: bank its clocks, reset its counters."""
+    s["cursor"] += 1
+    s["results_started"] = False
+    roll_budget_clocks(s)
+    s["session_id"] = None
+    s["last_exec_total"] = None
+    reset_config_counters(s)
+
+
+def run_log_tail(info):
+    """The last meaningful line of the run's manager log ('' if none) -- for a
+    manager that died at startup, that is the reason."""
+    p = info.get("run_log")
+    try:
+        lines = [ln.strip() for ln in Path(p).read_text(errors="replace").splitlines()
+                 if ln.strip()] if p else []
+    except OSError:
+        return ""
+    fatal = [ln for ln in lines if "FATAL" in ln or "SYZFAIL" in ln]
+    return (fatal or lines or [""])[-1][:300]
 
 
 def prune_cores(keep):
@@ -679,9 +741,17 @@ def record_incident(s, d, kind, info, end=None):
     ran_for = close_run(s, info, end)
     if ran_for is None and started:
         ran_for = max(0.0, end - started)
-    fast = (kind == "crash" and ran_for is not None
-            and ran_for < d["crashloop_window_seconds"])
+    # "Fast" means the run executed almost nothing before the panic (see
+    # crashloop_min_execs): independent of how long startup took, and of the
+    # 10s granularity of the stat line. No stat line at all reads as zero.
+    fuzz_from = info.get("fuzz_started_epoch")
+    fuzzed = max(0.0, end - fuzz_from) if fuzz_from and fuzz_from <= end else 0.0
+    execs = info.get("exec_total") or 0
+    fast = kind == "crash" and execs < d["crashloop_min_execs"]
     s["consec_fast_crashes"] = s["consec_fast_crashes"] + 1 if fast else 0
+    if fuzz_from:
+        s["startup_failures"] = 0          # this run did start
+    s["config_incidents"] = s.get("config_incidents", 0) + 1
     if kind == "crash":
         s["crashes"] += 1
     else:
@@ -689,6 +759,7 @@ def record_incident(s, d, kind, info, end=None):
     s["incidents"].append({
         "config": s["current_config"], "kind": kind, "at": now_iso(),
         "ran_seconds": round(ran_for) if ran_for else None,
+        "fuzzed_seconds": round(fuzzed),
         "exec_total": info.get("exec_total"),
         "panic_evidence": info.get("panic_evidence"),
     })
@@ -1343,6 +1414,7 @@ def supervise(s, d, sid, budget):
     """
     poll = d["poll_seconds"]
     hang_after = d["hang_after_seconds"]
+    fuzzing = False
     last_et = s.get("last_exec_total")
     last_progress = time.time()
     while True:
@@ -1358,7 +1430,11 @@ def supervise(s, d, sid, budget):
         # supervision started, not from the deadline, so a check that lands just
         # short of it used to buy a whole extra poll: a 1h campaign checked at
         # 59m06s and ran to 1h09m.
-        stop = wait_for_stop(s, d, min(poll, max(1, budget - budget_spent(s, d))))
+        # Until the first exec, a manager that dies is a startup failure, and
+        # it should be noticed in seconds, not at the next 10-minute poll.
+        step = poll if fuzzing else min(poll, d.get("startup_poll_seconds",
+                                                    DEFAULTS["startup_poll_seconds"]))
+        stop = wait_for_stop(s, d, min(step, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
             log("campaign halted by user")
             session("stop", sid)
@@ -1372,7 +1448,12 @@ def supervise(s, d, sid, budget):
         info = inspect(sid)
         now = time.time()
         if not info.get("found") or not info.get("pid_alive"):
-            return "crash" if info.get("panic_evidence") else "hang"
+            if info.get("panic_evidence"):
+                return "crash"
+            return "hang" if info.get("fuzz_started_epoch") else "startup"
+        if info.get("fuzz_started_epoch") and not fuzzing:
+            fuzzing = True
+            s["startup_failures"] = 0
         account_run(s, info, now)
         et = info.get("exec_total")
         if et is not None and et != last_et:
@@ -1457,7 +1538,7 @@ def cmd_run(name):
             "in %s)" % (d["max_log_mb"], coord_path))
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
-        s.setdefault(k, v)
+        s.setdefault(k, list(v) if isinstance(v, list) else v)   # never share a default list
     if s["status"] in ("done", "halted"):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
@@ -1532,6 +1613,7 @@ def cmd_run(name):
                 log("loop: wrapping cursor to 0")
                 s["cursor"] = 0
                 roll_budget_clocks(s)
+                reset_config_counters(s)
             else:
                 s["status"] = "done"
                 save_state(s)
@@ -1544,6 +1626,29 @@ def cmd_run(name):
                 return
         item = d["items"][s["cursor"]]
         cfg, budget = item["config"], item["budget_seconds"]
+        # A config max_crashes gave up on stays given up for this campaign: a
+        # looping campaign skips it, and one with nothing left to run halts.
+        gone = {a["config"] for a in s.get("abandoned", [])}
+        if cfg in gone:
+            if all(it["config"] in gone for it in d["items"]):
+                s["status"] = "halted"
+                s["halt_reason"] = "every config was abandoned (max_crashes)"
+                save_state(s)
+                log("HALT: %s" % s["halt_reason"])
+                return
+            log("skipping %s: abandoned earlier" % config_id(cfg))
+            advance_config(s)
+            save_state(s)
+            continue
+        why = config_breaker(s, d)
+        if why:
+            log("ABANDON %s: %s; moving to the next config" % (config_id(cfg), why))
+            s.setdefault("abandoned", []).append(
+                {"config": cfg, "reason": why, "at": now_iso()})
+            results_commit(s, d, "end", cfg=cfg)
+            advance_config(s)
+            save_state(s)
+            continue
         # Stamp the real clock's origin once per config. Guarded on absence, not
         # overwritten: every panic-reboot relaunches this loop, and re-stamping
         # would restart the window on each crash.
@@ -1580,13 +1685,31 @@ def cmd_run(name):
             session("collect", s["session_id"], "snapshot")
             session("stop", s["session_id"])
             results_commit(s, d, "end", cfg=cfg)
-            s["cursor"] += 1
-            s["results_started"] = False
-            roll_budget_clocks(s)
-            s["session_id"] = None
-            s["last_exec_total"] = None
+            advance_config(s)
             save_state(s)
             continue
+        if outcome == "startup":
+            info = inspect(s["session_id"])
+            end = run_end_epoch(info)
+            started = info.get("run_started_epoch")
+            close_run(s, info, end)
+            s["startup_failures"] = s.get("startup_failures", 0) + 1
+            why = run_log_tail(info)
+            s["last_startup_error"] = why
+            s["incidents"].append({
+                "config": cfg, "kind": "startup", "at": now_iso(),
+                "ran_seconds": round(end - started) if started else None,
+                "exec_total": None, "panic_evidence": False, "log_tail": why})
+            limit = d.get("startup_fail_limit", DEFAULTS["startup_fail_limit"])
+            log("startup failure %d/%d on %s: syz-manager died before executing "
+                "anything -- %s" % (s["startup_failures"], limit, config_id(cfg),
+                                    why or "(empty run log)"))
+            session("collect", s["session_id"], "startup")
+            save_state(s)
+            if s["startup_failures"] < limit:
+                wait_for_stop(s, d, d.get("startup_retry_seconds",
+                                          DEFAULTS["startup_retry_seconds"]))
+            continue                     # the breaker halts at the limit
         if outcome == "rotate":
             # A SOFT group rotated: stop and resume the SAME config (budget kept);
             # ensure_running re-applies the now-rotated disabled set on resume.
@@ -1854,8 +1977,17 @@ def status_lines(name, prev=None):
         _delta(execs, prev.get("execs"), "%+,d".replace(",", "")))
     if cov not in (None, ""):
         row("coverage", "%s basic block(s)" % cov, _delta(_int(cov), prev.get("cov")))
-    row("incidents", "%d crash / %d hang" % (s["crashes"], s["hangs"]),
+    row("incidents", "%d crash / %d hang  (this config: %d of max_crashes %d)"
+        % (s["crashes"], s["hangs"], s.get("config_incidents", 0), d["max_crashes"]),
         _delta(s["crashes"], prev.get("crashes")))
+    if s.get("startup_failures"):
+        row("startup", "%d failed start(s) in a row (halts at %d): %s"
+            % (s["startup_failures"], d.get("startup_fail_limit",
+                                            DEFAULTS["startup_fail_limit"]),
+               s.get("last_startup_error") or "?"))
+    for a in s.get("abandoned", []):
+        row("abandoned", "%s  (%s, %s)" % (config_id(a["config"]), a.get("reason"),
+                                           timefmt.fmt(a.get("at"), short=True)))
     row("phase", s.get("phase", "fuzzing"))
     if s.get("phase") == "triaging":
         row("triaging", "job %s, bug %s (advance %d/%d)"
@@ -2211,6 +2343,7 @@ def _set_status(name, status):
     if status == "running":
         s["halt_reason"] = None
         s["consec_fast_crashes"] = 0
+        s["startup_failures"] = 0
     save_state(s)
     log("campaign %r -> %s" % (name, status))
 
@@ -3231,9 +3364,9 @@ def main():
     sp.add_argument("--crashloop-limit", type=int,
                     help="consecutive fast crashes before halting (default %d)"
                          % DEFAULTS["crashloop_limit"])
-    sp.add_argument("--crashloop-window-seconds", type=int,
-                    help="a run shorter than this counts as a fast crash (default %d)"
-                         % DEFAULTS["crashloop_window_seconds"])
+    sp.add_argument("--crashloop-min-execs", type=int,
+                    help="a crash before this many programs executed counts as "
+                         "fast (default %d)" % DEFAULTS["crashloop_min_execs"])
     sp.add_argument("--triage-max-boots", type=int,
                     help="advances before giving up on a triage (default %d)"
                          % DEFAULTS["triage_max_boots"])
@@ -3334,7 +3467,7 @@ def main():
                  "kcov_device": args.kcov_device, "kext_id": args.kext_id,
                  "sandbox": args.sandbox, "max_k": args.max_k},
                 {"crashloop_limit": args.crashloop_limit,
-                 "crashloop_window_seconds": args.crashloop_window_seconds,
+                 "crashloop_min_execs": args.crashloop_min_execs,
                  "triage_max_boots": args.triage_max_boots,
                  "budget_clock": args.budget_clock})
     elif args.cmd == "stop":

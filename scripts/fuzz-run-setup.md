@@ -287,14 +287,30 @@ and letting the next start silently re-halt it.
 
 ### What the breaker will do
 
-The campaign **halts itself** on any of: `max_crashes` total incidents (default 20),
-free disk under `min_free_gb` (20), `crashloop_limit` consecutive crashes that
-never fuzzed anything (15 runs shorter than `crashloop_window_seconds`, 20s), or
-triage failing to reach a culprit in `triage_max_boots` advances (40). The window
-is deliberately below anything that managed to execute programs: a healthy run on
-this target panics every 30-110s, and the old 120s/5 pairing halted a working
-campaign within ten minutes of its first real bug. A halt is a safe stop, not a failure — `resume` clears it. For a multi-day
-unattended run, raise `max_crashes` in `campaigns/jpeg.json`.
+The campaign **halts itself** on any of: free disk under `min_free_gb` (20),
+`crashloop_limit` consecutive kernel panics that hit before the run fuzzed
+anything (15 in a row, each before `crashloop_min_execs`, 200, programs ran),
+`startup_fail_limit` managers in a row that died before executing a single
+program (3), or triage failing to reach a culprit in `triage_max_boots` advances
+(40). "Fuzzed anything" is counted in programs, not seconds: a poisoned corpus
+panics at 0-30 execs, while even five seconds of real fuzzing is over 200 at
+40-50 execs/s. A time window was tried and could not tell them apart -- the
+manager's stat line comes every 10s, so its error was as large as the window,
+and a healthy run with a quick real bug read as a crash loop. Only fuzzing runs
+count: panics caused on purpose during minimization never do. A halt is a safe stop, not a
+failure — `resume` clears it.
+
+`max_crashes` (20) is **per config** and does not halt: a config that reaches
+it is **abandoned** — recorded in `status`, skipped if the campaign loops — and
+the campaign moves on to the next one. Only when every config is abandoned does
+it halt. For a multi-day unattended run on a crash-heavy driver, raise
+`max_crashes` in the campaign definition.
+
+A manager that dies before its first exec without a panic (a held http port, a
+bad config, a missing binary) is a **startup failure**: noticed within
+`startup_poll_seconds` (15s), collected under `artifacts/startup-failures/`,
+retried after 30s, and the third in a row halts with the run log's last
+`FATAL` line as the reason.
 
 ### A config **is** a workdir
 

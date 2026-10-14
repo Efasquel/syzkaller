@@ -117,6 +117,11 @@ before any session starts. Anything written into it becomes the halt reason.
   `sys/darwin/*.txt` has uncommitted changes, the descriptions hash moves too.
 - **Budget seems not to advance** — the per-config clock resets on a config
   advance by design; the lifetime totals in `status` are the ones that never do.
+- **A config was skipped** — `status` lists it under `abandoned`: it reached
+  `max_crashes` incidents (per config) and the campaign moved on.
+- **Halted with "failed to start N times"** — the manager died before its first
+  exec; the reason quotes the run log. Look in
+  `<workdir>/artifacts/startup-failures/`. A held http port is the usual cause.
 
 ## Sequence for a fresh run
 

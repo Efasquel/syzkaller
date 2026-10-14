@@ -108,7 +108,11 @@ ARTIFACTS_SUBDIR = "artifacts"
 # One folder per kind, one dated dir per incident inside it. These live under
 # <workdir>/artifacts/ rather than <workdir>/crashes/, which is syzkaller's own
 # (it writes crashes/<hash>/ there) -- we must not mix our bundles into it.
-INCIDENT_DIRS = {"crash": "crashes", "hang": "hangs", "snapshot": "snapshots"}
+# "startup" is a manager that died before executing anything: no repro material,
+# but its run log is the only record of why, and collecting it is what keeps the
+# next boot from mistaking that run for an uncollected crash.
+INCIDENT_DIRS = {"crash": "crashes", "hang": "hangs", "startup": "startup-failures",
+                 "snapshot": "snapshots"}
 EVENT_KINDS = tuple(INCIDENT_DIRS)
 STOP_TIMEOUT = 30       # seconds to wait for a graceful (SIGINT) shutdown
 # Seconds to wait for the manager to log its rpc port. Generous on purpose: the
@@ -805,6 +809,7 @@ def cmd_inspect(target):
         # For the campaign clocks: preparation ends at the first exec, and a dead
         # run ended at its last sign of life, not when it was found.
         "fuzz_started_epoch": run_fuzz_start_epoch(latest_run_log(workdir)),
+        "run_log": str(latest_run_log(workdir) or "") or None,
         "last_activity_epoch": run_last_activity_epoch(latest_run_log(workdir),
                                                        cover_log_path(state)),
         "boot_epoch": boot_epoch(),
