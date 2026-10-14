@@ -80,10 +80,13 @@ tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 means nothing moved, which is the signal you are watching for — an absolute
 counter looks identical whether the box is fuzzing hard or wedged.
 
-Three clocks are reported separately: **fuzzing** (manager executing),
-**minimizing** (triage), **rebooting**. `--budget-clock` picks which one
-`--budget-hours` measures; the default `fuzz` means minimizing a bug never eats
-the fuzzing budget. Never quote wall time as fuzzing time.
+Four clocks are reported separately: **preparing** (snapshot, grammar compile,
+until the first exec), **fuzzing** (first exec to the run's last sign of life),
+**minimizing** (triage), **rebooting** (panic to back up, and dead time).
+`--budget-clock` picks what `--budget-hours` measures: the default `wall` charges
+all four, `fuzz` only fuzzing (so neither startup nor minimizing a bug eats the
+budget), `real` the elapsed time since the config started. Never quote wall time
+as fuzzing time.
 
 ## Stopping a box that will not stay up
 

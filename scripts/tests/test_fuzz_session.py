@@ -332,5 +332,52 @@ class DiagnoseHangTest(unittest.TestCase):
         self.assertTrue(any("IOAVB" in f for f in res[0][2]))
 
 
+class RunTimelineTest(unittest.TestCase):
+    """The two instants the campaign clocks are cut at: the first executed
+    program (end of preparation) and the run's last sign of life."""
+
+    LOG = ("2026/10/12 14:00:40 serving rpc on tcp://49246\n"
+           "2026/10/12 14:00:40 no VMs started (type=none)\n"
+           "2026/10/12 14:00:41 candidates=0 corpus=0 coverage=0 exec total=0 (0/sec)\n"
+           "2026/10/12 14:00:50 candidates=0 corpus=0 coverage=0 exec total=456 (41/sec)\n"
+           "2026/10/12 14:01:00 candidates=0 corpus=0 coverage=0 exec total=1064 (50/sec)\n"
+           "SYZ-EXECUTOR: PREEMPTED (errno 4)\n")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.log = self.dir / "run-20261012-140038.log"
+        self.log.write_text(self.LOG)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _epoch(self, hms):
+        from datetime import datetime
+        return datetime.strptime("20261012" + hms, "%Y%m%d%H%M%S").timestamp()
+
+    def test_fuzzing_starts_at_the_first_nonzero_exec_total(self):
+        self.assertEqual(fs.run_fuzz_start_epoch(self.log), self._epoch("140050"))
+
+    def test_a_run_that_never_executed_has_no_fuzz_start(self):
+        self.log.write_text(self.LOG.split("2026/10/12 14:00:50")[0])
+        self.assertIsNone(fs.run_fuzz_start_epoch(self.log))
+
+    def test_last_activity_is_the_newest_timestamped_line(self):
+        """The trailing executor line has no timestamp and is skipped."""
+        self.assertEqual(fs.run_last_activity_epoch(self.log), self._epoch("140100"))
+
+    def test_a_newer_cover_log_extends_the_run(self):
+        cover = self.dir / "cover.log"
+        cover.write_text("0x1\n")
+        later = self._epoch("140105")
+        os.utime(cover, (later, later))
+        self.assertEqual(fs.run_last_activity_epoch(self.log, cover), later)
+
+    def test_missing_log_is_none(self):
+        self.assertIsNone(fs.run_fuzz_start_epoch(self.dir / "nope.log"))
+        self.assertIsNone(fs.run_last_activity_epoch(self.dir / "nope.log"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

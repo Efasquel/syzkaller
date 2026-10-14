@@ -364,31 +364,47 @@ reinterpreted — it simply now *displays* as the hour it actually happened.
 
 ### Reading the clocks
 
-`status` reports three disjoint clocks plus their sum:
+`status` reports four disjoint clocks plus their sum, for the whole campaign:
 
 ```
-fuzzing     : 4h12m  (manager executing)
-minimizing  : 0h51m  (triage)
-rebooting   : 0h23m  (panic -> back up)
-wall        : 5h26m  (sum of the three)
+  time, whole campaign:
+    preparing   : 0h06m  (snapshot, grammar compile, until the first exec)
+    fuzzing     : 4h12m  (first exec -> end of run; see runstats.py for execution time)
+    minimizing  : 0h51m  (triage)
+    rebooting   : 0h23m  (panic -> back up, and dead time)
+    wall        : 5h32m  (sum of the four)
 ```
 
-`--budget-hours` measures **wall** by default: session uptime plus minimization
-plus reboot overhead. That is "give this config 24 hours of machine time", which
-is what comparing one configuration against another needs. `--budget-clock fuzz`
-charges session uptime only, so a stubborn bug's minimization cannot eat the
-budget — useful when you care about fuzzing throughput rather than a fixed
-envelope. `wall >= fuzz` always, so the default can only end a campaign sooner.
+A run's **preparing** stretch is everything from the coordinator opening it
+(snapshot, results commit, manager launch, grammar compile, executor handshake)
+to the first stat line with `exec total > 0`. **fuzzing** runs from there to the
+run's last sign of life — the newest run-log line or cover-log write — not to
+the moment the death was noticed. That matters on this target: nearly every
+crash is noticed on the next boot, and measuring to then charged the reboot as
+fuzzing. A triage advance cut short by its own crashing probe is split the same
+way: minimizing up to the last probe, rebooting after it.
 
-> **`fuzzing` in `status` is session uptime, not time executing programs.** The
-> manager also starts up, triages the corpus and waits on RPC; on a measured run
-> only **56%** of uptime was execution (18.9 h alive → 10.7 h executing). For the
-> real figure, `runstats.py show <run>` reads syz-manager's own counter and
-> prints an `efficiency` line. Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
+`--budget-hours` measures **wall** by default: preparing plus fuzzing plus
+minimization plus reboot overhead. That is "give this config 24 hours of machine
+time", which is what comparing one configuration against another needs.
+`--budget-clock fuzz` charges the fuzzing line only, so neither startup nor a
+stubborn bug's minimization can eat the budget. `--budget-clock real` is elapsed
+time since the config started, startup included: ask for 1h and it stops 1h
+later. `wall >= fuzz` always, so the default can only end a campaign sooner.
+
+> **`fuzzing` in `status` is still not time executing programs.** The manager
+> also re-triages its corpus and waits on RPC; on a measured run only **56%** of
+> uptime was execution (18.9 h alive → 10.7 h executing). For the real figure,
+> `runstats.py show <run>` reads syz-manager's own counter and prints an
+> `efficiency` line.
+
+Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
 say "24h fuzzing, 31h wall, of which 4h minimization" rather than picking one
 number and hiding the rest. Nothing accrues while the campaign is halted or idle,
-and a reboot gap longer than `max_boot_gap_seconds` (15 min) is treated as idle
-rather than overhead — otherwise the wall clock would measure your sleep schedule.
+and a reboot gap is charged at most `max_boot_gap_seconds` (15 min), of which at
+most `max_relaunch_seconds` (5 min) for boot-to-relaunch; the rest is treated as
+idle rather than overhead — otherwise the wall clock would measure your sleep
+schedule.
 
 ### When triage gets STUCK
 

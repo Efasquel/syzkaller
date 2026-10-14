@@ -363,7 +363,8 @@ def campaign_for(config_id):
 
 
 def _lifetime(st, key):
-    total = {"active_seconds": "total_active_seconds",
+    total = {"prep_seconds": "total_prep_seconds",
+             "active_seconds": "total_active_seconds",
              "triage_seconds": "total_triage_seconds",
              "overhead_seconds": "total_overhead_seconds"}[key]
     return (st.get(total, 0.0) or 0.0) + (st.get(key, 0.0) or 0.0)
@@ -508,12 +509,14 @@ def collect(workdir, campaign=None):
 
     if camp:
         rec["campaign"] = camp.get("name")
+        rec["prep_s"] = _lifetime(camp, "prep_seconds")
         rec["campaign_fuzz_s"] = _lifetime(camp, "active_seconds")
         rec["minimize_s"] = _lifetime(camp, "triage_seconds")
         rec["reboot_s"] = _lifetime(camp, "overhead_seconds")
     else:
         rec["campaign"] = None
         rec["campaign_fuzz_s"] = rec["minimize_s"] = rec["reboot_s"] = None
+        rec["prep_s"] = None
 
     # --- rates, all per FUZZING hour, never per wall hour ---
     h = fuzz_s / 3600.0
@@ -640,8 +643,9 @@ def cmd_show(args):
               % (100.0 * r["fuzz_seconds"] / r["uptime_seconds"]))
     if r["campaign"]:
         print("  campaign   : %s" % r["campaign"])
-        print("    alive    : %s h  (the campaign's budget clock -- session "
-              "uptime, NOT fuzzing)" % _h(r["campaign_fuzz_s"]))
+        print("    preparing: %s h  (startup, until the first exec)" % _h(r.get("prep_s")))
+        print("    fuzzing  : %s h  (the campaign's fuzz clock -- first exec to end "
+              "of run, NOT pure execution)" % _h(r["campaign_fuzz_s"]))
         print("    minimize : %s h  (%s of effort)"
               % (_h(r["minimize_s"]),
                  "-" if r["minimize_ratio"] is None else "%.0f%%" % (100 * r["minimize_ratio"])))
@@ -764,7 +768,7 @@ CSV_FIELDS = ("run", "driver", "date", "cov", "grammar", "mods", "segments",
               "fuzz_seconds", "uptime_seconds", "execs", "exec_rate", "blocks",
               "blocks_coverlog", "blocks_per_h", "corpus_progs", "bugs",
               "bugs_verified", "bug_ids", "ttfb_fuzz_seconds", "bugs_per_h",
-              "campaign", "campaign_fuzz_s", "minimize_s", "reboot_s",
+              "campaign", "prep_s", "campaign_fuzz_s", "minimize_s", "reboot_s",
               "minimize_ratio", "enabled", "disabled", "benched",
               "grammar_fp", "grammar_versions")
 

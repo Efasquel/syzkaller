@@ -39,6 +39,7 @@ Pure helpers, no CLI, no repo-root anchoring — imported as `from lib import X`
 
 | module | what it provides |
 |--------|------------------|
+| `bootinfo.py` | `boot_epoch()` (kern.boottime): tells a pre-reboot pid from a live one, and splits a campaign's lost time at the reboot. |
 | `cfgutil.py` | Parse a manager config exactly as syz-manager parses it (whole-line `#` comments and nothing else). |
 | `timefmt.py` | One clock for every tool: stored timestamps with a real UTC offset, local display, tolerant parsing, `now_ts()` directory stamps. |
 | `fsutil.py` | `hardlink_or_copy` (share evidence across consumers without duplicating blocks) and a link-count refcount. |

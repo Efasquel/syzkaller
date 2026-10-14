@@ -30,13 +30,15 @@ of every script and library in this directory, see [docs/OVERVIEW.md](docs/OVERV
 
    | `--budget-clock` | charges | use when |
    |---|---|---|
-   | `real` | elapsed time, including halts, reboots and downtime | you want a window — start at 2pm, stopped by 4pm |
-   | `wall` (default) | fuzzing + minimization + reboot overhead | you want N hours of *machine time* per config |
-   | `fuzz` | session uptime only | you want N hours of *fuzzing*, however long triage takes |
+   | `real` | elapsed time, including startup, halts, reboots and downtime | you want a window — start at 2pm, stopped by 4pm |
+   | `wall` (default) | startup + fuzzing + minimization + reboot overhead | you want N hours of *machine time* per config |
+   | `fuzz` | from each run's first executed program to its end | you want N hours of *fuzzing*, however long startup or triage takes |
 
    `real` is the only one that keeps running while the campaign does not, so it
    is the only one that can express a deadline. Note it charges downtime: if a
-   panic-reboot takes 20 minutes, that is 20 minutes of the window.
+   panic-reboot takes 20 minutes, that is 20 minutes of the window. It also
+   charges startup: a 1h config stops 1h after it started, however long the
+   grammar compile took. `status` shows that startup on its own `preparing` line.
 
 2. Publish the runtime tree. The build tree is `0700`, so the `fuzz` user cannot
    read it; this copies the scripts, binaries and configs into

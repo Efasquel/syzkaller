@@ -211,13 +211,20 @@ class CoordinatorTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update({"current_config": str(cfg), "run_active_base": 0.0})
         d = dict(fc.DEFAULTS)
+        now = time.time()
+        s["run_prep_started"] = now - 45
         fc.record_incident(s, d, "crash",
-                           {"run_started_epoch": time.time() - 42, "panic_evidence": True})
-        self.assertGreaterEqual(s["active_seconds"], 41)
+                           {"run_started_epoch": now - 44, "fuzz_started_epoch": now - 42,
+                            "last_activity_epoch": now, "boot_epoch": 1,
+                            "panic_evidence": True})
+        self.assertAlmostEqual(s["active_seconds"], 42, delta=1)
         first = s["active_seconds"]
+        s["run_prep_started"] = now - 12
         fc.record_incident(s, d, "crash",
-                           {"run_started_epoch": time.time() - 10, "panic_evidence": True})
-        self.assertGreaterEqual(s["active_seconds"], first + 9)   # accumulates
+                           {"run_started_epoch": now - 11, "fuzz_started_epoch": now - 10,
+                            "last_activity_epoch": now, "boot_epoch": 1,
+                            "panic_evidence": True})
+        self.assertAlmostEqual(s["active_seconds"], first + 10, delta=1)   # accumulates
 
     def test_triage_panics_reach_the_bug_inventory(self):
         """A crash that minimization produced must be catalogued, not left in the
@@ -323,11 +330,16 @@ class CoordinatorTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update({"phase": "triaging", "triage_job": "camp_t1", "triage_boots": 0})
         d = dict(fc.DEFAULTS)
+        waited = []
         with mock.patch.object(fc, "triage", lambda *a, **k: (0, "")), \
              mock.patch.object(fc, "triage_state", lambda job: {"stage": "MINIMIZE_CONN"}), \
              mock.patch.object(fc, "save_state", lambda st: None), \
-             mock.patch.object(fc.time, "sleep", lambda x: None):
+             mock.patch.object(fc, "route_triage_panics", lambda *a, **k: None), \
+             mock.patch.object(fc, "wait_for_stop",
+                               lambda st, dd, sec: waited.append(sec)):
             fc.advance_triage(s, d)
+        # A short, interruptible breather -- not a whole 10-minute poll.
+        self.assertEqual(waited, [d["triage_retry_seconds"]])
         self.assertEqual(s["phase"], "triaging")   # still triaging
         self.assertEqual(s["triage_boots"], 1)     # advance counted
         self.assertEqual(s["status"], "running")
@@ -418,7 +430,8 @@ class ClockTest(unittest.TestCase):
              mock.patch.object(fc, "advance_triage",
                                lambda *a: advanced.append(1)), \
              mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
-             mock.patch.object(fc, "reconcile_gap", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "reconcile_triage_gap", lambda *a, **k: None), \
              mock.patch.object(fc, "save_state", lambda st: None), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "brake_held", lambda n: None), \
@@ -443,7 +456,8 @@ class ClockTest(unittest.TestCase):
              mock.patch.object(fc, "load_def", lambda n: d), \
              mock.patch.object(fc, "advance_triage", stop_after_one), \
              mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
-             mock.patch.object(fc, "reconcile_gap", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "reconcile_triage_gap", lambda *a, **k: None), \
              mock.patch.object(fc, "save_state", lambda st: None), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "brake_held", lambda n: None), \
@@ -488,8 +502,151 @@ class ClockTest(unittest.TestCase):
         s = fc.init_state("camp")
         s["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                         time.gmtime(time.time() - 7 * 86400))
-        fc.reconcile_gap(s, dict(fc.DEFAULTS))
+        with mock.patch.object(fc, "boot_epoch", lambda: None):
+            fc.reconcile_gap(s, dict(fc.DEFAULTS))
         self.assertEqual(s["overhead_seconds"], fc.DEFAULTS["max_boot_gap_seconds"])
+
+    def test_reconcile_gap_never_charges_more_than_one_cap(self):
+        """Powered off for days after a panic: still one cap, not one per part."""
+        now = 1_000_000.0
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "boot_epoch", lambda: now - 60):
+            fc.reconcile_gap(s, dict(fc.DEFAULTS), since=now - 3 * 86400, now=now)
+        self.assertEqual(s["overhead_seconds"], fc.DEFAULTS["max_boot_gap_seconds"])
+
+    def test_a_late_manual_relaunch_is_not_overhead(self):
+        """Rebooted Saturday, driver started by hand Monday: the reboot counts,
+        the weekend after it does not."""
+        now = 1_000_000.0
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "boot_epoch", lambda: now - 2 * 86400):
+            fc.reconcile_gap(s, dict(fc.DEFAULTS), since=now - 2 * 86400 - 90, now=now)
+        self.assertEqual(s["overhead_seconds"], 90 + fc.DEFAULTS["max_relaunch_seconds"])
+
+    def test_crash_found_after_a_long_power_off_is_not_fuzzing(self):
+        """The 68h41m bug: a run discovered dead on the next boot was charged as
+        fuzzing up to the moment it was found, through the whole downtime."""
+        now = 1_000_000.0
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg",
+                  "run_prep_started": now - 68 * 3600 - 700})
+        info = {"found": True, "status": "crashed", "pid_alive": False,
+                "uncollected": {"run_started": "x"}, "panic_evidence": False,
+                "run_started_epoch": now - 68 * 3600 - 690,
+                "fuzz_started_epoch": now - 68 * 3600 - 660,
+                "last_activity_epoch": now - 68 * 3600,      # last log line
+                "boot_epoch": now - 120}
+        with mock.patch.object(fc, "inspect", lambda sid: info), \
+             mock.patch.object(fc, "collect_and_prune", lambda *a: None), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "boot_epoch", lambda: now - 120), \
+             mock.patch.object(fc.time, "time", lambda: now):
+            end = fc.reconcile_boot(s, dict(fc.DEFAULTS))
+            fc.reconcile_gap(s, dict(fc.DEFAULTS), since=end)
+        self.assertAlmostEqual(s["active_seconds"], 660, delta=1)
+        self.assertAlmostEqual(s["prep_seconds"], 40, delta=1)
+        # the panic->boot part alone exceeds the cap; nothing beyond one cap
+        self.assertEqual(s["overhead_seconds"], fc.DEFAULTS["max_boot_gap_seconds"])
+        self.assertEqual(s["incidents"][-1]["ran_seconds"], 690)
+
+    def test_a_run_that_never_executed_is_all_preparation(self):
+        now = 5000.0
+        s = fc.init_state("camp")
+        s.update({"run_prep_started": now - 100})
+        fc.close_run(s, {"run_started_epoch": now - 90, "fuzz_started_epoch": None},
+                     now - 88)
+        self.assertEqual(s["active_seconds"], 0.0)
+        self.assertAlmostEqual(s["prep_seconds"], 12, delta=0.01)
+        self.assertIsNone(s["run_prep_started"])
+
+    def test_closing_a_run_twice_counts_it_once(self):
+        now = 5000.0
+        s = fc.init_state("camp")
+        s.update({"run_prep_started": now - 100})
+        info = {"run_started_epoch": now - 95, "fuzz_started_epoch": now - 80}
+        fc.close_run(s, info, now)
+        fc.close_run(s, info, now)
+        self.assertAlmostEqual(s["active_seconds"], 80, delta=0.01)
+        self.assertAlmostEqual(s["prep_seconds"], 20, delta=0.01)
+
+    def test_reattaching_does_not_recount_the_open_run(self):
+        """Re-basing on attach re-added the run's elapsed time on every relaunch."""
+        s = fc.init_state("camp")
+        s.update({"session_id": "x", "active_seconds": 300.0, "run_active_base": 100.0,
+                  "prep_seconds": 30.0, "run_prep_base": 0.0, "run_prep_started": 1000.0})
+        alive = {"found": True, "status": "running", "pid_alive": True,
+                 "run_started_epoch": 1010.0}
+        with mock.patch.object(fc, "inspect", lambda sid: alive), \
+             mock.patch.object(fc, "apply_disabled", lambda *a: None), \
+             mock.patch.object(fc, "load_qstate", lambda c: {}), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            fc.ensure_running(s, "/cfg/x.cfg", dict(fc.DEFAULTS))
+        self.assertEqual(s["run_active_base"], 100.0)
+        self.assertEqual(s["run_prep_started"], 1000.0)
+
+    def test_reattaching_a_closed_run_counts_only_what_came_after(self):
+        """The review's case: a halt closes the run but leaves its manager alive.
+        Re-attaching reopened it from the manager's own start, on bases that
+        already held it -- an hour of fuzzing read as two."""
+        t0 = 1_000_000.0
+        s = fc.init_state("camp")
+        s.update({"session_id": "x", "run_prep_started": t0})
+        run = {"run_started_epoch": t0 + 5, "fuzz_started_epoch": t0 + 60}
+        fc.close_run(s, run, t0 + 3600)                     # halted after 1h
+        self.assertAlmostEqual(s["active_seconds"], 3540, delta=0.01)
+        alive = dict(run, found=True, status="running", pid_alive=True)
+        with mock.patch.object(fc, "inspect", lambda sid: alive), \
+             mock.patch.object(fc, "apply_disabled", lambda *a: None), \
+             mock.patch.object(fc, "load_qstate", lambda c: {}), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            fc.ensure_running(s, "/cfg/x.cfg", dict(fc.DEFAULTS))
+        fc.account_run(s, alive, t0 + 3660)                # one poll, 60s later
+        self.assertAlmostEqual(s["active_seconds"], 3600, delta=0.01)
+        self.assertAlmostEqual(s["prep_seconds"], 60, delta=0.01)
+
+    def test_a_breaker_halt_stops_the_manager(self):
+        s = fc.init_state("camp")
+        s.update({"session_id": "sid", "current_config": "/x.cfg"})
+        d = dict(fc.DEFAULTS, poll_seconds=0, stop_check_seconds=0.01, name="camp")
+        calls = []
+        alive = {"found": True, "pid_alive": True, "exec_total": 1,
+                 "run_started_epoch": time.time()}
+        with mock.patch.object(fc, "STATE_DIR", self.dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "inspect", lambda sid: alive), \
+             mock.patch.object(fc, "breaker", lambda *a: "low disk"), \
+             mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "session", lambda *a, **k: calls.append(a) or (0, "")):
+            self.assertEqual(fc.supervise(s, d, "sid", budget=10 ** 9), "halted")
+        self.assertIn(("stop", "sid"), calls)
+
+    def test_wall_includes_preparation(self):
+        s = {"prep_seconds": 7.0, "active_seconds": 100.0, "triage_seconds": 20.0,
+             "overhead_seconds": 5.0}
+        self.assertEqual(fc.wall_seconds(s), 132.0)
+        self.assertEqual(fc.budget_spent(s, {"budget_clock": "fuzz"}), 100.0)
+
+    def test_triage_advance_cut_by_a_panic_is_split_at_the_last_probe(self):
+        """Up to the crashing probe is minimization; after it, rebooting."""
+        now = 1_000_000.0
+        job = self.dir / "job"
+        job.mkdir()
+        ck = job / "conn_state.json"
+        ck.write_text(json.dumps({"attempting_at": now - 400}))
+        os.utime(ck, (now - 400, now - 400))
+        s = fc.init_state("camp")
+        s.update({"phase": "triaging", "triage_job": "camp_t1",
+                  "triage_advance_started": now - 1000})
+        with mock.patch.object(fc, "boot_epoch", lambda: now - 100), \
+             mock.patch.object(fc, "triage_state", lambda j: {"dir": str(job)}):
+            fc.reconcile_triage_gap(s, dict(fc.DEFAULTS), last_save=now - 1000, now=now)
+        self.assertAlmostEqual(s["triage_seconds"], 600, delta=0.01)
+        self.assertAlmostEqual(s["overhead_seconds"], 400, delta=0.01)
+        self.assertIsNone(s["triage_advance_started"])
 
     def test_reconcile_gap_tolerates_a_missing_timestamp(self):
         s = fc.init_state("camp")
@@ -502,7 +659,7 @@ class ClockTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update({"phase": "triaging", "triage_job": "camp_t1", "triage_bug_sig": "S"})
         d = dict(fc.DEFAULTS)
-        d["poll_seconds"] = 0
+        d["triage_retry_seconds"] = 0
         with mock.patch.object(fc, "STATE_DIR", self.dir), \
              mock.patch.object(fc, "triage", lambda *a, **k: (0, "")), \
              mock.patch.object(fc, "triage_state", lambda job: {"stage": "MINIMIZE_CONN"}), \
