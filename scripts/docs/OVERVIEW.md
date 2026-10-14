@@ -11,7 +11,7 @@ scripts/
   <driver>.py        CLI tools; each computes REPO_ROOT = its parent's parent,
                      so drivers MUST stay directly in scripts/
   lib/               shared library package, imported as `from lib import ...`
-  tests/             unit tests (python3 -m unittest discover -s tests)
+  tests/             unit tests (make test)
   docs/              this map and any design notes
   *.sh               shell entry points (publish, run)
   *.md               operational runbooks
@@ -54,8 +54,9 @@ Pure helpers, no CLI, no repo-root anchoring — imported as `from lib import X`
 ## Tests
 
 ```sh
-cd scripts && python3 -m unittest discover -s tests      # all
-cd scripts && python3 -m unittest tests.test_triage      # one module
+make -C scripts test                   # all
+make -C scripts test T=test_triage     # one module
+make -C scripts test V=1               # one line per test
 ```
 
 `tests/__init__.py` puts `scripts/` on the path, so tests import drivers
