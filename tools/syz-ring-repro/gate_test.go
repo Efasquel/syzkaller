@@ -72,3 +72,27 @@ func TestGateVerifyMatchConfirms(t *testing.T) {
 		t.Errorf("VerifiedCrash = %q, want 2", s.VerifiedCrash)
 	}
 }
+
+// The other bug's signature is kept, so its subset can be saved and triaged.
+func TestGateRecordsTheOtherBug(t *testing.T) {
+	gate := &crashGate{targetSig: "SIG", confirmCmd: []string{"/bin/echo", "other", "beef01"}}
+	s := &ddState{Memo: map[string]bool{}}
+	s.recoverAttempt("3", 1000.0, 4, gate)
+	s.recoverAttempt("3", 1000.0, 4, gate) // a second load of the same checkpoint
+	if len(s.OtherCrashes) != 1 || s.OtherCrashes[0].Mask != "3" || s.OtherCrashes[0].Sig != "beef01" {
+		t.Fatalf("OtherCrashes = %+v, want one entry for mask 3, sig beef01", s.OtherCrashes)
+	}
+	s.recoverVerify("2", 2000.0, 4, gate)
+	if len(s.OtherCrashes) != 2 || s.OtherCrashes[1].Mask != "2" {
+		t.Errorf("a different-bug reboot during verification was not recorded: %+v", s.OtherCrashes)
+	}
+}
+
+func TestOtherPathStaysInTheJobDir(t *testing.T) {
+	if got := otherPath("/j/culprit.syz", "ab12"); got != "/j/other_ab12.syz" {
+		t.Errorf("otherPath = %q", got)
+	}
+	if got := otherPath("/j/culprit.syz", "../../x"); got != "/j/other_______x.syz" {
+		t.Errorf("otherPath did not flatten a hostile signature: %q", got)
+	}
+}

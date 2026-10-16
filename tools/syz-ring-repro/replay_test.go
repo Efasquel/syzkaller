@@ -62,3 +62,13 @@ func TestReplayStateIsDiscardedForAnotherRing(t *testing.T) {
 		t.Error("checkpoint for a different range was reused")
 	}
 }
+
+// A pass that panicked with another bug names it and the slot it was running.
+func TestReplayRecordsTheOtherBug(t *testing.T) {
+	gate := &crashGate{targetSig: "SIG", confirmCmd: []string{"/bin/echo", "other", "beef01"}}
+	s := &replayState{Pending: passReplay, PendingAt: 1000, PendingSlot: "slot_0004.syz"}
+	s.recover(gate)
+	if s.Result != replayOther || s.OtherSig != "beef01" || s.OtherSlot != "slot_0004.syz" {
+		t.Errorf("got result %q other %q at %q", s.Result, s.OtherSig, s.OtherSlot)
+	}
+}

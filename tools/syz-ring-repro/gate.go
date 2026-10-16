@@ -93,13 +93,14 @@ const (
 	gateOther                    // a different bug rebooted; not the target
 )
 
-// verdict classifies the reboot for a subset that started running at sinceEpoch.
-// A nil gate, an unset target, a missing command, or a missing timestamp all
-// fall back to gateCrash (so pre-gating checkpoints and ungated runs behave as
-// before).
-func (g *crashGate) verdict(sinceEpoch float64) gateVerdict {
+// verdict classifies the reboot for a subset that started running at sinceEpoch,
+// and for gateOther also returns the other bug's signature ("unknown" when the
+// command did not name it). A nil gate, an unset target, a missing command, or a
+// missing timestamp all fall back to gateCrash (so pre-gating checkpoints and
+// ungated runs behave as before).
+func (g *crashGate) verdict(sinceEpoch float64) (gateVerdict, string) {
 	if g == nil || g.targetSig == "" || len(g.confirmCmd) == 0 || sinceEpoch <= 0 {
-		return gateCrash
+		return gateCrash, ""
 	}
 	args := append(append([]string{}, g.confirmCmd[1:]...),
 		g.targetSig, strconv.FormatFloat(sinceEpoch, 'f', 3, 64))
@@ -107,11 +108,14 @@ func (g *crashGate) verdict(sinceEpoch float64) gateVerdict {
 	if err != nil {
 		log.Logf(0, "crash-gate: confirm command %v failed (%v); counting the reboot as a crash",
 			g.confirmCmd, err)
-		return gateCrash
+		return gateCrash, ""
 	}
 	fields := strings.Fields(string(out))
 	if len(fields) > 0 && fields[0] == "other" {
-		return gateOther
+		if len(fields) > 1 {
+			return gateOther, fields[1]
+		}
+		return gateOther, "unknown"
 	}
-	return gateCrash
+	return gateCrash, ""
 }

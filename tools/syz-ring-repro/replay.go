@@ -69,6 +69,11 @@ type replayState struct {
 	Result string `json:"result,omitempty"`
 	// Skipped are slots over the executor's call limit; they cannot run at all.
 	Skipped []string `json:"skipped,omitempty"`
+	// OtherSig is the bug a pass panicked with instead of the target, and
+	// OtherSlot the slot it was running; OtherSaved the program file written.
+	OtherSig   string `json:"other_sig,omitempty"`
+	OtherSlot  string `json:"other_slot,omitempty"`
+	OtherSaved string `json:"other_saved,omitempty"`
 	// Hanging is the slot whose program never returned, as in ddState.
 	Hanging   string  `json:"hanging,omitempty"`
 	HangingAt float64 `json:"hanging_at,omitempty"`
@@ -113,8 +118,9 @@ func (s *replayState) recover(gate *crashGate) {
 		log.Logf(0, "the %s pass was interrupted but the box never rebooted -- running it again", pass)
 		return
 	}
-	if gate.verdict(at) == gateOther {
+	if v, other := gate.verdict(at); v == gateOther {
 		s.Result = replayOther
+		s.OtherSig, s.OtherSlot = other, slot
 		log.Logf(0, "crash-gate: the %s pass panicked with a DIFFERENT bug (at %s)", pass, slot)
 		return
 	}
@@ -159,6 +165,21 @@ func runReplayRing(target *prog.Target, dir string) error {
 	}
 	state := loadReplayState(statePath, ringHash(entries), len(entries))
 	state.recover(newGate())
+	if state.OtherSig != "" && state.OtherSaved == "" {
+		for _, e := range entries {
+			if e.slot != state.OtherSlot {
+				continue
+			}
+			path := otherPath(culpritPath, state.OtherSig)
+			if err := atomicWriteFile(path, e.prog.Serialize()); err != nil {
+				log.Logf(0, "could not save the other bug's program to %s: %v", path, err)
+			} else {
+				state.OtherSaved = path
+				log.Logf(0, "%s crashed with a DIFFERENT bug (%s); saved as %s",
+					e.slot, state.OtherSig, path)
+			}
+		}
+	}
 	if err := atomicWriteJSON(statePath, state); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}

@@ -139,6 +139,7 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 
 	state := loadDdState(statePath, red.n, progHash(p), red.label, gate)
 	logDdState(state)
+	saveOtherCrashes(state, statePath, culpritPath, red)
 	// culprit.syz is only written when the search completes. Any file left from an
 	// earlier run describes a different (or abandoned) reduction, and a stale one
 	// is easy to mistake for this run's output — drop it now rather than let it
@@ -282,6 +283,40 @@ func failHang(state *ddState, statePath, culpritPath, key string, sub *prog.Prog
 		"  sudo fuzz-session.py diagnose-hang\n"+
 		"Then REBOOT; the checkpoint records this subset and the search resumes from it.",
 		setBits(mask), *flagProgTimeout)
+}
+
+// saveOtherCrashes writes the program of every subset that crashed the box with
+// a different bug, as other_<sig>.syz next to the culprit. The first subset seen
+// for a signature is kept; later ones for the same signature are not written
+// over it. Best-effort: the crash is already recorded in the checkpoint.
+func saveOtherCrashes(state *ddState, statePath, culpritPath string, red reduction) {
+	changed := false
+	for i := range state.OtherCrashes {
+		o := &state.OtherCrashes[i]
+		if o.Saved != "" {
+			continue
+		}
+		mask, err := strconv.ParseUint(o.Mask, 16, 64)
+		if err != nil || mask&^fullMask(red.n) != 0 {
+			continue
+		}
+		path := otherPath(culpritPath, o.Sig)
+		if _, err := os.Stat(path); err != nil {
+			if err := atomicWriteFile(path, red.extract(mask).Serialize()); err != nil {
+				log.Logf(0, "could not save the other bug's program to %s: %v", path, err)
+				continue
+			}
+			log.Logf(0, "Subset %v crashed with a DIFFERENT bug (%s); its program is saved as %s",
+				setBits(mask), o.Sig, path)
+		}
+		o.Saved = path
+		changed = true
+	}
+	if changed {
+		if err := saveDdState(statePath, state); err != nil {
+			tool.Failf("checkpoint: %v", err)
+		}
+	}
 }
 
 // saveHang writes the program that hung next to the culprit, as hang.syz, so the
