@@ -211,8 +211,21 @@ type ddState struct {
 	// box, while this one wedged a kernel thread without panicking. Conflating
 	// them would file a hang as a crash and send triage looking for a panic
 	// report that does not exist.
+	//
+	// It is overwritten by every hang and cleared once the box has rebooted
+	// since: by then the caller has read it, and the subset, still unmemoized,
+	// is probed again. A subset that hangs every time is the caller's answer.
 	Hanging   string  `json:"hanging,omitempty"`
 	HangingAt float64 `json:"hanging_at,omitempty"`
+	// Untestable are masks whose program has more calls than the executor can
+	// run (maxExecCalls). They are never probed and never memoized: "too big to
+	// run" says nothing about whether the subset crashes, and recording it as
+	// "no crash" would steer the search away from a subset it never tested.
+	Untestable []string `json:"untestable,omitempty"`
+	// CulpritTooLarge marks a finished search whose answer cannot be re-checked
+	// because it is itself over the executor's call limit. Like Exhausted it is
+	// terminal, but it is not a failed verification: nothing was run.
+	CulpritTooLarge bool `json:"culprit_too_large,omitempty"`
 	// AttemptingAt / VerifyingAt are the wall-clock epochs the in-flight
 	// Attempting / Verifying subset started running, so a crash gate can scope its
 	// panic-report scan to reports produced by that subset's reboot. Zero when
@@ -327,6 +340,9 @@ func loadDdState(path string, nUnits int, hash, kind string, gates ...*crashGate
 		if mask, err := strconv.ParseUint(key, 16, 64); err != nil || mask&^fullMask(nUnits) != 0 {
 			delete(s.Memo, key)
 		}
+	}
+	if s.Hanging != "" && rebootedSince(s.HangingAt) {
+		s.Hanging, s.HangingAt = "", 0
 	}
 	s.recoverAttempt(s.Attempting, s.AttemptingAt, nUnits, gate)
 	s.recoverVerify(s.Verifying, s.VerifyingAt, nUnits, gate)

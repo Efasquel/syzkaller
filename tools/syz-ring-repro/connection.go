@@ -173,6 +173,12 @@ func atomicWriteJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
+	return atomicWriteFile(path, data)
+}
+
+// atomicWriteFile is atomicWriteJSON for bytes that are already serialized: a
+// program that must survive the panic-reboot its own probe may cause.
+func atomicWriteFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
