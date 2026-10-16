@@ -127,6 +127,10 @@ before any session starts. Anything written into it becomes the halt reason.
   `exhausted` with the kind (`no-repro`, `ring-only`, `hang`, ...). Recurrences
   are counted; after 4 the newest ring program is benched as an unverified lead.
   `forget-exhausted` re-allows triage once the cause is fixed.
+- **An incident says "NOT the fuzzed <kext>"** — the backtrace blames a kext
+  other than the one this config targets (a shared IOKit family, the kernel's
+  own zone code reached through the driver, or a genuinely different driver).
+  Worth a look before attributing the bug to the target.
 - **Halted with "failed to start N times"** — the manager died before its first
   exec; the reason quotes the run log. Look in
   `<workdir>/artifacts/startup-failures/`. A held http port is the usual cause.

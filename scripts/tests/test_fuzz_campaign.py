@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import tempfile
+import types
 import time
 import unittest
 from pathlib import Path
@@ -557,6 +558,167 @@ class SecondBugTest(unittest.TestCase):
         self.s["triage_queue"] = [{"sig": "OTHER", "program": "p"}]
         fc.advance_config(self.s)
         self.assertEqual(self.s["triage_queue"], [])
+
+
+class DisplayFixesTest(unittest.TestCase):
+    """Bugs seen in real campaign logs: a lost crash window, "HALT: None", a
+    phantom hang after a halt, and a hardcoded launchd domain."""
+
+    def test_the_session_is_named_before_it_starts(self):
+        s = fc.init_state("camp")
+        s.update({"session_id": None, "current_config": None})
+        saved_at_start = []
+
+        def session(verb, *a, **k):
+            saved_at_start.append((verb, dict(saved[-1])))
+            return 0, ""
+        saved = []
+        with mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+             mock.patch.object(fc, "apply_disabled", lambda *a: None), \
+             mock.patch.object(fc, "load_qstate", lambda c: {}), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "session", session), \
+             mock.patch.object(fc, "save_state", lambda st: saved.append(dict(st))):
+            fc.ensure_running(s, "/cfg/x.cfg", dict(fc.DEFAULTS))
+        verb, state = saved_at_start[0]
+        self.assertEqual(verb, "start")
+        self.assertEqual(state["session_id"], fc.config_id("/cfg/x.cfg"))
+        self.assertEqual(state["current_config"], "/cfg/x.cfg")
+
+    def reconcile(self, info, s=None):
+        s = s or fc.init_state("camp")
+        s["session_id"] = s.get("session_id") or "sess"
+        s["current_config"] = s.get("current_config") or "/cfg/x.cfg"
+        calls = []
+        with mock.patch.object(fc, "inspect", lambda sid: info), \
+             mock.patch.object(fc, "session", lambda *a, **k: calls.append(a) or (0, "")), \
+             mock.patch.object(fc, "collect_and_prune", lambda *a: calls.append("incident")), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            end = fc.reconcile_boot(s, dict(fc.DEFAULTS))
+        return s, calls, end
+
+    def test_a_deliberately_stopped_run_is_not_a_hang(self):
+        s, calls, _ = self.reconcile({
+            "found": True, "status": "stopped", "pid_alive": False,
+            "uncollected": {"run_started": "x"}, "panic_evidence": False})
+        self.assertEqual(s["hangs"], 0)
+        self.assertEqual(s["incidents"], [])
+        self.assertEqual(calls, [("collect", "sess", "snapshot")])
+
+    def test_a_run_that_died_uncollected_is_still_an_incident(self):
+        s, calls, _ = self.reconcile({
+            "found": True, "status": "crashed", "pid_alive": False,
+            "uncollected": {"run_started": "x"}, "panic_evidence": False,
+            "panics": [], "run_started_epoch": None})
+        self.assertEqual(s["hangs"], 1)
+        self.assertIn("incident", calls)
+
+    def test_a_previous_runs_record_does_not_end_the_new_run_early(self):
+        """Named before its manager started, then the box went down: the record
+        found is the previous, collected run, which ended before this one opened."""
+        s = fc.init_state("camp")
+        s.update({"session_id": "sess", "run_prep_started": 5000.0})
+        _, _, end = self.reconcile({
+            "found": True, "status": "stopped", "pid_alive": False, "uncollected": None,
+            "run_started_epoch": 1000.0, "last_activity_epoch": 2000.0,
+            "boot_epoch": 6000.0}, s)
+        self.assertEqual(end, 5000.0)
+        self.assertEqual(s["active_seconds"], 0.0)
+
+    def test_a_user_halt_has_a_reason(self):
+        s = fc.init_state("camp")
+        with mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            fc.cmd_halt("camp")
+        self.assertEqual((s["status"], s["halt_reason"]), ("halted", "halted by user"))
+        with mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            fc.cmd_resume("camp")
+        self.assertIsNone(s["halt_reason"])
+
+    def test_agent_domains_follow_the_install_not_a_fixed_uid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "fuzz"
+            agents = home / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            (agents / ("%s.plist" % fc.plist_label("camp"))).write_text("x")
+            users = [types.SimpleNamespace(pw_uid=503, pw_dir=str(home)),
+                     types.SimpleNamespace(pw_uid=501, pw_dir=str(Path(tmp) / "wan"))]
+            with mock.patch.object(fc.pwd, "getpwall", lambda: users), \
+                 mock.patch.object(fc, "state_path", lambda n: Path(tmp) / "absent.json"):
+                self.assertEqual(fc.agent_domains("camp"), ["gui/503"])
+
+
+class AttributionTest(unittest.TestCase):
+    """What each incident says about the crash: signature, kexts, bug, decision."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.cfg = write_cfg(self.dir, {
+            "target": "darwin/arm64",
+            "workdir": "/Users/Shared/fuzz-run/workdir/AppleSMC/261016_cov",
+            "kext_coverage": {"kext_id": 2},
+            "enable_syscalls": ["syz_IOServiceOpen$AppleSMCKeysEndpoint_AppleSMCClient",
+                                "syz_IOConnectCallMethod$AppleSMCClient_0"]})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_fuzzed_target_reads_the_config(self):
+        t = fc.fuzzed_target(str(self.cfg))
+        self.assertEqual(t, {"kext_id": 2, "kext": "AppleSMC",
+                             "services": ["AppleSMCKeysEndpoint"]})
+
+    def test_kext_match(self):
+        t = fc.fuzzed_target(str(self.cfg))
+        self.assertIs(fc.kext_matches(t, "AppleSMC"), True)
+        self.assertIs(fc.kext_matches(t, "IOSurface"), False)
+        self.assertIsNone(fc.kext_matches(t, "kernel"))
+        self.assertIsNone(fc.kext_matches(t, None))
+
+    def crash(self, decision="resume", sig="SIG9", kext="IOSurface", begin=False):
+        s = fc.init_state("camp")
+        s.update({"session_id": "sess", "current_config": str(self.cfg)})
+        fc.record_incident(s, dict(fc.DEFAULTS), "crash",
+                           {"run_started_epoch": 1.0, "panic_evidence": True}, 2.0)
+
+        def latest(st):
+            st["last_panic"] = {"signature": sig, "title": "panic: x", "crashing_kext": kext}
+            return sig
+        with mock.patch.object(fc, "STATE_DIR", self.dir / "state"), \
+             mock.patch.object(fc, "route_bug_registry", lambda *a, **k: ["BUG-0007"]), \
+             mock.patch.object(fc, "latest_panic_signature", latest), \
+             mock.patch.object(fc, "quarantine_decide", lambda st, g: decision), \
+             mock.patch.object(fc, "begin_triage",
+                               lambda st, d, g: st.update(triage_job="camp_t3") or begin):
+            fc.handle_crash(s, dict(fc.DEFAULTS), {"panics": ["/p.panic"]})
+        return s["incidents"][-1]
+
+    def test_a_crash_outside_the_fuzzed_kext_is_flagged(self):
+        inc = self.crash()
+        self.assertEqual((inc["fuzzed_kext"], inc["kext_id"]), ("AppleSMC", 2))
+        self.assertEqual((inc["signature"], inc["crashing_kext"]), ("SIG9", "IOSurface"))
+        self.assertIs(inc["kext_match"], False)
+        self.assertEqual(inc["bug_ids"], ["BUG-0007"])
+        self.assertIn("NOT the fuzzed AppleSMC", fc.incident_line(inc))
+
+    def test_the_decision_and_triage_job_are_recorded(self):
+        inc = self.crash(decision="triage", kext="AppleSMC", begin=True)
+        self.assertEqual((inc["decision"], inc["triage_job"]), ("triage", "camp_t3"))
+        self.assertIs(inc["kext_match"], True)
+        line = fc.incident_line(inc)
+        self.assertIn("sig SIG9 BUG-0007", line)
+        self.assertIn("-> triage camp_t3", line)
+
+    def test_route_bug_registry_returns_the_bug_ids(self):
+        out = "NEW BUG  BUG-0012 [new]  Drv:m:READ\n"
+        with mock.patch.object(fc, "BUG_REGISTRY", self.cfg), \
+             mock.patch.object(fc, "BUGS_DIR", self.dir / "bugs"), \
+             mock.patch.object(fc.subprocess, "run",
+                               lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=out)):
+            self.assertEqual(fc.route_bug_registry("/p.panic"), ["BUG-0012"])
 
 
 class ExhaustedRecurrenceTest(unittest.TestCase):

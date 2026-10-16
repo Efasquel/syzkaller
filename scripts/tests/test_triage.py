@@ -440,3 +440,32 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(st["other_bugs"]["beef01"]["program"],
                          str(self.jdir / "other_beef01.syz"))
         self.assertEqual(st["stage"], "MINIMIZE_CONN")   # the job itself goes on
+
+
+class ProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_search_in_progress(self):
+        (self.tmp / "conn_state.json").write_text(json.dumps({
+            "n_units": 14, "memo": {"1": False, "2": False, "4": True},
+            "attempting": "6", "untestable": ["ff"]}))
+        st = {"dir": str(self.tmp), "stage": "MINIMIZE_CONN", "hangs": [{}],
+              "incidents": [{"signature": "T"}, {"signature": "O", "other": True}],
+              "other_bugs": {"O": {}}}
+        p = triage.progress(st)
+        self.assertEqual((p["tested"], p["hits"], p["units"], p["pending_size"],
+                          p["untestable"], p["other_panics"], p["hangs"]),
+                         (3, 1, 14, 2, 1, 1, 1))
+        line = triage.progress_line(p)
+        self.assertIn("3 connection subset(s) tested of 14 connections, 1 crashed", line)
+        self.assertIn("testing a 2-connection subset", line)
+        self.assertIn("1 from OTHER bugs (O)", line)
+
+    def test_a_ring_replay_in_progress(self):
+        (self.tmp / "replay_state.json").write_text(json.dumps({
+            "slots": 40, "pending": "verify", "pending_slot": "slot_0012.syz",
+            "crash_slot": "slot_0030.syz"}))
+        p = triage.progress({"dir": str(self.tmp), "stage": triage.REPLAY})
+        self.assertIn("verify pass at slot_0012.syz of 40 slots", triage.progress_line(p))

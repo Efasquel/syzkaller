@@ -380,6 +380,21 @@ The deltas are the point. An absolute counter looks identical one refresh later
 whether the box is fuzzing hard or wedged; a blank delta column means nothing
 moved, which is exactly the signal you are watching for.
 
+Each recent incident says what the crash turned out to be: its signature, its
+BUG id in the registry, the kext the backtrace blames, and what the coordinator
+decided. A crash in a kext other than the fuzzed one is called out — the config
+names no kext, so "fuzzed" means the workdir's kext directory and the services
+the config opens:
+
+```
+    - 16/10 12:24:02  crash   AppleSMC_261016_cov_handfixed  ran 312s  sig 5fe467b592862b54 BUG-0004  in AppleSMC  -> triage AppleSMC_261016_1h_handfixed_t2
+    - 16/10 13:02:40  crash   AppleSMC_261016_cov_handfixed  ran 95s  sig 1c2e... BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
+```
+
+While triaging, a `progress` row reads the job's checkpoint: subsets tested and
+crashed, the subset under test, panics from other bugs, hangs — or, during the
+ring replay, the pass and slot.
+
 ### Dates
 
 Stored timestamps are ISO 8601 **with a real offset** — `2026-09-01T14:56:39+02:00`

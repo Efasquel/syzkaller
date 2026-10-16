@@ -60,6 +60,9 @@ as the current job ends.
 /usr/bin/python3 scripts/triage.py status <job>
 ```
 
+`triage.py status <job>` also prints where the job came from (campaign, config,
+fuzzed kext) and, while it runs, its progress read from the checkpoint.
+
 Stages: `MERGE` → `MINIMIZE_CONN` → `MINIMIZE_CALLS` → `DONE`, or terminal
 `STUCK`. Each crashing subset panics the box, so the job advances one boot at a
 time and resumes from its own checkpoint. When no connection subset reproduces,

@@ -69,6 +69,7 @@ import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
 import triage as tri  # noqa: E402  (job outcome constants only; runs as a subprocess)
 from lib import bootinfo  # noqa: E402
+from lib import cfgutil  # noqa: E402
 from lib import timefmt  # noqa: E402
 from lib.tablefmt import render, tabulate  # noqa: E402
 
@@ -768,8 +769,10 @@ def record_incident(s, d, kind, info, end=None):
         s["crashes"] += 1
     else:
         s["hangs"] += 1
+    target = fuzzed_target(s["current_config"])
     s["incidents"].append({
         "config": s["current_config"], "kind": kind, "at": now_iso(),
+        "fuzzed_kext": target["kext"], "kext_id": target["kext_id"],
         "ran_seconds": round(ran_for) if ran_for else None,
         "fuzzed_seconds": round(fuzzed),
         "exec_total": info.get("exec_total"),
@@ -884,12 +887,47 @@ def latest_panic_signature(s):
             log("could not fingerprint %s: %s" % (r.name, e))
             continue
         sig = fp["signature"]
+        # Kept for the incident and for status: the backtrace's crashing kext is
+        # how a crash outside the fuzzed driver gets noticed.
+        s["last_panic"] = {"signature": sig, "title": fp.get("title"),
+                           "crashing_kext": fp.get("crashing_kext"), "report": r.name}
         try:
             s["panic_sig_watermark"] = max(s.get("panic_sig_watermark", 0.0),
                                            r.stat().st_mtime)
         except OSError:
             pass
     return sig
+
+
+def fuzzed_target(cfg):
+    """What a config fuzzes: its Pishi kext_id, the IOKit services it opens
+    (from syz_IOServiceOpen$<Service>_<UserClient>) and its workdir's kext
+    directory (workdir/<Kext>/<run>). The config names no kext, so this is the
+    best there is to compare a backtrace's crashing kext against."""
+    try:
+        conf = cfgutil.load(cfg) if cfg else {}
+    except (OSError, ValueError):
+        conf = {}
+    services = set()
+    for name in conf.get("enable_syscalls") or []:
+        if name.startswith("syz_IOServiceOpen$"):
+            services.add(name.split("$", 1)[1].rsplit("_", 1)[0])
+    workdir = conf.get("workdir")
+    return {"kext_id": (conf.get("kext_coverage") or {}).get("kext_id"),
+            "kext": Path(workdir).parent.name if workdir else None,
+            "services": sorted(services)}
+
+
+def kext_matches(target, crashing):
+    """Whether a backtrace's crashing kext is the one being fuzzed: True, False,
+    or None when there is nothing to compare (no kext, or the kernel itself)."""
+    if not crashing or crashing == "kernel":
+        return None
+    names = [n for n in [target.get("kext")] + target.get("services", []) if n]
+    if not names:
+        return None
+    c = crashing.lower()
+    return any(c in n.lower() or n.lower() in c for n in names)
 
 
 def config_triage_flags(cfg):
@@ -962,7 +1000,13 @@ def begin_triage(s, d, sig, ring=None):
     tri.update(config_triage_flags(cfg_path))
     # Pin the target signature so triage's crash gate is active from the first
     # subset (a second bug firing during minimization won't misdirect it).
-    args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force"]
+    args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force",
+            "--campaign", s["name"]]
+    if cfg_path:
+        args += ["--config", config_id(cfg_path)]
+        kext = fuzzed_target(cfg_path).get("kext")
+        if kext:
+            args += ["--fuzzed-kext", kext]
     for flag, key in (("--executor", "executor"), ("--ringrepro", "ringrepro"),
                       ("--kcov-device", "kcov_device"), ("--kext-id", "kext_id"),
                       ("--sandbox", "sandbox"), ("--max-k", "max_k"),
@@ -1384,6 +1428,13 @@ def ensure_running(s, cfg, d=None):
         s["run_prep_base"] = s.get("prep_seconds", 0.0)
         s["run_active_base"] = s.get("active_seconds", 0.0)
         s["run_prep_started"] = time.time()
+        # Name the session BEFORE starting it. It used to be saved only after
+        # `session start` returned, so a panic in between (grammar compile,
+        # corpus re-triage: the riskiest seconds of a run) left session_id None:
+        # the next boot reconciled nothing, and the --force start overwrote the
+        # ring buffer that held the crash.
+        s["session_id"] = sid
+        s["current_config"] = cfg
         save_state(s)
         verb = "resume" if info.get("found") else "start"
         target = sid if verb == "resume" else cfg
@@ -1422,20 +1473,49 @@ def handle_crash(s, d, info):
     """
     panics = info.get("panics", [])
     log("crash: %d panic report(s); bug inventory -> %s" % (len(panics), BUGS_DIR))
+    # The incident record_incident just wrote for this crash: what is learned
+    # here (signature, kexts, bug ids, decision) is written onto it, so status
+    # and the state file say what each crash WAS, not only that it happened.
+    inc = s["incidents"][-1] if s.get("incidents") else {}
+    if inc.get("kind") != "crash":
+        inc = {}
+    bug_ids = []
     for pth in panics:
         # provenance: which run found it, so one deduped inventory can still be
         # sliced per campaign (bug_registry list --campaign <name>)
-        route_bug_registry(pth, s.get("name"), s.get("current_config"))
+        bug_ids += route_bug_registry(pth, s.get("name"), s.get("current_config")) or []
+    if bug_ids:
+        inc["bug_ids"] = list(dict.fromkeys(bug_ids))
     sig = latest_panic_signature(s)
     if not sig:
         log("crash: no readable panic signature; resuming without a decision")
+        inc["decision"] = "unreadable"
         return False
+    last = s.get("last_panic") or {}
+    inc["signature"] = sig
+    if last.get("signature") == sig:
+        inc["title"] = last.get("title")
+        inc["crashing_kext"] = last.get("crashing_kext")
+        match = kext_matches(fuzzed_target(s.get("current_config")), last.get("crashing_kext"))
+        inc["kext_match"] = match
+        if match is False:
+            log("crash %s: the backtrace blames %s, not the fuzzed kext %s"
+                % (sig, last.get("crashing_kext"), inc.get("fuzzed_kext") or "?"))
     if sig in (s.get("exhausted_sigs") or []):
         exhausted_recurrence(s, sig, info)
+        inc["decision"] = "exhausted (%s)" % ((s.get("exhausted_why") or {}).get(sig)
+                                              or "no-repro")
         return False
     if quarantine_decide(s, sig) != "triage":
+        rec = (load_qstate(s["current_config"])["catalog"].get(sig) or {}
+               if s.get("current_config") else {})
+        inc["decision"] = rec.get("disposition") or "resume"
         return False
-    return begin_triage(s, d, sig)
+    started = begin_triage(s, d, sig)
+    inc["decision"] = "triage" if started else "triage failed"
+    if started:
+        inc["triage_job"] = s.get("triage_job")
+    return started
 
 
 def reconcile_gap(s, d, since=None, now=None):
@@ -1543,9 +1623,24 @@ def reconcile_boot(s, d):
     if info.get("status") == "running" and info.get("pid_alive"):
         return RUN_ALIVE             # survived; supervisor will re-attach
     end = run_end_epoch(info) if s.get("run_prep_started") else None
+    if end is not None:
+        # The record can be the previous run's: the session is named before its
+        # manager starts, and the box may have gone down in between.
+        end = max(end, s["run_prep_started"])
     if not info.get("uncollected"):
         if end is not None:
             close_run(s, info, end)  # already collected; just stop its clocks
+        return end
+    if info.get("status") == "stopped" and not info.get("panic_evidence"):
+        # Stopped on purpose (halt, stop, rotation) and never collected: not an
+        # incident. Filing it as a hang is how a halt-then-resume used to add a
+        # phantom hang to the campaign. Snapshot it so its ring is kept and the
+        # record reads collected.
+        log("boot reconcile: %s was stopped deliberately, not lost; snapshot only" % sid)
+        if end is not None:
+            close_run(s, info, end)
+        session("collect", sid, "snapshot")
+        save_state(s)
         return end
     kind = "crash" if info.get("panic_evidence") else "hang"
     log("boot reconcile: %s ended uncollected -> %s" % (sid, kind))
@@ -1663,7 +1758,7 @@ def supervise(s, d, sid, budget):
                                                     DEFAULTS["startup_poll_seconds"]))
         stop = wait_for_stop(s, d, min(step, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
-            log("campaign halted by user")
+            s["halt_reason"] = s.get("halt_reason") or "halted by user"
             session("stop", sid)
             return "halted"
         if stop == "brake":
@@ -1910,8 +2005,9 @@ def cmd_run(name):
 
         if outcome == "halted":
             close_run(s, inspect(s["session_id"]), time.time())
+            s["halt_reason"] = s.get("halt_reason") or "halted by user"
             save_state(s)
-            log("HALT: %s" % s.get("halt_reason"))
+            log("HALT: %s" % s["halt_reason"])
             results_commit(s, d, "halt", cfg=cfg)
             return
         if outcome == "budget":
@@ -2228,6 +2324,9 @@ def status_lines(name, prev=None):
         row("triaging", "job %s, bug %s (advance %d/%d)"
             % (s.get("triage_job"), s.get("triage_bug_sig"),
                s.get("triage_boots", 0), d["triage_max_boots"]))
+        tst = triage_state(s.get("triage_job")) if s.get("triage_job") else None
+        if tst:
+            row("  progress", tri.progress_line(tri.progress(tst)))
     if s.get("triage_queue"):
         row("triage queue", "%d second bug(s) waiting: %s"
             % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
@@ -2244,13 +2343,34 @@ def status_lines(name, prev=None):
     row("updated", timefmt.fmt(s.get("updated_at")))
     row("started", timefmt.fmt(s.get("started_at")))
     for inc in s["incidents"][-5:]:
-        out.append("    - %s  %-6s %s  (ran %ss, panic=%s)"
-                   % (timefmt.fmt(inc["at"]), inc["kind"], config_id(inc["config"]),
-                      inc.get("ran_seconds"), inc.get("panic_evidence")))
+        out.append("    - " + incident_line(inc))
 
     sample = {"execs": execs, "cov": _int(cov), "crashes": s["crashes"],
               "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
     return out, sample
+
+
+def incident_line(inc):
+    """One incident for status: when, what, where, and what it turned out to be."""
+    line = "%s  %-7s %s  ran %ss" % (timefmt.fmt(inc["at"]), inc["kind"],
+                                     config_id(inc["config"]), inc.get("ran_seconds"))
+    if inc.get("signature"):
+        line += "  sig %s" % inc["signature"]
+    if inc.get("bug_ids"):
+        line += " %s" % ",".join(inc["bug_ids"])
+    if inc.get("crashing_kext"):
+        line += "  in %s" % inc["crashing_kext"]
+        if inc.get("kext_match") is False:
+            line += " (NOT the fuzzed %s)" % (inc.get("fuzzed_kext") or "kext")
+    if inc.get("decision"):
+        line += "  -> %s" % inc["decision"]
+        if inc.get("triage_job"):
+            line += " %s" % inc["triage_job"]
+    elif inc["kind"] == "crash" and not inc.get("panic_evidence"):
+        line += "  (no panic report)"
+    if inc.get("log_tail"):
+        line += "  -- %s" % inc["log_tail"][:80]
+    return line
 
 
 def _int(v):
@@ -2597,9 +2717,11 @@ def cmd_list():
     tabulate(rows, ("CAMPAIGN", "STATUS", "CONFIG", "CRASH/HANG", "FUZZED", "WALL"))
 
 
-def _set_status(name, status):
+def _set_status(name, status, reason=None):
     s = load_state(name)
     s["status"] = status
+    if reason:
+        s["halt_reason"] = reason
     if status == "running":
         s["halt_reason"] = None
         s["consec_fast_crashes"] = 0
@@ -2612,7 +2734,7 @@ def cmd_halt(name):
     s = load_state(name)
     if s.get("session_id"):
         session("stop", s["session_id"])
-    _set_status(name, "halted")
+    _set_status(name, "halted", reason="halted by user")
 
 
 def cmd_resume(name):
@@ -2990,6 +3112,23 @@ def _signal(pid, sig, what):
         return False
 
 
+def agent_domains(name):
+    """launchd domains this campaign's agent may be loaded in: gui/<uid> of each
+    user with its plist in ~/Library/LaunchAgents, and of the state file's
+    owner (install chowns it to the agent user)."""
+    label = plist_label(name)
+    uids = []
+    try:
+        uids.append(state_path(name).stat().st_uid)
+    except OSError:
+        pass
+    for pw in pwd.getpwall():
+        if pw.pw_uid >= 500 and _exists(
+                Path(pw.pw_dir) / "Library" / "LaunchAgents" / ("%s.plist" % label)):
+            uids.append(pw.pw_uid)
+    return ["gui/%d" % u for u in dict.fromkeys(uids) if u != 0]
+
+
 def cmd_stop(name, grace=30, keep_agent=False):
     """End a campaign's fuzzing for good, whether or not a supervisor is alive.
 
@@ -3009,7 +3148,7 @@ def cmd_stop(name, grace=30, keep_agent=False):
     # 1. Nothing may bring it back while we work.
     if not keep_agent:
         label = plist_label(name)
-        for dom in ("gui/502", "system"):
+        for dom in agent_domains(name) + ["system"]:
             subprocess.run(["launchctl", "bootout", "%s/%s" % (dom, label)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log("  launchd job %s booted out (if it was loaded)" % label)
@@ -3370,7 +3509,8 @@ def route_bug_registry(panic_path, campaign=None, config=None, origin="fuzz"):
     """Best-effort: catalog a panic in the bug registry (the reportable inventory
     that end-of-campaign replay iterates). Tolerated crashes are catalogued too."""
     if not BUG_REGISTRY.exists():
-        return
+        return []
+    ids = []
     try:
         BUGS_DIR.mkdir(parents=True, exist_ok=True)
         p = subprocess.run(
@@ -3382,15 +3522,17 @@ def route_bug_registry(panic_path, campaign=None, config=None, origin="fuzz"):
         if p.returncode != 0:
             log("bug_registry route rc=%d for %s: %s"
                 % (p.returncode, Path(panic_path).name, (p.stdout or "").strip()))
-            return
+            return ids
         # Echo the routing decision (NEW BUG / new crash / dup + the bug id and
         # key). Silently succeeding here is what made the bug inventory feel like
         # it was not being written at all.
         for line in (p.stdout or "").splitlines():
             if line.strip():
                 log("bug_registry: %s  <- %s" % (line.strip(), Path(panic_path).name))
+                ids += re.findall(r"\bBUG-\d+\b", line)
     except Exception as e:  # noqa: BLE001 - cataloguing must never stall the campaign
         log("bug_registry route failed for %s: %s" % (panic_path, e))
+    return ids
 
 
 def cmd_replay(name, as_json=False):

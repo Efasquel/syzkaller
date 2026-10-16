@@ -774,9 +774,74 @@ def result_path(st):
     return st.get("final_culprit") or st.get("conn_culprit")
 
 
+STAGE_CHECKPOINTS = {"MINIMIZE_CONN": ("conn_state.json", "connection"),
+                     "MINIMIZE_CALLS": ("call_state.json", "call")}
+
+
+def progress(st):
+    """Where a job is, read from its checkpoints (no device): what the stage is
+    doing, how far it has got, and what it has run into along the way."""
+    st = st or {}
+    incs = st.get("incidents") or []
+    p = {"stage": st.get("stage"), "panics": len(incs),
+         "other_panics": sum(1 for i in incs if i.get("other")),
+         "hangs": len(st.get("hangs") or []),
+         "other_bugs": sorted((st.get("other_bugs") or {}))}
+    stage = st.get("stage")
+    if stage in STAGE_CHECKPOINTS and st.get("dir"):
+        name, unit = STAGE_CHECKPOINTS[stage]
+        ck = read_json(job_dir(st) / name) or {}
+        memo = ck.get("memo") or {}
+        pending = ck.get("verifying") or ck.get("attempting")
+        try:
+            size = bin(int(pending, 16)).count("1") if pending else None
+        except ValueError:
+            size = None
+        p.update(unit=unit, units=ck.get("n_units"), tested=len(memo),
+                 hits=sum(1 for v in memo.values() if v),
+                 untestable=len(ck.get("untestable") or []),
+                 pending_size=size, verifying=bool(ck.get("verifying")))
+    elif stage == REPLAY and st.get("dir"):
+        ck = read_json(job_dir(st) / "replay_state.json") or {}
+        p.update(replay_pass=ck.get("pending") or ("verify" if ck.get("crash_slot") else "replay"),
+                 slot=ck.get("pending_slot"), slots=ck.get("slots"),
+                 crash_slot=ck.get("crash_slot"))
+    return p
+
+
+def progress_line(p):
+    """One line of progress(), for status displays."""
+    parts = [p.get("stage") or "?"]
+    if p.get("unit"):
+        parts.append("%d %s subset(s) tested of %s %ss, %d crashed"
+                     % (p["tested"], p["unit"], p.get("units") or "?", p["unit"], p["hits"]))
+        if p.get("pending_size"):
+            parts.append("%s a %d-%s subset" % ("re-checking" if p["verifying"] else "testing",
+                                                p["pending_size"], p["unit"]))
+        if p.get("untestable"):
+            parts.append("%d over the 64-call limit" % p["untestable"])
+    elif "replay_pass" in p:
+        parts.append("%s pass%s of %s slots" % (
+            p["replay_pass"], " at %s" % p["slot"] if p.get("slot") else "",
+            p.get("slots") or "?"))
+    parts.append("%d panic(s)" % p["panics"])
+    if p.get("other_panics"):
+        parts.append("%d from OTHER bugs (%s)" % (p["other_panics"],
+                                                   ", ".join(p["other_bugs"]) or "?"))
+    if p.get("hangs"):
+        parts.append("%d hang(s)" % p["hangs"])
+    return "; ".join(parts)
+
+
 def _print_summary(st):
     sigs = cf.load_store(job_dir(st) / "signatures.json").get("signatures", {})
     print("\n== triage %s ==" % st["name"])
+    if st.get("campaign") or st.get("config"):
+        print("found by         : campaign %s, config %s (fuzzed kext %s)"
+              % (st.get("campaign") or "-", st.get("config") or "-",
+                 st.get("fuzzed_kext") or "?"))
+    if st.get("stage") not in TERMINAL:
+        print("progress         : %s" % progress_line(progress(st)))
     print("result           : %s" % (result_path(st) or "(none)"))
     if st.get("stage") == STUCK:
         print("stuck            : %s at %s" % (st.get("stuck_kind"), st.get("stuck_at")))
@@ -798,7 +863,8 @@ def _print_summary(st):
 # --- job authoring + inspection ----------------------------------------------
 def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
             sandbox, max_k, os_name, arch, from_off, to_off, force,
-            target_sig=None, executor_name=None):
+            target_sig=None, executor_name=None, campaign=None, config=None,
+            fuzzed_kext=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if state_path(name).exists() and not force:
         die("triage job %s already exists (use --force to overwrite)" % name)
@@ -841,6 +907,9 @@ def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
         # crash gate is active from the first subset; otherwise the first
         # reconciled panic sets it.
         "target_signature": target_sig,
+        # Provenance: which campaign and config found the bug, and which kext
+        # that config fuzzes -- the kext_id flag alone does not say.
+        "campaign": campaign, "config": config, "fuzzed_kext": fuzzed_kext,
         "incidents": [],
         "created_at": now_iso(),
     }
@@ -976,6 +1045,10 @@ def main():
                    help="ring range end (offset back from newest); 0 = newest")
     n.add_argument("--target-sig", dest="target_sig", default=None,
                    help="pin the crash signature to gate minimization on (else the first panic sets it)")
+    n.add_argument("--campaign", default=None, help="campaign that found the bug")
+    n.add_argument("--config", default=None, help="config id that found the bug")
+    n.add_argument("--fuzzed-kext", dest="fuzzed_kext", default=None,
+                   help="kext that config fuzzes")
     n.add_argument("--force", action="store_true")
 
     r = sub.add_parser("run", help="advance the job as far as this boot allows")
@@ -995,7 +1068,8 @@ def main():
         cmd_new(args.name, args.ring, args.executor, args.ringrepro,
                 args.kcov_device, args.kext_id, args.sandbox, args.max_k,
                 args.os_name, args.arch, args.from_off, args.to_off, args.force,
-                args.target_sig, executor_name=args.executor_name)
+                args.target_sig, executor_name=args.executor_name,
+                campaign=args.campaign, config=args.config, fuzzed_kext=args.fuzzed_kext)
     elif args.cmd == "run":
         cmd_run(args.name, reboot_on_hang=args.reboot_on_hang)
     elif args.cmd == "status":
