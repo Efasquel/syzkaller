@@ -67,6 +67,7 @@ BUGS_DIR = CAMPAIGN_DIR / "bugs"
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
+import triage as tri  # noqa: E402  (job outcome constants only; runs as a subprocess)
 from lib import bootinfo  # noqa: E402
 from lib import timefmt  # noqa: E402
 from lib.tablefmt import render, tabulate  # noqa: E402
@@ -985,6 +986,84 @@ def _bench_culprit(s, culprit):
         log("already benched in %s: %s" % (cfg.name, n))
 
 
+def bench_lead_program(s, cfg, key, program, why):
+    """Bench `program`'s selectors under quarantine key `key` as an UNVERIFIED
+    lead. Returns True if anything was benched."""
+    try:
+        seq = culprit_sequence(program)
+    except RuntimeError as e:
+        log("  cannot read selectors from %s (%s); nothing benched" % (program, e))
+        return False
+    qs = load_qstate(cfg)
+    res = qm.bench_lead(qs, key, seq, program)
+    if res is None:
+        log("  %s names no selector; nothing benched" % program)
+        return False
+    save_qstate(cfg, qs)
+    apply_disabled(cfg, qs)
+    log("  benched UNVERIFIED lead for %s (%s): %s -> %s/%s; disabled=%s"
+        % (key, why, program, res["category"], res["disposition"], res["disabled"]))
+    return True
+
+
+def bench_hang(s, job, cfg, program):
+    """A triage job that kept hanging: bench the program that hung. It gets its
+    own quarantine key -- a hang has no panic signature, and filing it under the
+    crash being minimized would claim it reproduces that crash."""
+    if not (cfg and program and Path(program).exists()):
+        log("  hang culprit missing (%s); nothing benched" % program)
+        return
+    bench_lead_program(s, cfg, "hang:%s" % job, program, "hung %d times in triage"
+                       % tri.MAX_HANGS)
+
+
+def newest_ring_program(workdir, dst):
+    """Copy the newest program in workdir's ring buffer to dst, without its id
+    header. The program running when the box panicked, as far as the ring knows.
+    Returns dst, or None."""
+    best = None
+    for p in (Path(workdir) / "ring_buffer").glob("slot_*.syz"):
+        try:
+            head, _, body = p.read_text().partition("\n")
+            n = int(head[3:]) if head.startswith("id=") else None
+        except (OSError, ValueError):
+            continue
+        if n is not None and (best is None or n > best[0]):
+            best = (n, body)
+    if best is None:
+        return None
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(best[1])
+    return str(dst)
+
+
+def exhausted_recurrence(s, sig, info):
+    """An exhausted signature panicked the box again. Count it in the quarantine,
+    and once it has recurred tolerate_budget times, bench the newest ring program
+    as an UNVERIFIED lead -- otherwise nothing ever stops it rebooting the box."""
+    cfg = s.get("current_config")
+    if not cfg:
+        return
+    qs = load_qstate(cfg)
+    n = qm.count_exhausted(qs, sig)
+    save_qstate(cfg, qs)
+    budget = qm._p(qs, "tolerate_budget")
+    why = (s.get("exhausted_why") or {}).get(sig) or "no-repro"
+    if not qm.lead_due(qs, n):
+        log("crash %s: exhausted (%s), not re-triaged; recurrence %d of %d before a "
+            "lead is benched" % (sig, why, n, budget))
+        return
+    lead = newest_ring_program(info.get("workdir") or "",
+                               STATE_DIR / "leads" / ("%s_%s.syz" % (sig, timefmt.now_ts())))
+    if not lead:
+        log("crash %s: exhausted, %d recurrences, but no ring program to bench" % (sig, n))
+        return
+    log("crash %s: exhausted (%s) and recurred %d times; benching the newest ring "
+        "program as a lead" % (sig, why, n))
+    bench_lead_program(s, cfg, sig, lead, "newest ring program, recurrence %d" % n)
+
+
 def route_triage_panics(st, campaign=None, config=None):
     """Catalog the panics that minimization itself produced.
 
@@ -1033,7 +1112,7 @@ def advance_triage(s, d):
     save_state(s)
     log("triage advance %d/%d for job %s"
         % (s["triage_boots"], d["triage_max_boots"], job))
-    triage("run", job)
+    triage("run", job, "--reboot-on-hang")
     # Charge this advance to the triage clock. A crashing subset reboots the box
     # mid-run and we never get here -- reconcile_triage_gap does it next boot.
     s["triage_seconds"] = s.get("triage_seconds", 0.0) + (time.time() - advance_started)
@@ -1042,6 +1121,17 @@ def advance_triage(s, d):
 
     st = triage_state(job)
     route_triage_panics(st, s.get("name"), s.get("current_config"))
+    # A program hung, the executor holds the coverage device, and triage could
+    # not reboot the box. Nothing can run until someone does: fuzzing would die
+    # at startup and every further advance would fail the same way.
+    if st and st.get("needs_reboot"):
+        s["status"] = "halted"
+        s["halt_reason"] = ("triage job %s hung and the box must be rebooted, but it "
+                            "could not reboot itself: %s"
+                            % (job, st["needs_reboot"].get("why")))
+        save_state(s)
+        log("HALT: %s" % s["halt_reason"])
+        return
     stage = st.get("stage") if st else "?"
     if not st or stage not in ("DONE", "STUCK"):
         pause = d.get("triage_retry_seconds", DEFAULTS["triage_retry_seconds"])
@@ -1052,48 +1142,54 @@ def advance_triage(s, d):
         s["triage_seconds"] = s.get("triage_seconds", 0.0) + (time.time() - paused)
         return
 
-    # STUCK is a result, not a failure: minimization proved that no subset
-    # reproduces alone, so the bug needs accumulated state. Bench the culprit's
-    # selectors anyway -- quarantine exists to keep fuzzing productive, and the
-    # smallest sequence seen to crash is still the best evidence we have -- but
-    # say plainly that it is unproven, and record it as unverified so the dossier
-    # never presents a lead as a reproducer.
+    # STUCK is a result, not a failure, and its kind says what there is to bench:
+    #   unverified  a subset crashed during the search but not again on its own.
+    #               Benched as an UNVERIFIED lead -- the smallest sequence seen to
+    #               crash is still the best evidence -- and recorded as unproven.
+    #   hang        the search kept hanging. The hung program is benched under its
+    #               own quarantine key (it is not the target crash), and the target
+    #               is exhausted: minimizing it again would hang the same way.
+    #   no-repro, ring-*  nothing smaller than the whole ring reproduced. Benching
+    #               "the whole program" would disable syscalls on no evidence, so
+    #               the signature is recorded as exhausted instead; handle_crash
+    #               counts its recurrences and benches a lead after the budget.
     verified = stage == "DONE"
-    # "Nothing reproduced, ever" is not a finding about the bug -- it means the
-    # search never reached the driver (see triage.py::stage_no_repro). Its culprit
-    # is the whole program by elimination, so benching from it would disable
-    # syscalls on the strength of a measurement that never happened. Record the
-    # signature instead so the same dead search is not run again: this bug was
-    # re-triaged three times in a row, 6,000 probes each, before that was noticed.
-    no_repro = (not verified) and st.get("stuck_kind") == "no-repro"
+    kind = None if verified else st.get("stuck_kind")
     sig = s.get("triage_bug_sig")
-    if no_repro:
-        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
-        log("  NOT benching: a search that never reproduced anything is evidence "
-            "about the environment, not about the bug")
+    cfg = s.get("current_config")
+    if not verified:
+        log("triage %s STUCK (%s): %s"
+            % (job, kind, st.get("stuck_reason", "no verified culprit")))
+    if kind in tri.NO_CULPRIT_KINDS or kind == "hang":
+        if kind == "hang":
+            bench_hang(s, job, cfg, st.get("hang_culprit"))
+        else:
+            log("  NOT benching: there is no culprit smaller than the whole ring")
         if sig and sig not in s.setdefault("exhausted_sigs", []):
             s["exhausted_sigs"].append(sig)
-            log("  %s recorded as exhausted; it will not be re-triaged until the "
-                "environment changes (fuzz-campaign.py forget-exhausted %s)"
-                % (sig, s["name"]))
-    elif not verified:
-        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
-        log("  benching its selectors anyway so fuzzing can continue, but the "
-            "reproducer is UNVERIFIED -- it is a lead, not a proof")
-
-    culprit = st.get("final_culprit") or st.get("conn_culprit")
-    cfg = s.get("current_config")
-    if no_repro:
-        pass
-    elif culprit and Path(culprit).exists() and sig and cfg:
-        quarantine_apply_culprit(s, sig, cfg, culprit)
-        # Write the reproducer back into the bug inventory. The quarantine knows
-        # the culprit and triage holds the .syz, but the dossier -- the thing that
-        # becomes a vendor report -- knew neither, and reported method: None.
-        attribute_bug(sig, culprit, job, verified)
+        if sig:
+            s.setdefault("exhausted_why", {})[sig] = kind
+            log("  %s recorded as exhausted (%s): not re-triaged; after %d more "
+                "recurrences its newest ring program is benched as an UNVERIFIED "
+                "lead (fuzz-campaign.py forget-exhausted %s to retry)"
+                % (sig, kind, qm.DEFAULT_PARAMS["tolerate_budget"], s["name"]))
     else:
-        log("triage %s %s but missing culprit/sig/config; suppression skipped"
-            % (job, stage))
+        if not verified:
+            log("  benching its selectors anyway so fuzzing can continue, but the "
+                "reproducer is UNVERIFIED -- it is a lead, not a proof")
+        elif st.get("calls_reduced") is False:
+            log("  calls could not be reduced; the verified connection culprit is "
+                "the reproducer")
+        culprit = st.get("final_culprit") or st.get("conn_culprit")
+        if culprit and Path(culprit).exists() and sig and cfg:
+            quarantine_apply_culprit(s, sig, cfg, culprit)
+            # Write the reproducer back into the bug inventory. The quarantine knows
+            # the culprit and triage holds the .syz, but the dossier -- the thing
+            # that becomes a vendor report -- knew neither, and reported method: None.
+            attribute_bug(sig, culprit, job, verified)
+        else:
+            log("triage %s %s but missing culprit/sig/config; suppression skipped"
+                % (job, stage))
     # The quarantine owns the disable/rotate decision, but the campaign still
     # records which signatures it has spent a triage on -- that is what `status`
     # reports and what makes a re-triage of the same bug visible.
@@ -1104,9 +1200,11 @@ def advance_triage(s, d):
     s["triage_bug_sig"] = None
     s["triage_boots"] = 0
     save_state(s)
-    log("triage %s %s; bug %s benched (%s); resuming fuzzing"
+    log("triage %s %s; bug %s %s; resuming fuzzing"
         % (job, "COMPLETE" if verified else "STUCK", sig,
-           "verified reproducer" if verified else "UNVERIFIED lead"))
+           "benched (verified reproducer)" if verified
+           else "exhausted (%s)" % kind if sig in s.get("exhausted_sigs", [])
+           else "benched (UNVERIFIED lead)"))
 
 
 # --- the loop ----------------------------------------------------------------
@@ -1204,9 +1302,7 @@ def handle_crash(s, d, info):
         log("crash: no readable panic signature; resuming without a decision")
         return False
     if sig in (s.get("exhausted_sigs") or []):
-        log("crash %s: already exhausted a full minimization that reproduced "
-            "nothing; not re-triaging (fuzz-campaign.py forget-exhausted %s to "
-            "retry after fixing the environment)" % (sig, s["name"]))
+        exhausted_recurrence(s, sig, info)
         return False
     if quarantine_decide(s, sig) != "triage":
         return False
@@ -1257,7 +1353,8 @@ def triage_probe_epoch(job, lo, hi):
     if not st or not st.get("dir"):
         return None
     best = None
-    for name in ("conn_state.json", "call_state.json"):
+    # The ring replay rewrites its checkpoint before every slot, like a probe.
+    for name in ("conn_state.json", "call_state.json", "replay_state.json"):
         p = Path(st["dir"]) / name
         cands = []
         try:
@@ -1265,7 +1362,8 @@ def triage_probe_epoch(job, lo, hi):
         except OSError:
             continue
         ck = read_json(p) or {}
-        cands += [ck.get(k) for k in ("attempting_at", "verifying_at", "hanging_at")]
+        cands += [ck.get(k) for k in ("attempting_at", "verifying_at", "hanging_at",
+                                      "pending_at")]
         for t in cands:
             if t and lo <= t <= hi and (best is None or t > best):
                 best = t
@@ -1596,14 +1694,13 @@ def cmd_run(name):
             # wall budget without ever noticing. Check before spending another
             # boot on triage. Only the wall clock can expire here; a fuzz-clock
             # budget deliberately does not charge triage at all.
+            # A job is not abandoned half-way when the budget runs out: it is
+            # finished (still bounded by triage_max_boots), its result benched,
+            # and the config advanced after -- see the budget check below.
             item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
             if budget_spent(s, d) >= item["budget_seconds"]:
-                log("budget spent (%s clock) while triaging %s; stopping the "
-                    "campaign with the triage job left resumable"
-                    % (d.get("budget_clock"), s.get("triage_job")))
-                s["status"] = "done"
-                save_state(s)
-                return
+                log("budget spent (%s clock) while triaging %s; finishing the job, "
+                    "then moving on" % (d.get("budget_clock"), s.get("triage_job")))
             advance_triage(s, d)
             if s["status"] == "halted":
                 return
@@ -1656,6 +1753,15 @@ def cmd_run(name):
             s["config_started_at"] = now_iso()
             save_state(s)
         remaining = budget - budget_spent(s, d)
+        if remaining <= 0:
+            # Spent while triaging (the only phase that can overrun it). The
+            # manager was stopped at the crash; starting it again only to stop it
+            # at the first budget check would cost a whole preparation.
+            log("budget spent on %s (during triage); advancing" % config_id(cfg))
+            results_commit(s, d, "end", cfg=cfg)
+            advance_config(s)
+            save_state(s)
+            continue
         log("config %d/%d: %s (%.0f min left of %.1fh %s budget; this config so "
             "far: prep %s, fuzz %s, triage %s, reboots %s)"
             % (s["cursor"] + 1, len(d["items"]), config_id(cfg),
@@ -1994,9 +2100,11 @@ def status_lines(name, prev=None):
             % (s.get("triage_job"), s.get("triage_bug_sig"),
                s.get("triage_boots", 0), d["triage_max_boots"]))
     if s.get("exhausted_sigs"):
-        row("exhausted", "%d sig(s) reproduced NOTHING under minimization -- "
-            "environment, not bug (%s)"
-            % (len(s["exhausted_sigs"]), ", ".join(s["exhausted_sigs"][-3:])))
+        why = s.get("exhausted_why") or {}
+        row("exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
+            % (len(s["exhausted_sigs"]),
+               ", ".join("%s %s" % (g, why.get(g, "no-repro"))
+                         for g in s["exhausted_sigs"][-3:])))
     if s.get("suppressed_sigs"):
         row("benched sigs", "%d (%s)"
             % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
@@ -2299,6 +2407,16 @@ def cmd_doctor(name):
         if _exists(ap):
             add("INFO", "launchd agent INSTALLED for %s (%s)" % (u, ap))
 
+    # A probe that hangs leaves an executor holding /dev/pishi until a reboot;
+    # triage reboots by itself only if sudo lets this user run shutdown.
+    if can_reboot():
+        add("OK", "triage can reboot after a hang (sudo -n %s)" % " ".join(tri.REBOOT_CMD[2:]))
+    else:
+        add("WARN", "%s cannot run `%s` without a password: a hang during triage will "
+                    "halt the campaign until someone reboots. Add to /etc/sudoers.d/fuzz: "
+                    "`%s ALL=(root) NOPASSWD: /sbin/shutdown -r now`"
+            % (me, " ".join(tri.REBOOT_CMD[2:]), me))
+
     fails = sum(1 for lvl, _ in checks if lvl == "FAIL")
     warns = sum(1 for lvl, _ in checks if lvl == "WARN")
     print("doctor: campaign %s" % name)
@@ -2313,6 +2431,16 @@ def cmd_doctor(name):
     else:
         print("-> looks good")
     return 1 if fails else 0
+
+
+def can_reboot():
+    """True when sudo lets this user run triage's reboot command, no password."""
+    try:
+        return subprocess.run(["/usr/bin/sudo", "-n", "-l"] + tri.REBOOT_CMD[2:],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def cmd_list():
@@ -3271,10 +3399,11 @@ def cmd_include(name, syscalls, config=None, all_=False, dry_run=False):
 def cmd_forget_exhausted(name, sig=None):
     """Clear signatures recorded as exhausted so they can be triaged again.
 
-    A signature lands there when a full minimization reproduced NOTHING, which
-    means the search could not reach the driver. Once the environment is fixed
-    (the usual cause is a missing executor_name), the bug is worth another pass --
-    but only then, which is why this is a deliberate command and not automatic.
+    A signature lands there when minimization found nothing smaller than the
+    whole ring to blame: nothing reproduced at all (often the environment -- a
+    missing executor_name), only the unmerged ring did, or the search kept
+    hanging. Once the cause is fixed, the bug is worth another pass -- but only
+    then, which is why this is a deliberate command and not automatic.
     """
     s = load_state(name)
     if not s:
@@ -3288,10 +3417,12 @@ def cmd_forget_exhausted(name, sig=None):
             die("%s is not recorded as exhausted for %s (have: %s)"
                 % (sig, name, ", ".join(have)))
         have.remove(sig)
+        (s.get("exhausted_why") or {}).pop(sig, None)
         print("forgot %s; it will be triaged again on its next crash" % sig)
     else:
         print("forgot %d signature(s): %s" % (len(have), ", ".join(have)))
         have = []
+        s["exhausted_why"] = {}
     s["exhausted_sigs"] = have
     save_state(s)
     return 0

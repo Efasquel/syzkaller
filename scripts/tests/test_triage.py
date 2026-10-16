@@ -5,6 +5,8 @@ import shutil
 import sys
 import json
 import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
 
@@ -267,3 +269,162 @@ class ExecScratchPrune(unittest.TestCase):
     def test_missing_exec_dir_is_not_an_error(self):
         shutil.rmtree(self.exec_dir)
         self.assertEqual(triage.prune_exec_scratch(self.st), 0)
+
+
+class FakeRingRepro:
+    """Stands in for subprocess.run: plays syz-ring-repro by writing the
+    checkpoint a real run would leave, then returning its exit code."""
+
+    def __init__(self, jdir, write, rc=0):
+        self.jdir, self.write, self.rc, self.calls = Path(jdir), write, rc, []
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(cmd)
+        self.write(self.jdir, cmd)
+        return types.SimpleNamespace(returncode=self.rc, stdout="")
+
+
+class OutcomeTest(unittest.TestCase):
+    """What each way a minimization can end turns the job into."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        triage.STATE_DIR = self.tmp / ".state"
+        triage.PANIC_DIRS = []
+        self.jdir = self.tmp / "job"
+        self.jdir.mkdir()
+        ring = self.tmp / "ring"
+        ring.mkdir()
+        for i in range(3):
+            (ring / ("slot_%04d.syz" % i)).write_text("id=%d\nopen()\n" % i)
+        self.st = {"name": "j", "dir": str(self.jdir), "ring_buffer": str(ring),
+                   "ringrepro": "rr", "executor": "ex", "flags": {}, "from": -1,
+                   "to": 0, "stage": "MINIMIZE_CONN", "panic_watermark": 0,
+                   "target_signature": "abcd", "incidents": [],
+                   "merged": str(self.jdir / "merged.syz")}
+        Path(self.st["merged"]).write_text("merged\n")
+        triage.save_job(self.st)
+        self.orig_run = triage.subprocess.run
+        self.addCleanup(setattr, triage.subprocess, "run", self.orig_run)
+        self.addCleanup(setattr, triage, "REBOOT_ON_HANG", False)
+        for name in ("diagnose_hang", "job_executor_pids"):
+            self.addCleanup(setattr, triage, name, getattr(triage, name))
+        triage.diagnose_hang = lambda st, n: str(self.jdir / "hangs" / str(n))
+
+    def play(self, write, rc=0):
+        fake = FakeRingRepro(self.jdir, write, rc)
+        triage.subprocess.run = fake
+        st = triage.load_job("j")
+        triage.advance(st)
+        return triage.load_job("j"), fake
+
+    @staticmethod
+    def checkpoint(name, **kw):
+        def write(jdir, cmd):
+            (jdir / name).write_text(json.dumps(kw))
+            (jdir / "culprit.syz").write_text("culprit\n")
+        return write
+
+    def test_conn_search_with_no_hit_replays_the_ring(self):
+        st, _ = self.play(self.checkpoint(
+            "conn_state.json", memo={"1": False, "2": False}, exhausted=True,
+            untestable=["3"]))
+        self.assertEqual(st["stage"], triage.REPLAY)
+        self.assertEqual(st["conn_untestable"], 1)
+
+    def test_conn_search_with_hits_that_fail_recheck_is_an_unverified_lead(self):
+        st, _ = self.play(self.checkpoint(
+            "conn_state.json", memo={"1": True, "2": False}, exhausted=True))
+        self.assertEqual((st["stage"], st["stuck_kind"]), (triage.STUCK, "unverified"))
+        self.assertTrue(Path(st["conn_culprit"]).exists())
+
+    def test_call_search_failing_keeps_the_verified_connection_culprit(self):
+        conn = self.jdir / "conn_culprit.syz"
+        conn.write_text("conn\n")
+        self.st.update(stage="MINIMIZE_CALLS", conn_culprit=str(conn))
+        triage.save_job(self.st)
+        st, _ = self.play(self.checkpoint(
+            "call_state.json", memo={"1": False}, exhausted=True))
+        self.assertEqual(st["stage"], "DONE")
+        self.assertEqual(st["final_culprit"], str(conn))
+        self.assertIs(st["calls_reduced"], False)
+        self.assertTrue(Path(st["call_lead"]).exists())
+        self.assertEqual(triage.result_path(st), str(conn))
+
+    def replay(self, **result):
+        self.st["stage"] = triage.REPLAY
+        triage.save_job(self.st)
+        st, fake = self.play(self.checkpoint("replay_state.json", **result))
+        self.assertIn("-replay-ring", fake.calls[0])
+        return st
+
+    def test_ring_that_does_not_crash_ends_no_repro(self):
+        st = self.replay(result="clean")
+        self.assertEqual((st["stage"], st["stuck_kind"]), (triage.STUCK, "no-repro"))
+        self.assertIsNone(triage.result_path(st))
+        self.assertIn("no-repro", triage.NO_CULPRIT_KINDS)
+
+    def test_ring_that_crashes_twice_is_kept_as_the_reproducer(self):
+        st = self.replay(result="verified", crash_slot="slot_0002.syz")
+        self.assertEqual(st["stuck_kind"], "ring-only")
+        self.assertEqual(sorted(p.name for p in Path(st["ring_copy"]).iterdir()),
+                         ["slot_0000.syz", "slot_0001.syz", "slot_0002.syz"])
+        self.assertEqual(triage.result_path(st), st["ring_copy"])
+        self.assertIn("slot_0002.syz", st["stuck_reason"])
+
+    def test_ring_replay_hitting_another_bug(self):
+        self.assertEqual(self.replay(result="other")["stuck_kind"], "ring-other")
+
+    def test_ring_replay_without_an_answer_resumes(self):
+        st = self.replay(pending="replay")
+        self.assertEqual(st["stage"], triage.REPLAY)
+
+    def hang(self, rc=1):
+        def write(jdir, cmd):
+            if cmd[0] == "rr":
+                (jdir / "conn_state.json").write_text(json.dumps(
+                    {"memo": {}, "hanging": "5", "hanging_at": time.time()}))
+                (jdir / "hang.syz").write_text("hung\n")
+        return self.play(write, rc)
+
+    def test_a_hang_is_recorded_and_the_job_waits_for_a_reboot(self):
+        st, fake = self.hang()
+        self.assertEqual(st["stage"], "MINIMIZE_CONN")
+        self.assertEqual([h["unit"] for h in st["hangs"]], ["5"])
+        self.assertNotIn("needs_reboot", st)        # not asked to reboot
+        self.assertEqual(len(fake.calls), 1)        # no shutdown attempted
+
+    def test_the_third_hang_is_the_answer(self):
+        for _ in range(3):
+            st, _ = self.hang()
+        self.assertEqual((st["stage"], st["stuck_kind"]), (triage.STUCK, "hang"))
+        self.assertEqual(Path(st["hang_culprit"]).read_text(), "hung\n")
+        self.assertEqual(triage.result_path(st), st["hang_culprit"])
+
+    def test_a_failed_reboot_is_recorded_for_the_campaign(self):
+        triage.REBOOT_ON_HANG = True
+        st, fake = self.hang()
+        self.assertEqual(fake.calls[-1], triage.REBOOT_CMD)
+        self.assertIn("needs_reboot", st)
+
+    def test_old_hang_is_not_this_runs(self):
+        def write(jdir, cmd):
+            (jdir / "conn_state.json").write_text(json.dumps(
+                {"memo": {}, "hanging": "5", "hanging_at": 1}))
+        st, _ = self.play(write, rc=1)
+        self.assertNotIn("hangs", st)
+
+    def test_a_job_waiting_for_a_reboot_does_nothing_until_one_happens(self):
+        self.addCleanup(setattr, triage.bootinfo, "boot_epoch", triage.bootinfo.boot_epoch)
+        triage.bootinfo.boot_epoch = lambda: time.time() - 600
+        self.st["needs_reboot"] = {"at": time.time(), "why": "sudo refused"}
+        triage.save_job(self.st)
+        fake = FakeRingRepro(self.jdir, lambda j, c: None)
+        triage.subprocess.run = fake
+        triage.cmd_run("j")
+        self.assertEqual(fake.calls, [])
+        self.st["needs_reboot"]["at"] = 1            # a boot has happened since
+        triage.save_job(self.st)
+        triage.cmd_run("j")
+        self.assertNotIn("needs_reboot", triage.load_job("j"))

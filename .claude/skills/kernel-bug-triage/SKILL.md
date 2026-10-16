@@ -56,16 +56,33 @@ own rank. Never read the `(+N)` as evidence a bug is common.
 
 Stages: `MERGE` → `MINIMIZE_CONN` → `MINIMIZE_CALLS` → `DONE`, or terminal
 `STUCK`. Each crashing subset panics the box, so the job advances one boot at a
-time and resumes from its own checkpoint.
+time and resumes from its own checkpoint. When no connection subset reproduces,
+the job takes `REPLAY_RING` instead of the call stage: the ring is replayed
+exactly as fuzzed, slot by slot, and the job stops. Subsets over the executor's
+64-call limit are skipped, never counted as "no crash".
 
 **`DONE` vs `STUCK` is the distinction that matters for a report:**
 
 - **DONE** — the culprit was re-run *in isolation, as the first program of a
   boot,* and crashed. That is a verified reproducer. Report it.
-- **STUCK** — the subset crashed during the search but not on isolated re-check,
-  so the bug needs state an earlier program left behind. **This is a result, not
-  a failure.** Re-running will not improve it. The saved sequence is a lead, not
-  a proof, and the dossier says so.
+- **DONE with `calls_reduced: false`** — the connection culprit verified but no
+  call subset did; the connection culprit is the reproducer (`call_lead.syz` is
+  the unverified call-level candidate).
+- **STUCK** is a result, not a failure; re-running will not improve it. Read
+  `stuck_kind` (`triage.py status <job>`):
+  - `unverified` — a subset crashed during the search but not on isolated
+    re-check: the bug needs state an earlier program left behind. The saved
+    sequence is a lead, not a proof, and the dossier says so.
+  - `ring-only` — no subset of the merged program reproduced, but the ring
+    replayed as fuzzed crashed twice. The reproducer is the ring itself
+    (`ring/` in the job dir, crash slot in `replay_crash_slot`); merging loses
+    what the bug needs. `ring-unverified` crashed only once.
+  - `no-repro` — nothing reproduced, not even the ring. Suspect the
+    environment first (executor_name, kext_id, kcov_device, sandbox), then
+    state from before the ring's window.
+  - `ring-other` — the ring replay hit a different bug.
+  - `hang` — the job hung 3 times; `hang_culprit.syz` hangs, the stacks are in
+    `hangs/<n>/`. It is a separate (hang) bug, not a reproducer of the panic.
 
 Probes share a kernel boot, so an unverified culprit may simply be whichever
 subset happened to tip the kernel over. Never present one as a reproducer.

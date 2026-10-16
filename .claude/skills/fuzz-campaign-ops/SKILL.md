@@ -119,6 +119,14 @@ before any session starts. Anything written into it becomes the halt reason.
   advance by design; the lifetime totals in `status` are the ones that never do.
 - **A config was skipped** — `status` lists it under `abandoned`: it reached
   `max_crashes` incidents (per config) and the campaign moved on.
+- **Halted with "... hung and the box must be rebooted"** — a triage probe
+  wedged the executor (it holds `/dev/pishi`) and `sudo -n /sbin/shutdown -r
+  now` was refused. Reboot by hand, `resume`, and add the sudoers rule from
+  `fuzz-run-setup.md` (doctor warns when it is missing).
+- **A signature keeps crashing but is never triaged** — `status` lists it under
+  `exhausted` with the kind (`no-repro`, `ring-only`, `hang`, ...). Recurrences
+  are counted; after 4 the newest ring program is benched as an unverified lead.
+  `forget-exhausted` re-allows triage once the cause is fixed.
 - **Halted with "failed to start N times"** — the manager died before its first
   exec; the reason quotes the run log. Look in
   `<workdir>/artifacts/startup-failures/`. A held http port is the usual cause.

@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import crash_fingerprint as cf  # noqa: E402
+from lib import bootinfo  # noqa: E402
 from lib import timefmt  # noqa: E402
 from lib.tablefmt import tabulate  # noqa: E402
 
@@ -60,6 +61,25 @@ STAGES = ("MERGE", "MINIMIZE_CONN", "MINIMIZE_CALLS", "DONE")
 # would have consumed all forty before halting.
 STUCK = "STUCK"
 TERMINAL = ("DONE", STUCK)
+
+# REPLAY_RING is not in STAGES either: it is a detour, taken only when no subset
+# of the merged program reproduced. It replays the ring exactly as fuzzed -- every
+# slot as its own program -- and its answer decides what kind of STUCK the job
+# ends in. Going on to MINIMIZE_CALLS would make no sense without a culprit.
+REPLAY = "REPLAY_RING"
+
+# How a job's STUCK is read by whoever benches its result. These kinds have no
+# culprit worth benching: the "culprit" is the whole merged program or ring.
+NO_CULPRIT_KINDS = ("no-repro", "ring-only", "ring-unverified", "ring-other")
+
+# A program that hangs wedges the executor in the kernel, holding the coverage
+# device until the box reboots. Each hang costs one reboot; after MAX_HANGS in a
+# job the hang is the answer, and the job stops (STUCK, kind "hang").
+MAX_HANGS = 3
+SESSION = SCRIPT_DIR / "fuzz-session.py"
+# Needs a sudoers rule for the running user (see fuzz-run-setup.md):
+#   fuzz ALL=(root) NOPASSWD: /sbin/shutdown -r now
+REBOOT_CMD = ["/usr/bin/sudo", "-n", "/sbin/shutdown", "-r", "now"]
 
 
 # --- small utilities ---------------------------------------------------------
@@ -321,6 +341,19 @@ def _stabilize(culprit, dst):
     return str(dst)
 
 
+def hung_since(state_json, started):
+    """The unit (mask or slot) that hung in a run launched at `started`, or None.
+
+    syz-ring-repro records a hang in its checkpoint before exiting non-zero, and
+    clears it on the first load after a reboot -- so a hang stamped after this
+    run started is this run's.
+    """
+    s = read_json(state_json) or {}
+    if s.get("hanging") and (s.get("hanging_at") or 0) >= started - 2:
+        return s["hanging"]
+    return None
+
+
 def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     """Drive one on-device minimization stage to completion for this boot.
 
@@ -335,41 +368,47 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     cmd = ringrepro_cmd(st, flag, "-state", str(state_json),
                         "-culprit", str(culprit), *gate_args(st), str(prog))
     log("%s: %s" % (stage, " ".join(cmd)))
+    started = time.time()
     rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
     # Reconcile any panic this run produced (it may have rebooted us on a prior
     # invocation; on this one it returned, but earlier subsets still left logs).
     reconcile_panics(st)
     if rc != 0:
+        hung = hung_since(state_json, started)
+        if hung:
+            handle_hang(st, stage, hung)
+            return
         log("%s: syz-ring-repro exited %d (not complete this boot); will resume"
             % (stage, rc))
         return
     if not stage_verified(state_json):
         if stage_exhausted(state_json):
-            # The search is spent: its best candidate was re-checked in isolation
-            # and did not crash. That is a RESULT about the bug -- it needs state
-            # an earlier program leaves behind -- not a reason to try again.
+            if stage == "MINIMIZE_CALLS":
+                keep_conn_culprit(st, culprit)
+                return
             st[out_key] = _stabilize(culprit, job_dir(st) / ("%s.syz" % out_key))
+            if stage_no_repro(state_json):
+                # Not one subset reproduced. Before concluding anything, replay
+                # the ring exactly as it was fuzzed: whether THAT crashes is what
+                # separates "merging lost the bug" from "nothing reproduces".
+                untestable = len((read_json(state_json) or {}).get("untestable") or [])
+                st["conn_untestable"] = untestable
+                st["stage"] = REPLAY
+                save_job(st)
+                log("%s: no subset reproduced%s; replaying the ring as fuzzed"
+                    % (stage, " (%d were over the executor's 64-call limit and could "
+                               "not run)" % untestable if untestable else ""))
+                return
+            # Subsets crashed during the search, but the smallest did not crash
+            # again on its own. That is a RESULT about the bug -- it needs state an
+            # earlier program leaves behind -- not a reason to try again.
             st["stage"] = STUCK
             st["stuck_at"] = stage
-            unit = "connection" if "CONN" in stage else "call"
-            if stage_no_repro(state_json):
-                st["stuck_kind"] = "no-repro"
-                st["stuck_reason"] = (
-                    "NOT ONE probe reproduced the crash -- not a single %s subset, "
-                    "ever. For a bug that panicked the box during fuzzing that is "
-                    "evidence about the ENVIRONMENT, not about the bug: the "
-                    "minimization run cannot reach the driver. Check that this job "
-                    "carries the same executor_name, kext_id, kcov_device and "
-                    "sandbox the config fuzzed under -- a missing executor_name "
-                    "makes every IOServiceOpen return kIOReturnUnsupported and "
-                    "every later call inert. The saved culprit is meaningless "
-                    "here: it is the whole program, by elimination." % unit)
-            else:
-                st["stuck_kind"] = "unverified"
-                st["stuck_reason"] = (
-                    "no %s subset reproduces in isolation; the bug needs accumulated "
-                    "state. The saved culprit is the smallest sequence seen to crash "
-                    "DURING the search, so treat it as a lead, not a proof." % unit)
+            st["stuck_kind"] = "unverified"
+            st["stuck_reason"] = (
+                "no connection subset reproduces in isolation; the bug needs "
+                "accumulated state. The saved culprit is the smallest sequence seen "
+                "to crash DURING the search, so treat it as a lead, not a proof.")
             save_job(st)
             log("%s: STUCK -- %s" % (stage, st["stuck_reason"]))
             log("%s: unverified culprit preserved at %s" % (stage, st[out_key]))
@@ -385,6 +424,223 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
     save_job(st)
     log("%s done -> %s (verified)" % (stage, st[out_key]))
 
+
+def keep_conn_culprit(st, culprit):
+    """MINIMIZE_CALLS ended without a verified call subset: finish on the
+    connection culprit, which MINIMIZE_CONN already verified.
+
+    Ending STUCK here threw a proven reproducer away: the job read as
+    "unverified", and when the call search had no hits at all, as "no-repro" --
+    which the campaign takes to mean the search never reached the driver, so it
+    benched nothing and stopped triaging the signature. The call-level candidate
+    is kept beside it as a lead.
+    """
+    if Path(culprit).exists():
+        st["call_lead"] = _stabilize(culprit, job_dir(st) / "call_lead.syz")
+    st["final_culprit"] = st["conn_culprit"]
+    st["calls_reduced"] = False
+    st["stage"] = "DONE"
+    save_job(st)
+    log("MINIMIZE_CALLS: no call subset reproduces on its own; keeping the verified "
+        "connection culprit %s as the reproducer%s"
+        % (st["conn_culprit"], " (call-level lead: %s)" % st["call_lead"]
+           if st.get("call_lead") else ""))
+
+
+def run_replay(st):
+    """Replay the ring buffer as it was fuzzed, slot by slot, on device.
+
+    Reached only when no subset of the merged program reproduced. syz-ring-repro
+    -replay-ring checkpoints the pass in flight, so a pass that panics the box is
+    recovered on the next boot, where a second pass verifies it. Its answer ends
+    the job: there is no culprit to minimize further either way.
+    """
+    rstate = job_dir(st) / "replay_state.json"
+    ring_out = job_dir(st) / "ring.syz"
+    cmd = ringrepro_cmd(st, "-replay-ring", "-state", str(rstate),
+                        "-culprit", str(ring_out),
+                        "-from", str(st.get("from", -1)), "-to", str(st.get("to", 0)),
+                        *gate_args(st), st["ring_buffer"])
+    log("%s: %s" % (REPLAY, " ".join(cmd)))
+    started = time.time()
+    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
+    reconcile_panics(st)
+    if rc != 0:
+        hung = hung_since(rstate, started)
+        if hung:
+            handle_hang(st, REPLAY, hung)
+            return
+        log("%s: syz-ring-repro exited %d; will resume" % (REPLAY, rc))
+        return
+    r = read_json(rstate) or {}
+    result = r.get("result")
+    if not result:
+        log("%s: no answer yet; will resume" % REPLAY)
+        return
+    st["replay_result"] = result
+    st["replay_crash_slot"] = r.get("crash_slot")
+    st["replay_skipped"] = len(r.get("skipped") or [])
+    if result in ("verified", "unverified"):
+        # The live ring is overwritten as soon as fuzzing resumes, and here it is
+        # the only reproducer there is.
+        st["ring_copy"] = preserve_ring(st)
+    st["stage"] = STUCK
+    st["stuck_at"] = REPLAY
+    st["stuck_kind"], st["stuck_reason"] = replay_verdict(st)
+    save_job(st)
+    log("%s: STUCK (%s) -- %s" % (REPLAY, st["stuck_kind"], st["stuck_reason"]))
+
+
+def replay_verdict(st):
+    """(stuck_kind, stuck_reason) for a finished ring replay."""
+    result = st.get("replay_result")
+    slot = st.get("replay_crash_slot") or "?"
+    notes = []
+    if st.get("conn_untestable"):
+        notes.append("%d connection subset(s) were over the executor's 64-call limit "
+                     "and could not be tested" % st["conn_untestable"])
+    if st.get("replay_skipped"):
+        notes.append("%d ring slot(s) were over that limit and did not run"
+                     % st["replay_skipped"])
+    tail = (" Note: %s." % "; ".join(notes)) if notes else ""
+    if result == "verified":
+        return "ring-only", (
+            "no subset of the merged program reproduced, but the ring replayed as "
+            "fuzzed crashed twice (first at %s). Merging -- one process, connections "
+            "kept alive across program boundaries, calls dropped by the static pass -- "
+            "loses what the bug needs. The reproducer is the ring itself, kept at %s."
+            % (slot, st.get("ring_copy")) + tail)
+    if result == "unverified":
+        return "ring-unverified", (
+            "no subset of the merged program reproduced; the ring replayed as fuzzed "
+            "crashed once (at %s) but not on the second pass. A lead, not a proof; "
+            "the ring is kept at %s." % (slot, st.get("ring_copy")) + tail)
+    if result == "other":
+        return "ring-other", (
+            "no subset of the merged program reproduced, and replaying the ring "
+            "panicked the box with a DIFFERENT bug; the target never reproduced." + tail)
+    return "no-repro", (
+        "NOT one subset reproduced, and the ring replayed exactly as fuzzed did not "
+        "crash either: the crash does not reproduce from what the ring recorded. "
+        "Either this environment differs from the fuzzing run -- check the job "
+        "carries the config's executor_name, kext_id, kcov_device and sandbox; a "
+        "missing executor_name makes every IOServiceOpen return "
+        "kIOReturnUnsupported -- or the bug needs state from before the ring's "
+        "window. Nothing here is worth benching." + tail)
+
+
+def preserve_ring(st):
+    """Copy the ring buffer into the job, so the reproducer outlives fuzzing."""
+    dst = job_dir(st) / "ring"
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for p in Path(st["ring_buffer"]).glob("slot_*.syz"):
+            shutil.copy2(p, dst / p.name)
+    except OSError as e:
+        log("could not preserve the ring buffer: %s" % e)
+        return None
+    return str(dst)
+
+
+def job_executor_pids(st):
+    """Pids of this job's executors. diagnose-hang's own search matches on
+    syz-executor's path, which misses the renamed copy -executor_name runs."""
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "pid,command"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    name = (st.get("flags") or {}).get("executor_name")
+    pids = []
+    for line in (out or "").splitlines()[1:]:
+        pid_s, _, cmd = line.strip().partition(" ")
+        exe = cmd.split(" ", 1)[0]
+        if exe == st.get("executor") or (name and os.path.basename(exe) == name):
+            try:
+                pids.append(int(pid_s))
+            except ValueError:
+                pass
+    return pids
+
+
+def diagnose_hang(st, n):
+    """Capture the wedged executor's stack (sample + spindump). Best-effort: the
+    reboot that follows destroys the evidence, so this is the only chance."""
+    out = job_dir(st) / "hangs" / ("%d" % n)
+    pids = job_executor_pids(st)
+    cmd = [sys.executable, str(SESSION), "diagnose-hang", "--out", str(out)]
+    cmd += [str(p) for p in pids]
+    log("hang: capturing the wedged executor's stack -> %s" % out)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=180)
+        for line in (p.stdout or "").splitlines():
+            if line.strip():
+                log("  %s" % line.rstrip())
+    except (OSError, subprocess.SubprocessError) as e:
+        log("hang: diagnose-hang failed: %s" % e)
+    return str(out)
+
+
+def handle_hang(st, where, unit):
+    """A program never returned: record it, capture the stack, and reboot.
+
+    Without a reboot nothing can run -- the wedged executor holds the coverage
+    device -- and every relaunch on the same boot fails the same way. That used
+    to spend a campaign's whole triage budget (40 advances) on one hang.
+    """
+    hangs = st.setdefault("hangs", [])
+    n = len(hangs) + 1
+    hangs.append({"at": now_iso(), "where": where, "unit": unit,
+                  "diagnosis": diagnose_hang(st, n)})
+    log("%s: HANG %d of %d on %s" % (where, n, MAX_HANGS, unit))
+    if n >= MAX_HANGS:
+        prog = job_dir(st) / "hang.syz"
+        st["hang_culprit"] = (_stabilize(prog, job_dir(st) / "hang_culprit.syz")
+                              if prog.exists() else None)
+        st["stage"] = STUCK
+        st["stuck_at"] = where
+        st["stuck_kind"] = "hang"
+        st["stuck_reason"] = (
+            "the job hung %d times (last on %s): the program wedges a kernel thread "
+            "without panicking, so the panic being minimized cannot be reached past "
+            "it. The hung program is kept at %s; the stacks are under %s."
+            % (n, unit, st["hang_culprit"], job_dir(st) / "hangs"))
+        log("%s: STUCK -- %s" % (where, st["stuck_reason"]))
+    save_job(st)
+    request_reboot(st)
+
+
+def request_reboot(st):
+    """Reboot to free the coverage device, when the run was allowed to.
+
+    Records needs_reboot when it cannot, so the campaign halts with the reason
+    instead of retrying on a device nothing can open."""
+    if not REBOOT_ON_HANG:
+        log("hang: the box must be REBOOTED before anything else can run "
+            "(triage run --reboot-on-hang does it automatically)")
+        return
+    log("hang: rebooting to free the coverage device: %s" % " ".join(REBOOT_CMD))
+    try:
+        p = subprocess.run(REBOOT_CMD, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, timeout=30)
+        rc, out = p.returncode, (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        rc, out = 1, str(e)
+    if rc == 0:
+        # The shutdown is under way; do not let the caller start more work.
+        time.sleep(REBOOT_GRACE)
+        out = "the reboot was accepted but the box was still up %ds later" % REBOOT_GRACE
+    st["needs_reboot"] = {"at": time.time(), "why": "%s (%s)" % (out or "rc=%d" % rc,
+                                                                  " ".join(REBOOT_CMD))}
+    save_job(st)
+    log("hang: could not reboot: %s" % st["needs_reboot"]["why"])
+
+
+REBOOT_GRACE = 300
+# Set by `run --reboot-on-hang` (the campaign passes it). Never stored in the job:
+# a later hand-run of the same job must not reboot the box unasked.
+REBOOT_ON_HANG = False
 
 
 def prune_exec_scratch(st):
@@ -429,19 +685,32 @@ def advance(st):
     elif stage == "MINIMIZE_CALLS":
         run_minimize(st, "MINIMIZE_CALLS", "-minimize-calls",
                      "conn_culprit", "final_culprit", "call_state.json")
+    elif stage == REPLAY:
+        run_replay(st)
     elif stage in TERMINAL:
         return
     else:
         die("unknown stage: %s" % stage)
 
 
-def cmd_run(name):
+def cmd_run(name, reboot_on_hang=False):
     """One launch of the driver: advance until DONE or a reboot kills us."""
+    global REBOOT_ON_HANG
+    REBOOT_ON_HANG = reboot_on_hang
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     st = load_job(name)
+    # A reboot the job asked for has happened: the device is free again.
+    need = st.get("needs_reboot")
+    boot = bootinfo.boot_epoch()
+    if need and boot and boot > need.get("at", 0):
+        st.pop("needs_reboot")
+        save_job(st)
+    elif need:
+        log("%s: waiting for a reboot (a hung executor holds the coverage device): %s"
+            % (name, need.get("why")))
+        return
     if st["stage"] in TERMINAL:
-        log("%s already %s: %s"
-            % (name, st["stage"], st.get("final_culprit") or st.get("conn_culprit") or "?"))
+        log("%s already %s: %s" % (name, st["stage"], result_path(st) or "?"))
         if st["stage"] == STUCK:
             log("  %s" % st.get("stuck_reason", ""))
         pruned = prune_exec_scratch(st)
@@ -461,8 +730,8 @@ def cmd_run(name):
     if pruned:
         log("triage %s: pruned %d executor scratch dir(s)" % (name, pruned))
     if st["stage"] == STUCK:
-        log("triage %s STUCK at %s -> %s"
-            % (name, st.get("stuck_at"), st.get("conn_culprit") or st.get("final_culprit")))
+        log("triage %s STUCK (%s) at %s -> %s"
+            % (name, st.get("stuck_kind"), st.get("stuck_at"), result_path(st)))
         log("  %s" % st.get("stuck_reason", ""))
         _print_summary(st)
         return
@@ -471,10 +740,30 @@ def cmd_run(name):
         _print_summary(st)
 
 
+def result_path(st):
+    """What a finished job leaves behind: its reproducer, lead or evidence."""
+    kind = st.get("stuck_kind") if st.get("stage") == STUCK else None
+    if kind == "hang":
+        return st.get("hang_culprit")
+    if kind in ("ring-only", "ring-unverified"):
+        return st.get("ring_copy")
+    if kind in ("no-repro", "ring-other"):
+        return None
+    return st.get("final_culprit") or st.get("conn_culprit")
+
+
 def _print_summary(st):
     sigs = cf.load_store(job_dir(st) / "signatures.json").get("signatures", {})
     print("\n== triage %s ==" % st["name"])
-    print("final reproducer : %s" % st.get("final_culprit", "(none)"))
+    print("result           : %s" % (result_path(st) or "(none)"))
+    if st.get("stage") == STUCK:
+        print("stuck            : %s at %s" % (st.get("stuck_kind"), st.get("stuck_at")))
+    if st.get("calls_reduced") is False:
+        print("note             : calls not reduced; the verified connection culprit "
+              "is the reproducer (call lead: %s)" % (st.get("call_lead") or "-"))
+    if st.get("hangs"):
+        print("hangs            : %d (stacks under %s)"
+              % (len(st["hangs"]), job_dir(st) / "hangs"))
     print("target signature : %s" % st.get("target_signature", "(none)"))
     print("distinct crashes : %d" % len(sigs))
     for sig, rec in sigs.items():
@@ -562,9 +851,9 @@ def cmd_list():
             continue
         # A finished job's worth is its reproducer, and whether it is proven.
         if st["stage"] == "DONE":
-            repro = "verified"
+            repro = "verified" if st.get("calls_reduced", True) else "verified(conn)"
         elif st["stage"] == STUCK:
-            repro = "UNVERIFIED"
+            repro = "STUCK:%s" % (st.get("stuck_kind") or "?")
         else:
             repro = "-"
         rows.append((st["name"], st["stage"], repro,
@@ -667,8 +956,12 @@ def main():
                    help="pin the crash signature to gate minimization on (else the first panic sets it)")
     n.add_argument("--force", action="store_true")
 
-    for cmd, helptext in (("run", "advance the job as far as this boot allows"),
-                          ("status", "show a job's stage + crash ledger"),
+    r = sub.add_parser("run", help="advance the job as far as this boot allows")
+    r.add_argument("name")
+    r.add_argument("--reboot-on-hang", action="store_true",
+                   help="reboot (sudo -n /sbin/shutdown -r now) when a program hangs, "
+                        "to free the coverage device the wedged executor holds")
+    for cmd, helptext in (("status", "show a job's stage + crash ledger"),
                           ("install", "load a launchd agent (relaunch after reboot)"),
                           ("uninstall", "unload the launchd agent")):
         s = sub.add_parser(cmd, help=helptext)
@@ -682,7 +975,7 @@ def main():
                 args.os_name, args.arch, args.from_off, args.to_off, args.force,
                 args.target_sig, executor_name=args.executor_name)
     elif args.cmd == "run":
-        cmd_run(args.name)
+        cmd_run(args.name, reboot_on_hang=args.reboot_on_hang)
     elif args.cmd == "status":
         cmd_status(args.name)
     elif args.cmd == "list":

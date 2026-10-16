@@ -42,11 +42,12 @@ device fine.
 
 ---
 
-## Two privileged prerequisites (one-time, `sudo`)
+## Privileged prerequisites (one-time, `sudo`)
 
-There is really only one, and it fails **silently** — the campaign keeps fuzzing and
-just never notices a crash — so `doctor` checks it explicitly. The second item is here
-because `doctor` warns about it and the obvious "fix" is a bad one.
+The first fails **silently** — the campaign keeps fuzzing and just never notices a
+crash — so `doctor` checks it explicitly. The second is here because `doctor` warns
+about it and the obvious "fix" is a bad one. The third lets triage recover from a hang
+on its own.
 
 ### 1. Panic reports must be readable by `fuzz`
 
@@ -100,6 +101,23 @@ excludes `*.kernel.core.gz` from incident bundles (`PANIC_GLOBS` takes only the
 
 If core dumping is ever re-enabled and the cores start accumulating again, prune them
 from a small root-owned periodic LaunchDaemon rather than widening the directory.
+
+### 3. Let triage reboot the box after a hang
+
+A minimization probe that hangs leaves its executor wedged in the kernel (STAT `U`),
+holding `/dev/pishi` until the machine reboots: SIGKILL cannot reach it, and nothing
+else can run on that boot. Triage captures the stack (`diagnose-hang`) and then
+reboots with `sudo -n /sbin/shutdown -r now`. Allow exactly that command:
+
+```sh
+echo 'fuzz ALL=(root) NOPASSWD: /sbin/shutdown -r now' | sudo tee /etc/sudoers.d/fuzz-reboot
+sudo chmod 0440 /etc/sudoers.d/fuzz-reboot
+sudo visudo -cf /etc/sudoers.d/fuzz-reboot                     # -> parsed OK
+sudo -u fuzz sudo -n -l /sbin/shutdown -r now                  # -> prints the command
+```
+
+Without it a hang **halts** the campaign with the reason, and someone has to reboot
+by hand. `doctor` warns when the rule is missing.
 
 ---
 
@@ -424,12 +442,28 @@ schedule.
 
 ### When triage gets STUCK
 
-Minimization can finish without a verified reproducer: the culprit crashed during
-the search but not when re-run on its own, which means the bug needs state an
-earlier program left behind. That is a **result**, not a failure. The job stops at
-`STUCK`, the campaign benches the selectors anyway so fuzzing continues, and the
-bug dossier records the sequence as an *unverified lead* rather than a
-reproducer. Re-running will not improve it.
+Minimization can finish without a verified reproducer. That is a **result**, not a
+failure, and re-running will not improve it. The job's `stuck_kind` says which:
+
+| kind | what happened | what the campaign does |
+|---|---|---|
+| `unverified` | a connection subset crashed during the search but not when re-run on its own: the bug needs state an earlier program left behind | benches the selectors anyway; the dossier records an *unverified lead* |
+| `no-repro` | no subset reproduced, **and** the ring replayed exactly as fuzzed did not crash either | benches nothing; the signature is *exhausted* |
+| `ring-only` | no subset of the merged program reproduced, but the ring replayed as fuzzed crashed twice: merging loses what the bug needs. The ring is kept in the job as `ring/` | benches nothing; *exhausted* |
+| `ring-unverified` / `ring-other` | the ring crashed once only / panicked with a different bug | benches nothing; *exhausted* |
+| `hang` | the job hung 3 times (each hang costs a reboot) | benches the hung program under its own quarantine key `hang:<job>`; the target is *exhausted* |
+
+When the connection culprit was verified but the call stage cannot reduce it, the job
+still ends `DONE`, with the connection culprit as the reproducer.
+
+An **exhausted** signature is not triaged again (that would repeat the same answer).
+Its recurrences are counted in the quarantine, and after `tolerate_budget` (4) of them
+the newest program in the ring buffer is benched as an *unverified lead* so it stops
+costing a reboot each time. `fuzz-campaign.py forget-exhausted <campaign> [sig]`
+allows a new triage once the cause is fixed.
+
+If the budget runs out while a job is in progress, the job is finished first, its
+result benched, and then the campaign moves to the next config.
 
 ### Switching which campaign runs
 

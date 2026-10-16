@@ -40,6 +40,18 @@ culprit.syz             (minimal crashing set of IOKit connections)
 culprit.syz             (also minimal in IOConnectCallMethod calls) ✓ verified
 ```
 
+If **no** connection subset reproduces, the job does not go on to the calls: there
+is nothing to reduce. It replays the ring instead, exactly as fuzzed — every slot in
+order, each as its own program (`syz-ring-repro -replay-ring`) — and stops
+(`STUCK`). The replay's answer says whether the merge lost the bug (`ring-only`: the
+ring crashes, the merged program does not) or nothing reproduces at all (`no-repro`).
+If the call stage finds nothing, the verified connection culprit is the reproducer.
+
+A subset over the executor's 64-call limit (`kMaxCalls`) cannot run: it is skipped
+and never recorded as "no crash". A probe that hangs is saved as `hang.syz`; triage
+captures the wedged executor's stack and (with `run --reboot-on-hang`, as the
+campaign runs it) reboots. The third hang in a job ends it (`STUCK`, kind `hang`).
+
 Each `-minimize-*` stage tests subsets on the device. A subset that reproduces
 **panics the box and reboots it**, killing the driver; the stage checkpoints to
 `conn_state.json` / `call_state.json` first, so on the next boot it resumes
@@ -225,10 +237,13 @@ fuzzing ──crash──▶ fingerprint the panic
 ```
 
 On a new bug the campaign pauses fuzzing, stands up a triage job from the
-session's ring buffer, and on each boot advances it (`triage.py run`) until DONE;
-then it benches the culprit's syscall(s) in the crashed config and resumes. If
-triage can't reach a culprit within `triage_max_boots` advances, the campaign
-halts with a reason for a human to look. `status` shows the phase:
+session's ring buffer, and on each boot advances it (`triage.py run
+--reboot-on-hang`) until DONE or STUCK; then it benches what the outcome allows
+in the crashed config and resumes (see "When triage gets STUCK" in
+`fuzz-run-setup.md` for each kind). If the budget runs out meanwhile, the job is
+finished before the campaign moves on. If triage can't finish within
+`triage_max_boots` advances, or a hang needs a reboot the box cannot do itself,
+the campaign halts with a reason for a human to look. `status` shows the phase:
 
 ```sh
 scripts/fuzz-campaign.py status <campaign>   # phase, triage job, benched sigs
@@ -286,6 +301,10 @@ Under `triage/<name>/`:
 | `merged.syz` | ring buffer merged + statically reduced |
 | `conn_state.json` / `call_state.json` | per-stage crash-safe checkpoints (bitmasks) |
 | `culprit.syz` | the minimal, verified reproducer |
+| `conn_culprit.syz` / `final_culprit.syz` | each stage's result, kept under its own name |
+| `call_lead.syz` | the call stage's unverified candidate, when only the connection culprit verified |
+| `replay_state.json` / `ring/` / `ring.syz` | the ring replay's checkpoint; the preserved ring when it crashed, and its concatenation (for naming syscalls only) |
+| `hang.syz` / `hang_culprit.syz` / `hangs/<n>/` | the last program that hung; the one kept when the job ended on hangs; the stacks `diagnose-hang` captured |
 | `syscalls.json` | list of syscall names to disable, from the culprit (`-emit-json`) |
 | `signatures.json` | dedup ledger: one entry per distinct panic signature |
 | `reports/` | archived panic reports |

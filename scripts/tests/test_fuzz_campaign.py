@@ -377,6 +377,126 @@ class CoordinatorTest(unittest.TestCase):
         self.assertIsNone(s["triage_job"])
 
 
+class TriageOutcomeTest(unittest.TestCase):
+    """What the campaign does with each way a triage job can end."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.cfg = write_cfg(self.dir, {"target": "darwin/arm64", "enable_syscalls": ["a"]})
+        self.s = fc.init_state("camp")
+        self.s.update({"phase": "triaging", "triage_job": "camp_t1",
+                       "triage_bug_sig": "SIG1", "current_config": str(self.cfg)})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def advance(self, st, selectors=("syz_IOConnectCallMethod$Foo_5",)):
+        runs = []
+        with mock.patch.object(fc, "STATE_DIR", self.dir / "state"), \
+             mock.patch.object(fc, "triage", lambda *a, **k: runs.append(a) or (0, "")), \
+             mock.patch.object(fc, "triage_state", lambda job: st), \
+             mock.patch.object(fc, "route_triage_panics", lambda *a, **k: None), \
+             mock.patch.object(fc, "wait_for_stop", lambda *a, **k: None), \
+             mock.patch.object(fc, "attribute_bug", lambda *a, **k: None), \
+             mock.patch.object(fc, "culprit_sequence", lambda c: list(selectors)), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            fc.advance_triage(self.s, dict(fc.DEFAULTS))
+        return runs
+
+    def disabled(self):
+        return json.loads(self.cfg.read_text()).get("disable_syscalls", [])
+
+    def test_triage_runs_with_reboot_on_hang(self):
+        runs = self.advance({"stage": "MINIMIZE_CONN"})
+        self.assertEqual(runs, [("run", "camp_t1", "--reboot-on-hang")])
+
+    def test_no_repro_is_exhausted_and_benches_nothing(self):
+        self.advance({"stage": "STUCK", "stuck_kind": "no-repro",
+                      "conn_culprit": str(self.cfg)})
+        self.assertEqual(self.s["exhausted_sigs"], ["SIG1"])
+        self.assertEqual(self.s["exhausted_why"], {"SIG1": "no-repro"})
+        self.assertEqual(self.disabled(), [])
+        self.assertEqual(self.s["phase"], "fuzzing")
+
+    def test_a_ring_only_reproducer_is_not_benched_either(self):
+        self.advance({"stage": "STUCK", "stuck_kind": "ring-only",
+                      "ring_copy": str(self.dir)})
+        self.assertEqual(self.s["exhausted_why"], {"SIG1": "ring-only"})
+        self.assertEqual(self.disabled(), [])
+
+    def test_a_hang_benches_the_hung_program_under_its_own_key(self):
+        hung = self.dir / "hang_culprit.syz"
+        hung.write_text("syz_IOConnectCallMethod$Foo_9(0x0)\n")
+        self.advance({"stage": "STUCK", "stuck_kind": "hang", "hang_culprit": str(hung)},
+                     selectors=["syz_IOConnectCallMethod$Foo_9"])
+        self.assertEqual(self.disabled(), ["syz_IOConnectCallMethod$Foo_9"])
+        with mock.patch.object(fc, "STATE_DIR", self.dir / "state"):
+            cat = fc.load_qstate(str(self.cfg))["catalog"]
+        self.assertIn("hang:camp_t1", cat)
+        self.assertNotIn("SIG1", cat)             # not filed as the target crash
+        self.assertEqual(self.s["exhausted_why"], {"SIG1": "hang"})
+
+    def test_a_verified_connection_culprit_is_benched_when_calls_did_not_reduce(self):
+        culprit = self.dir / "conn_culprit.syz"
+        culprit.write_text("x\n")
+        with mock.patch.object(fc, "STATE_DIR", self.dir / "state"):
+            qs = fc.load_qstate(str(self.cfg))
+            fc.qm.on_crash(qs, "SIG1", None)
+            fc.save_qstate(str(self.cfg), qs)
+        self.advance({"stage": "DONE", "final_culprit": str(culprit),
+                      "conn_culprit": str(culprit), "calls_reduced": False})
+        self.assertEqual(self.disabled(), ["syz_IOConnectCallMethod$Foo_5"])
+        self.assertEqual(self.s.get("exhausted_sigs"), [])
+
+    def test_a_hang_the_box_could_not_reboot_from_halts(self):
+        self.advance({"stage": "MINIMIZE_CONN",
+                      "needs_reboot": {"at": 1, "why": "sudo: a password is required"}})
+        self.assertEqual(self.s["status"], "halted")
+        self.assertIn("password is required", self.s["halt_reason"])
+
+
+class ExhaustedRecurrenceTest(unittest.TestCase):
+    """An exhausted signature that keeps panicking the box: counted, then a lead
+    is benched so it stops costing a reboot every time."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.cfg = write_cfg(self.dir, {"target": "darwin/arm64", "enable_syscalls": ["a"]})
+        ring = self.dir / "wd" / "ring_buffer"
+        ring.mkdir(parents=True)
+        (ring / "slot_0001.syz").write_text("id=9\nnewest()\n")
+        (ring / "slot_0002.syz").write_text("id=3\nolder()\n")
+        self.s = fc.init_state("camp")
+        self.s.update({"current_config": str(self.cfg), "exhausted_sigs": ["SIG1"],
+                       "exhausted_why": {"SIG1": "no-repro"}})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_newest_ring_program_is_the_highest_id_without_its_header(self):
+        out = fc.newest_ring_program(self.dir / "wd", self.dir / "lead.syz")
+        self.assertEqual(Path(out).read_text(), "newest()\n")
+        self.assertIsNone(fc.newest_ring_program(self.dir / "nowhere", self.dir / "x.syz"))
+
+    def test_lead_is_benched_after_the_tolerate_budget(self):
+        seen = []
+        info = {"panics": [], "workdir": str(self.dir / "wd")}
+        with mock.patch.object(fc, "STATE_DIR", self.dir / "state"), \
+             mock.patch.object(fc, "route_bug_registry", lambda *a, **k: None), \
+             mock.patch.object(fc, "latest_panic_signature", lambda s: "SIG1"), \
+             mock.patch.object(fc, "culprit_sequence",
+                               lambda c: seen.append(Path(c).read_text()) or ["sel_A"]):
+            results = [fc.handle_crash(self.s, dict(fc.DEFAULTS), info) for _ in range(4)]
+            disabled = json.loads(self.cfg.read_text()).get("disable_syscalls", [])
+            rec = fc.load_qstate(str(self.cfg))["catalog"]["SIG1"]
+        self.assertEqual(results, [False] * 4)      # never re-triaged
+        self.assertEqual(seen, ["newest()\n"])      # benched once, on the 4th
+        self.assertEqual(disabled, ["sel_A"])
+        self.assertFalse(rec["leads"][0]["verified"])
+
+
 class ClockTest(unittest.TestCase):
     """The three budget clocks and their lifetime totals.
 
@@ -414,21 +534,32 @@ class ClockTest(unittest.TestCase):
         self.assertGreaterEqual(fc.budget_spent(s, {"budget_clock": "wall"}),
                                 fc.budget_spent(s, {"budget_clock": "fuzz"}))
 
-    def test_triage_phase_stops_when_the_wall_budget_is_spent(self):
-        """The budget is otherwise only tested inside supervise, which does not
-        run while triaging -- so a long minimization would overrun the envelope
-        without ever noticing."""
+    def test_budget_spent_while_triaging_finishes_the_job_then_advances(self):
+        """A job is not abandoned half-way when the budget runs out (that used to
+        end the whole campaign, so later configs never ran): it is finished, and
+        the config is advanced without starting a manager only to stop it."""
         s = fc.init_state("camp")
         s.update({"phase": "triaging", "triage_job": "camp_t1",
                   "triage_bug_sig": "S", "active_seconds": 3600.0,
                   "triage_seconds": 3600.0})
-        d = dict(fc.DEFAULTS, budget_clock="wall",
+        d = dict(fc.DEFAULTS, budget_clock="wall", loop=False,
                  items=[{"config": "/x.cfg", "budget_seconds": 7200}], name="camp")
-        advanced = []
+        advanced, commits = [], []
+
+        def finish(st, dd):
+            advanced.append(1)
+            st["phase"] = "fuzzing"
+            st["triage_job"] = None
+
+        def no_start(*a, **k):
+            raise AssertionError("a manager was started on a spent budget")
+
         with mock.patch.object(fc, "STATE_DIR", self.dir), \
              mock.patch.object(fc, "load_def", lambda n: d), \
-             mock.patch.object(fc, "advance_triage",
-                               lambda *a: advanced.append(1)), \
+             mock.patch.object(fc, "advance_triage", finish), \
+             mock.patch.object(fc, "ensure_running", no_start), \
+             mock.patch.object(fc, "results_commit",
+                               lambda st, dd, ev, cfg=None, **k: commits.append(ev)), \
              mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
              mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
              mock.patch.object(fc, "reconcile_triage_gap", lambda *a, **k: None), \
@@ -437,8 +568,10 @@ class ClockTest(unittest.TestCase):
              mock.patch.object(fc, "brake_held", lambda n: None), \
              mock.patch.object(fc, "breaker", lambda *a: None):
             fc.cmd_run("camp")
-        self.assertEqual(advanced, [])          # never spent another triage boot
-        self.assertEqual(s["status"], "done")
+        self.assertEqual(advanced, [1])         # the job was finished
+        self.assertEqual(commits, ["end"])      # the config was closed
+        self.assertEqual(s["cursor"], 1)
+        self.assertEqual(s["status"], "done")   # one config, no loop
 
     def test_triage_phase_continues_while_budget_remains(self):
         s = fc.init_state("camp")
@@ -647,6 +780,21 @@ class ClockTest(unittest.TestCase):
         self.assertAlmostEqual(s["triage_seconds"], 600, delta=0.01)
         self.assertAlmostEqual(s["overhead_seconds"], 400, delta=0.01)
         self.assertIsNone(s["triage_advance_started"])
+
+    def test_a_ring_replay_cut_by_a_panic_is_split_at_its_last_slot(self):
+        now = 1_000_000.0
+        job = self.dir / "job"
+        job.mkdir()
+        ck = job / "replay_state.json"
+        ck.write_text(json.dumps({"pending": "replay", "pending_at": now - 700}))
+        os.utime(ck, (now - 300, now - 300))     # rewritten before the last slot
+        s = fc.init_state("camp")
+        s.update({"phase": "triaging", "triage_job": "camp_t1",
+                  "triage_advance_started": now - 1000})
+        with mock.patch.object(fc, "boot_epoch", lambda: now - 100), \
+             mock.patch.object(fc, "triage_state", lambda j: {"dir": str(job)}):
+            fc.reconcile_triage_gap(s, dict(fc.DEFAULTS), last_save=now - 1000, now=now)
+        self.assertAlmostEqual(s["triage_seconds"], 700, delta=0.01)
 
     def test_reconcile_gap_tolerates_a_missing_timestamp(self):
         s = fc.init_state("camp")

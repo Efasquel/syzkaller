@@ -27,7 +27,7 @@ libraries and tests moved out around them instead.
 |--------|--------------|
 | `fuzz-campaign.py` | The autonomous coordinator: fuzz → crash → triage → quarantine → resume, reboot-resumable, driven by one launchd agent. Shells out to the drivers below. |
 | `fuzz-session.py` | One `syz-manager` run: start/stop/resume, collect repro bundles, snapshot corpus+ring_buffer, save the grammar a run compiled. |
-| `triage.py` | Minimizes a crashing program to a verified reproducer, one boot at a time (MERGE → MINIMIZE_CONN → MINIMIZE_CALLS → DONE/STUCK). |
+| `triage.py` | Minimizes a crashing program to a verified reproducer, one boot at a time (MERGE → MINIMIZE_CONN → MINIMIZE_CALLS → DONE, or REPLAY_RING → STUCK when no subset reproduces). |
 | `quarantine.py` | Decides which syscalls to bench when a signature keeps crashing (HARD / REPETITION / SOFT), and writes `disable_syscalls` back into the live config. |
 | `crash_fingerprint.py` | KASLR-stable signature + fault class + culprit site for a panic report. Imported by the coordinator and usable standalone. |
 | `bug_registry.py` | Groups signatures into bugs (`bug_key`), tracks disclosure, and holds the dossiers under `campaigns/bugs/`. |
