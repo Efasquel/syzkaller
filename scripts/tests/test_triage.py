@@ -311,6 +311,9 @@ class OutcomeTest(unittest.TestCase):
         for name in ("diagnose_hang", "job_executor_pids"):
             self.addCleanup(setattr, triage, name, getattr(triage, name))
         triage.diagnose_hang = lambda st, n: str(self.jdir / "hangs" / str(n))
+        # cmd_run asks for the boot time; never let the fake answer that.
+        self.addCleanup(setattr, triage.bootinfo, "boot_epoch", triage.bootinfo.boot_epoch)
+        triage.bootinfo.boot_epoch = lambda: time.time() - 600
 
     def play(self, write, rc=0):
         fake = FakeRingRepro(self.jdir, write, rc)
@@ -416,8 +419,6 @@ class OutcomeTest(unittest.TestCase):
         self.assertNotIn("hangs", st)
 
     def test_a_job_waiting_for_a_reboot_does_nothing_until_one_happens(self):
-        self.addCleanup(setattr, triage.bootinfo, "boot_epoch", triage.bootinfo.boot_epoch)
-        triage.bootinfo.boot_epoch = lambda: time.time() - 600
         self.st["needs_reboot"] = {"at": time.time(), "why": "sudo refused"}
         triage.save_job(self.st)
         fake = FakeRingRepro(self.jdir, lambda j, c: None)
@@ -428,3 +429,14 @@ class OutcomeTest(unittest.TestCase):
         triage.save_job(self.st)
         triage.cmd_run("j")
         self.assertNotIn("needs_reboot", triage.load_job("j"))
+
+    def test_programs_saved_for_other_bugs_are_recorded(self):
+        def write(jdir, cmd):
+            (jdir / "conn_state.json").write_text(json.dumps({"memo": {}}))
+            (jdir / "other_beef01.syz").write_text("other\n")
+        triage.subprocess.run = FakeRingRepro(self.jdir, write, rc=1)
+        triage.cmd_run("j")
+        st = triage.load_job("j")
+        self.assertEqual(st["other_bugs"]["beef01"]["program"],
+                         str(self.jdir / "other_beef01.syz"))
+        self.assertEqual(st["stage"], "MINIMIZE_CONN")   # the job itself goes on

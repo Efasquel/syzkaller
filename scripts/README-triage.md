@@ -175,7 +175,10 @@ $RR -minimize-conn \
 `syz-ring-repro` appends `<target_sig> <since_epoch>` and reads the verdict:
 `match`/`none` count as the target crash (a genuine repro whose report we can't
 read is never dropped); `other <sig>` means a **different** bug rebooted, so that
-subset is recorded as a non-repro instead. Unset `-target_sig` = original
+subset is recorded as a non-repro instead — and its program is saved as
+`other_<sig>.syz` next to the culprit, since it is the best evidence there is for
+that other bug (the ring replay does the same with the slot it was running).
+Unset `-target_sig` = original
 behavior (any reboot counts). `triage.py` and the campaign coordinator pass these
 flags automatically once the target signature is known — the coordinator pins it
 up front (`--target-sig`), so gating is active from the first subset.

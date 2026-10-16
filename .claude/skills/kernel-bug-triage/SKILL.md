@@ -43,9 +43,15 @@ bug_registry.py route --origin triage <report>
 
 `origin=triage` marks a panic the **minimizer caused on purpose** while re-running
 a known-crashing subset. Listings show these as `6 (+4)`: six genuine sightings,
-four self-inflicted. Only fuzz-origin crashes count as sightings, because crash
+four self-inflicted. Only genuine finds count as sightings, because crash
 frequency is a prioritization signal and investigating a bug must not inflate its
 own rank. Never read the `(+N)` as evidence a bug is common.
+
+`origin=fuzz-during-triage` is a **different** bug a minimization probe tripped
+over. Nobody was looking for it, so it counts as a sighting like `fuzz`. The
+campaign also seeds it SUSPECT in the quarantine and queues a triage for it from
+the subset that crashed (`other_<sig>.syz` in the job that found it), run as soon
+as the current job ends.
 
 ## Minimizing
 

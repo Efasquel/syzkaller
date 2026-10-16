@@ -224,7 +224,8 @@ def reconcile_panics(st):
 
         incident = {"at": now_iso(), "report": r.name,
                     "signature": fp["signature"], "title": fp["title"],
-                    "kext": fp["crashing_kext"], "status": status}
+                    "kext": fp["crashing_kext"], "status": status,
+                    "stage": st.get("stage")}
         st.setdefault("incidents", []).append(incident)
         new_incidents.append(incident)
 
@@ -233,6 +234,7 @@ def reconcile_panics(st):
             log("target signature set: %s  %s  %s"
                 % (fp["signature"], fp["crashing_kext"], fp["title"]))
         elif fp["signature"] != st["target_signature"]:
+            incident["other"] = True
             log("WARNING: new signature %s (%s) differs from target %s -- a "
                 "second bug surfaced during minimization"
                 % (fp["signature"], fp["title"], st["target_signature"]))
@@ -673,9 +675,27 @@ def prune_exec_scratch(st):
 
 
 # --- the orchestrator --------------------------------------------------------
+def collect_other_bugs(st):
+    """Record the programs syz-ring-repro saved for OTHER bugs (other_<sig>.syz):
+    subsets the crash gate saw panic the box with a signature that is not the
+    target. They are not part of this job's answer, but each is the best
+    evidence there is for its own bug -- the campaign files and triages them."""
+    found = st.setdefault("other_bugs", {})
+    changed = False
+    for p in sorted(job_dir(st).glob("other_*.syz")):
+        sig = p.stem[len("other_"):]
+        if sig and sig not in found:
+            found[sig] = {"program": str(p), "at": now_iso(), "stage": st.get("stage")}
+            log("second bug %s: its crashing program is saved at %s" % (sig, p))
+            changed = True
+    if changed:
+        save_job(st)
+
+
 def advance(st):
     """Do one boot's worth of work: reconcile panics, run the current stage."""
     reconcile_panics(st)
+    collect_other_bugs(st)
     stage = st["stage"]
     if stage == "MERGE":
         run_merge(st)
@@ -726,6 +746,8 @@ def cmd_run(name, reboot_on_hang=False):
         last = st["stage"]
         advance(st)
         st = load_job(name)          # advance persisted; reload the fresh state
+    # The stage run that just returned may have saved another bug's program.
+    collect_other_bugs(st)
     pruned = prune_exec_scratch(st)
     if pruned:
         log("triage %s: pruned %d executor scratch dir(s)" % (name, pruned))

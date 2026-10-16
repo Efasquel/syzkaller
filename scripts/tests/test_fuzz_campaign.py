@@ -235,11 +235,11 @@ class CoordinatorTest(unittest.TestCase):
         with mock.patch.object(fc, "PANIC_DIRS", [self.dir]), \
              mock.patch.object(fc, "route_bug_registry",
                                lambda p, *a, **kw: routed.append((p, kw.get("origin")))):
-            fc.route_triage_panics({"incidents": [
+            fc.route_triage_panics(fc.init_state("camp"), {"incidents": [
                 {"report": "panic-full-x.panic"},
                 {"report": "panic-full-missing.panic"},   # not on disk -> skipped
                 {},                                       # no report key -> skipped
-            ]})
+            ]}, "camp_t1")
         # Filed as triage-origin: the minimizer caused this panic on purpose, so
         # it is evidence for the bug but must not count as another sighting.
         self.assertEqual(routed, [(str(panic), "triage")])
@@ -454,6 +454,109 @@ class TriageOutcomeTest(unittest.TestCase):
                       "needs_reboot": {"at": 1, "why": "sudo: a password is required"}})
         self.assertEqual(self.s["status"], "halted")
         self.assertIn("password is required", self.s["halt_reason"])
+
+
+class SecondBugTest(unittest.TestCase):
+    """A different bug panicking the box during minimization: filed once as a
+    genuine find, seeded SUSPECT, and queued for its own triage."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.cfg = write_cfg(self.dir, {"target": "darwin/arm64", "enable_syscalls": ["a"]})
+        self.panics = self.dir / "panics"
+        self.panics.mkdir()
+        for n in ("t.panic", "o.panic"):
+            (self.panics / n).write_text("x")
+        self.prog = self.dir / "other_OTHER.syz"
+        self.prog.write_text("syz_IOConnectCallMethod$Foo_7(0x0)\n")
+        self.st = {"target_signature": "TARGET", "incidents": [
+            {"report": "t.panic", "signature": "TARGET"},
+            {"report": "o.panic", "signature": "OTHER", "title": "panic: x",
+             "kext": "com.apple.Foo"}],
+            "other_bugs": {"OTHER": {"program": str(self.prog)}}}
+        self.s = fc.init_state("camp")
+        self.s.update({"phase": "triaging", "triage_job": "camp_t1",
+                       "triage_bug_sig": "TARGET", "current_config": str(self.cfg)})
+        self.d = dict(fc.DEFAULTS, items=[{"config": str(self.cfg), "budget_seconds": 7200}])
+        self.routed = []
+        for p in (mock.patch.object(fc, "STATE_DIR", self.dir / "state"),
+                  mock.patch.object(fc, "PANIC_DIRS", [self.panics]),
+                  mock.patch.object(fc, "route_bug_registry",
+                                    lambda p, *a, **kw: self.routed.append(
+                                        (Path(p).name, kw.get("origin"))))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_each_panic_is_routed_once_with_its_origin(self):
+        fc.route_triage_panics(self.s, self.st, "camp_t1")
+        fc.route_triage_panics(self.s, self.st, "camp_t1")     # the next advance
+        self.assertEqual(self.routed, [("t.panic", "triage"),
+                                       ("o.panic", "fuzz-during-triage")])
+
+    def test_a_second_bug_is_seeded_suspect(self):
+        fc.route_triage_panics(self.s, self.st, "camp_t1")
+        rec = fc.load_qstate(str(self.cfg))["catalog"]["OTHER"]
+        self.assertEqual((rec["disposition"], rec["occurrence_count"]), (fc.qm.SUSPECTED, 1))
+        self.assertNotIn("TARGET", fc.load_qstate(str(self.cfg))["catalog"])
+
+    def test_a_second_bug_is_queued_once(self):
+        fc.queue_second_bugs(self.s, self.st, "camp_t1")
+        fc.queue_second_bugs(self.s, self.st, "camp_t1")
+        self.assertEqual([q["sig"] for q in self.s["triage_queue"]], ["OTHER"])
+        self.assertEqual(self.s["triage_queue"][0]["program"], str(self.prog))
+
+    def test_an_exhausted_or_benched_second_bug_is_not_queued(self):
+        self.s["exhausted_sigs"] = ["OTHER"]
+        fc.queue_second_bugs(self.s, self.st, "camp_t1")
+        self.assertEqual(self.s["triage_queue"], [])
+        self.s["exhausted_sigs"] = []
+        qs = fc.load_qstate(str(self.cfg))
+        fc.qm.bench_lead(qs, "OTHER", ["A"], "x")
+        fc.save_qstate(str(self.cfg), qs)
+        fc.queue_second_bugs(self.s, self.st, "camp_t2")
+        self.assertEqual(self.s["triage_queue"], [])
+
+    def finish_job(self, spent=0.0):
+        """End the current job (DONE, nothing to bench) and return the ring a
+        queued triage was started from, if any."""
+        started = []
+        self.s["triage_seconds"] = spent
+        with mock.patch.object(fc, "triage", lambda *a, **k: (0, "")), \
+             mock.patch.object(fc, "triage_state", lambda job: dict(self.st, stage="DONE")), \
+             mock.patch.object(fc, "attribute_bug", lambda *a, **k: None), \
+             mock.patch.object(fc, "quarantine_apply_culprit", lambda *a, **k: None), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "begin_triage",
+                               lambda s, d, sig, ring=None: started.append((sig, ring)) or True):
+            fc.advance_triage(self.s, self.d)
+        return started
+
+    def test_the_queued_bug_is_triaged_when_the_job_ends(self):
+        before = self.s["panic_sig_watermark"]
+        os.utime(self.panics / "o.panic", (before + 100, before + 100))
+        started = self.finish_job()
+        self.assertEqual(len(started), 1)
+        sig, ring = started[0]
+        self.assertEqual(sig, "OTHER")
+        self.assertEqual((ring / "slot_0000.syz").read_text(),
+                         "id=0\n" + self.prog.read_text())
+        self.assertEqual(self.s["triage_queue"], [])
+        self.assertNotIn("camp_t1", self.s["triage_seen"])
+        # the next fuzzing crash must not fingerprint the triage panics again
+        self.assertGreaterEqual(self.s["panic_sig_watermark"], before + 100)
+
+    def test_a_spent_budget_drops_the_queue(self):
+        self.assertEqual(self.finish_job(spent=7200.0), [])
+        self.assertEqual(self.s["triage_queue"], [])
+
+    def test_advancing_the_config_drops_the_queue(self):
+        self.s["triage_queue"] = [{"sig": "OTHER", "program": "p"}]
+        fc.advance_config(self.s)
+        self.assertEqual(self.s["triage_queue"], [])
 
 
 class ExhaustedRecurrenceTest(unittest.TestCase):

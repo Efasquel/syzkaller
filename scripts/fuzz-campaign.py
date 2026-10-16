@@ -545,6 +545,9 @@ def init_state(name):
         "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
         "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
         "exhausted_sigs": [],
+        # Second bugs a triage job surfaced, waiting for a job of their own, and
+        # per-job bookkeeping (panics routed, bugs announced / queued).
+        "triage_queue": [], "triage_seen": {},
         # Start the watermark at the newest report that already exists, so the
         # campaign's first crash fingerprints one fresh panic instead of replaying
         # every historical report in the dir (they are ~2MB each).
@@ -632,6 +635,7 @@ COORDINATOR_DEFAULTS = {
     "total_overhead_seconds": 0.0,
     "prep_seconds": 0.0, "total_prep_seconds": 0.0,
     "config_incidents": 0, "startup_failures": 0, "abandoned": [],
+    "triage_queue": [], "triage_seen": {},
 }
 
 
@@ -690,6 +694,13 @@ def advance_config(s):
     s["session_id"] = None
     s["last_exec_total"] = None
     reset_config_counters(s)
+    # A queued second bug belongs to the config it crashed in. Its program stays
+    # in the triage job that found it, and the quarantine already has it as
+    # SUSPECT, so a recurrence later still gets it triaged.
+    for item in s.get("triage_queue") or []:
+        log("dropping queued triage of %s (config advanced); its program is %s"
+            % (item["sig"], item["program"]))
+    s["triage_queue"] = []
 
 
 def run_log_tail(info):
@@ -911,15 +922,20 @@ def config_triage_flags(cfg):
     return out
 
 
-def begin_triage(s, d, sig):
+def begin_triage(s, d, sig, ring=None):
     """Pause fuzzing and stand up a triage job for a new bug. Returns True on
-    success; on any failure the campaign just resumes fuzzing (no phase change)."""
-    info = inspect(s["session_id"]) if s.get("session_id") else {"found": False}
-    workdir = info.get("workdir")
-    if not workdir:
-        log("cannot triage %s: session workdir unknown; resuming fuzzing" % sig)
-        return False
-    ring = Path(workdir) / "ring_buffer"
+    success; on any failure the campaign just resumes fuzzing (no phase change).
+
+    `ring` defaults to the session's ring buffer; a queued second bug brings its
+    own (a one-slot ring holding the program that crashed with it)."""
+    if ring is None:
+        info = inspect(s["session_id"]) if s.get("session_id") else {"found": False}
+        workdir = info.get("workdir")
+        if not workdir:
+            log("cannot triage %s: session workdir unknown; resuming fuzzing" % sig)
+            return False
+        ring = Path(workdir) / "ring_buffer"
+    ring = Path(ring)
     if not ring.is_dir():
         log("cannot triage %s: no ring buffer at %s; resuming fuzzing" % (sig, ring))
         return False
@@ -1064,27 +1080,130 @@ def exhausted_recurrence(s, sig, info):
     bench_lead_program(s, cfg, sig, lead, "newest ring program, recurrence %d" % n)
 
 
-def route_triage_panics(st, campaign=None, config=None):
-    """Catalog the panics that minimization itself produced.
+def triage_seen(s, job):
+    """Per-job bookkeeping: panic reports routed, second bugs announced, and
+    second bugs queued. Dropped when the job ends."""
+    seen = s.setdefault("triage_seen", {}).setdefault(job, {})
+    for k in ("routed", "others", "queued"):
+        seen.setdefault(k, [])
+    return seen
+
+
+def route_triage_panics(s, st, job):
+    """Catalog the panics a triage job produced, each once.
 
     A subset that reproduces the bug panics the box, and triage.py files that
-    panic in the JOB's ledger -- nothing routed it to the bug inventory. For the
-    target signature that is merely redundant, but a DIFFERENT bug surfacing
-    during minimization was recorded only as a triage incident and never appeared
-    as a reportable bug at all. route_one dedups by report basename, so
-    re-routing something already filed is a no-op.
+    panic in the JOB's ledger -- nothing else routes it to the bug inventory.
+    The target's panics are evidence the minimizer caused on purpose (origin
+    triage, not a sighting). A DIFFERENT signature is a genuine find nobody was
+    looking for (origin fuzz-during-triage): it is announced, and seeded in the
+    quarantine. Routing used to repeat every incident on every advance.
     """
+    seen = triage_seen(s, job)
+    target = (st or {}).get("target_signature")
     for inc in (st or {}).get("incidents", []):
         rep = inc.get("report")
-        if not rep:
+        if not rep or rep in seen["routed"]:
             continue
+        seen["routed"].append(rep)       # a report that is gone will not come back
+        sig = inc.get("signature")
+        other = bool(sig and target and sig != target)
         for dpath in PANIC_DIRS:
             cand = dpath / rep
             if _exists(cand):
-                # Caused by the minimizer re-running a known-crashing subset, not
-                # found by fuzzing: filed as evidence, not counted as a sighting.
-                route_bug_registry(str(cand), campaign, config, origin="triage")
+                route_bug_registry(str(cand), s.get("name"), s.get("current_config"),
+                                   origin="fuzz-during-triage" if other else "triage")
                 break
+        if other:
+            note_second_bug(s, job, inc)
+
+
+def note_second_bug(s, job, inc):
+    """Announce a second bug a triage job tripped over, and seed it SUSPECT."""
+    seen = triage_seen(s, job)
+    sig = inc["signature"]
+    if sig in seen["others"]:
+        return
+    seen["others"].append(sig)
+    log("SECOND BUG during triage %s: %s -- %s (crashing kext %s), not the target "
+        "%s; filed as a genuine find" % (job, sig, inc.get("title") or "?",
+                                         inc.get("kext") or "?", s.get("triage_bug_sig")))
+    cfg = s.get("current_config")
+    if not cfg:
+        return
+    qs = load_qstate(cfg)
+    rec = qs["catalog"].get(sig)
+    if rec is None:
+        qm.on_crash(qs, sig, None)
+        save_qstate(cfg, qs)
+        log("  quarantine: %s seeded SUSPECT" % sig)
+    else:
+        log("  quarantine: %s already known (%s)" % (sig, rec.get("disposition")))
+
+
+def why_not_triage(s, sig):
+    """Why a second bug should NOT get a triage of its own, or None."""
+    if sig == s.get("triage_bug_sig"):
+        return "it is the bug being triaged"
+    if sig in (s.get("exhausted_sigs") or []):
+        return "it is exhausted"
+    cfg = s.get("current_config")
+    rec = load_qstate(cfg)["catalog"].get(sig) if cfg else None
+    if rec and rec.get("disposition") not in (None, qm.SUSPECTED):
+        return "the quarantine already handles it (%s)" % rec["disposition"]
+    return None
+
+
+def queue_second_bugs(s, st, job):
+    """Queue a triage for each second bug whose crashing program triage saved."""
+    seen = triage_seen(s, job)
+    for sig, ob in sorted(((st or {}).get("other_bugs") or {}).items()):
+        if sig in seen["queued"] or not Path(ob.get("program") or "").exists():
+            continue
+        seen["queued"].append(sig)
+        why = why_not_triage(s, sig)
+        if not why and any(q["sig"] == sig for q in s.get("triage_queue") or []):
+            why = "it is already queued"
+        if why:
+            log("second bug %s: not queued for triage: %s" % (sig, why))
+            continue
+        s.setdefault("triage_queue", []).append(
+            {"sig": sig, "program": ob["program"], "from_job": job,
+             "config": s.get("current_config"), "at": now_iso()})
+        log("second bug %s: queued for its own triage after %s (program %s)"
+            % (sig, job, ob["program"]))
+
+
+def start_queued_triage(s, d):
+    """Start the next queued second-bug triage, if any is still worth it.
+    Returns True when the campaign is triaging again."""
+    while s.get("triage_queue"):
+        item = s["triage_queue"].pop(0)
+        sig = item["sig"]
+        if item.get("config") != s.get("current_config"):
+            log("dropping queued triage of %s: queued under another config" % sig)
+            continue
+        budget = d["items"][min(s["cursor"], len(d["items"]) - 1)]["budget_seconds"]
+        if budget_spent(s, d) >= budget:
+            log("dropping queued triage of %s: the budget is spent (program %s; it is "
+                "SUSPECT, so a recurrence will still be triaged)" % (sig, item["program"]))
+            continue
+        why = why_not_triage(s, sig)
+        if why:
+            log("dropping queued triage of %s: %s" % (sig, why))
+            continue
+        ring = STATE_DIR / "queued" / ("%s_%s" % (sig, timefmt.now_ts())) / "ring_buffer"
+        try:
+            ring.mkdir(parents=True, exist_ok=True)
+            (ring / "slot_0000.syz").write_text("id=0\n" + Path(item["program"]).read_text())
+        except OSError as e:
+            log("dropping queued triage of %s: cannot stage its program: %s" % (sig, e))
+            continue
+        log("starting the queued triage of second bug %s (found by %s)"
+            % (sig, item["from_job"]))
+        if begin_triage(s, d, sig, ring=ring):
+            return True
+    return False
 
 
 def advance_triage(s, d):
@@ -1120,7 +1239,8 @@ def advance_triage(s, d):
     save_state(s)     # or a driver death here re-charges the advance next boot
 
     st = triage_state(job)
-    route_triage_panics(st, s.get("name"), s.get("current_config"))
+    route_triage_panics(s, st, job)
+    queue_second_bugs(s, st, job)
     # A program hung, the executor holds the coverage device, and triage could
     # not reboot the box. Nothing can run until someone does: fuzzing would die
     # at startup and every further advance would fail the same way.
@@ -1199,12 +1319,21 @@ def advance_triage(s, d):
     s["triage_job"] = None
     s["triage_bug_sig"] = None
     s["triage_boots"] = 0
+    # Every panic this job caused is filed. Without moving the watermark past
+    # them, the next fuzzing crash would fingerprint them all again -- and if its
+    # own report were unreadable, would take a triage panic's signature for it.
+    s["panic_sig_watermark"] = max(s.get("panic_sig_watermark", 0.0),
+                                   _newest_report_mtime())
+    (s.get("triage_seen") or {}).pop(job, None)
     save_state(s)
     log("triage %s %s; bug %s %s; resuming fuzzing"
         % (job, "COMPLETE" if verified else "STUCK", sig,
            "benched (verified reproducer)" if verified
            else "exhausted (%s)" % kind if sig in s.get("exhausted_sigs", [])
            else "benched (UNVERIFIED lead)"))
+    # A second bug this job (or an earlier one) surfaced goes next, before fuzzing.
+    if start_queued_triage(s, d):
+        save_state(s)
 
 
 # --- the loop ----------------------------------------------------------------
@@ -1636,7 +1765,7 @@ def cmd_run(name):
             "in %s)" % (d["max_log_mb"], coord_path))
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
-        s.setdefault(k, list(v) if isinstance(v, list) else v)   # never share a default list
+        s.setdefault(k, type(v)(v) if isinstance(v, (list, dict)) else v)   # never share a default
     if s["status"] in ("done", "halted"):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
@@ -2099,6 +2228,9 @@ def status_lines(name, prev=None):
         row("triaging", "job %s, bug %s (advance %d/%d)"
             % (s.get("triage_job"), s.get("triage_bug_sig"),
                s.get("triage_boots", 0), d["triage_max_boots"]))
+    if s.get("triage_queue"):
+        row("triage queue", "%d second bug(s) waiting: %s"
+            % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
     if s.get("exhausted_sigs"):
         why = s.get("exhausted_why") or {}
         row("exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"

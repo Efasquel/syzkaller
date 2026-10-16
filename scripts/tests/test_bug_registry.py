@@ -44,6 +44,15 @@ class OriginTest(unittest.TestCase):
         rec = self.reg["bugs"]["Drv:m:READ"]
         self.assertEqual(br.crash_origin(rec["crashes"][0]), "triage")
 
+    def test_a_second_bug_found_during_triage_is_a_sighting(self):
+        """Nobody was minimizing it: it counts like a fuzzing find, unlike the
+        panics minimization causes on purpose."""
+        br.route_one(self.reg, self.dir, analyzed("a.panic"), origin="fuzz-during-triage")
+        c = self.reg["bugs"]["Drv:m:READ"]["crashes"][0]
+        self.assertEqual(br.crash_origin(c), "fuzz-during-triage")
+        self.assertTrue(br.is_sighting(c))
+        self.assertFalse(br.is_sighting({"origin": "triage"}))
+
     def test_reroute_is_idempotent(self):
         br.route_one(self.reg, self.dir, analyzed("a.panic"))
         _, _, new_bug, new_crash = br.route_one(self.reg, self.dir, analyzed("a.panic"))

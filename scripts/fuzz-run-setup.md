@@ -465,6 +465,18 @@ allows a new triage once the cause is fixed.
 If the budget runs out while a job is in progress, the job is finished first, its
 result benched, and then the campaign moves to the next config.
 
+### A second bug during triage
+
+A probe that panics the box with a **different** signature is not counted for the
+bug being minimized (the crash gate filters it), but it is not lost either. The
+coordinator log says `SECOND BUG during triage`, the panic is filed in the bug
+registry as `fuzz-during-triage` (a genuine sighting), the quarantine records it as
+SUSPECT, and the subset that crashed is saved as `other_<sig>.syz` in the job. A
+triage for it is queued (`status` shows `triage queue`) and starts when the current
+job ends, from that one program. The queue is dropped when the config's budget is
+spent or the campaign moves to another config; the bug stays SUSPECT, so its next
+recurrence while fuzzing is triaged as usual.
+
 ### Switching which campaign runs
 
 Author another def, then install its own agent (each campaign gets its own label).
