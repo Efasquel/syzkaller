@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -211,14 +212,64 @@ type ddState struct {
 	// box, while this one wedged a kernel thread without panicking. Conflating
 	// them would file a hang as a crash and send triage looking for a panic
 	// report that does not exist.
+	//
+	// It is overwritten by every hang and cleared once the box has rebooted
+	// since: by then the caller has read it, and the subset, still unmemoized,
+	// is probed again. A subset that hangs every time is the caller's answer.
 	Hanging   string  `json:"hanging,omitempty"`
 	HangingAt float64 `json:"hanging_at,omitempty"`
+	// Untestable are masks whose program has more calls than the executor can
+	// run (maxExecCalls). They are never probed and never memoized: "too big to
+	// run" says nothing about whether the subset crashes, and recording it as
+	// "no crash" would steer the search away from a subset it never tested.
+	Untestable []string `json:"untestable,omitempty"`
+	// CulpritTooLarge marks a finished search whose answer cannot be re-checked
+	// because it is itself over the executor's call limit. Like Exhausted it is
+	// terminal, but it is not a failed verification: nothing was run.
+	CulpritTooLarge bool `json:"culprit_too_large,omitempty"`
 	// AttemptingAt / VerifyingAt are the wall-clock epochs the in-flight
 	// Attempting / Verifying subset started running, so a crash gate can scope its
 	// panic-report scan to reports produced by that subset's reboot. Zero when
 	// nothing is pending, and on pre-gating checkpoints (which then bypass gating).
 	AttemptingAt float64 `json:"attempting_at,omitempty"`
 	VerifyingAt  float64 `json:"verifying_at,omitempty"`
+	// OtherCrashes are reboots the crash gate identified as a DIFFERENT bug: the
+	// subset is not counted as a repro of the target, but it did crash the box,
+	// and it is the best evidence there is for that other bug. minimize saves its
+	// program as other_<sig>.syz so the caller can triage it on its own.
+	OtherCrashes []otherCrash `json:"other_crashes,omitempty"`
+}
+
+// otherCrash is one subset that panicked the box with a bug other than the
+// target. Saved is the program file written for it, empty until written.
+type otherCrash struct {
+	Mask  string  `json:"mask"`
+	Sig   string  `json:"sig"`
+	At    float64 `json:"at"`
+	Saved string  `json:"saved,omitempty"`
+}
+
+// noteOther records a reboot the gate attributed to a different bug, once.
+func (s *ddState) noteOther(key, sig string, at float64) {
+	for _, o := range s.OtherCrashes {
+		if o.Mask == key && o.At == at {
+			return
+		}
+	}
+	s.OtherCrashes = append(s.OtherCrashes, otherCrash{Mask: key, Sig: sig, At: at})
+}
+
+// otherPath is where the program for another bug's signature is saved, next to
+// the culprit. The signature is a hex hash; anything else is flattened so it
+// cannot escape the directory.
+func otherPath(culpritPath, sig string) string {
+	clean := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+			return r
+		}
+		return '_'
+	}, sig)
+	return filepath.Join(filepath.Dir(culpritPath), "other_"+clean+".syz")
 }
 
 // meanProbeMs is the average clean-probe cost measured so far, or 0 if nothing
@@ -328,6 +379,9 @@ func loadDdState(path string, nUnits int, hash, kind string, gates ...*crashGate
 			delete(s.Memo, key)
 		}
 	}
+	if s.Hanging != "" && rebootedSince(s.HangingAt) {
+		s.Hanging, s.HangingAt = "", 0
+	}
 	s.recoverAttempt(s.Attempting, s.AttemptingAt, nUnits, gate)
 	s.recoverVerify(s.Verifying, s.VerifyingAt, nUnits, gate)
 	// A lost rename leaves the pending checkpoint stranded in the temp file.
@@ -355,7 +409,8 @@ func (s *ddState) recoverVerify(key string, at float64, nConns int, gate *crashG
 			"— verification is inconclusive, not a pass", key)
 		return
 	}
-	if gate.verdict(at) == gateOther {
+	if v, other := gate.verdict(at); v == gateOther {
+		s.noteOther(key, other, at)
 		if !slices.Contains(s.VerifyFailed, key) {
 			s.VerifyFailed = append(s.VerifyFailed, key)
 		}
@@ -394,7 +449,8 @@ func (s *ddState) recoverAttempt(key string, at float64, nConns int, gate *crash
 			"— not counting it as a repro; it will be re-probed", key)
 		return
 	}
-	if gate.verdict(at) == gateOther {
+	if v, other := gate.verdict(at); v == gateOther {
+		s.noteOther(key, other, at)
 		s.Memo[key] = false
 		log.Logf(0, "crash-gate: reboot while testing %s was a DIFFERENT crash than the target "+
 			"— not counting it as a repro", key)

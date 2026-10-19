@@ -411,7 +411,7 @@ func TestExhaustedRoundTrips(t *testing.T) {
 func TestHangingRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "conn_state.json")
 	s := &ddState{Kind: "connection", NUnits: 4, ProgHash: "p",
-		Memo: map[string]bool{}, Hanging: "5", HangingAt: 1788000000}
+		Memo: map[string]bool{}, Hanging: "5", HangingAt: gateNow()}
 	if err := saveDdState(path, s); err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +421,24 @@ func TestHangingRoundTrips(t *testing.T) {
 	}
 	if got.HangingAt == 0 {
 		t.Error("HangingAt did not survive the checkpoint")
+	}
+}
+
+// A hang recorded before the current boot has been dealt with: the reboot freed
+// the device, the caller has counted it, and the subset is due to be probed again.
+func TestHangingIsClearedAfterAReboot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conn_state.json")
+	s := &ddState{Kind: "connection", NUnits: 4, ProgHash: "p",
+		Memo: map[string]bool{}, Hanging: "5", HangingAt: 1}
+	if err := saveDdState(path, s); err != nil {
+		t.Fatal(err)
+	}
+	got := loadDdState(path, 4, "p", "")
+	if got.Hanging != "" || got.HangingAt != 0 {
+		t.Errorf("hang from a previous boot kept: %q at %v", got.Hanging, got.HangingAt)
+	}
+	if _, ok := got.Memo["5"]; ok {
+		t.Error("a cleared hang was memoized; the subset must be probed again")
 	}
 }
 

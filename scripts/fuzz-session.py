@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -68,9 +69,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import cfgutil  # noqa: E402
-import timefmt  # noqa: E402
-from fsutil import hardlink_or_copy  # noqa: E402
+from lib import bootinfo  # noqa: E402
+from lib import cfgutil  # noqa: E402
+from lib import timefmt  # noqa: E402
+from lib.fsutil import hardlink_or_copy  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -106,7 +108,11 @@ ARTIFACTS_SUBDIR = "artifacts"
 # One folder per kind, one dated dir per incident inside it. These live under
 # <workdir>/artifacts/ rather than <workdir>/crashes/, which is syzkaller's own
 # (it writes crashes/<hash>/ there) -- we must not mix our bundles into it.
-INCIDENT_DIRS = {"crash": "crashes", "hang": "hangs", "snapshot": "snapshots"}
+# "startup" is a manager that died before executing anything: no repro material,
+# but its run log is the only record of why, and collecting it is what keeps the
+# next boot from mistaking that run for an uncollected crash.
+INCIDENT_DIRS = {"crash": "crashes", "hang": "hangs", "startup": "startup-failures",
+                 "snapshot": "snapshots"}
 EVENT_KINDS = tuple(INCIDENT_DIRS)
 STOP_TIMEOUT = 30       # seconds to wait for a graceful (SIGINT) shutdown
 # Seconds to wait for the manager to log its rpc port. Generous on purpose: the
@@ -186,9 +192,6 @@ def _epoch_iso(epoch):
     return timefmt.fmt_epoch(epoch, default="unknown")
 
 
-_BOOT_EPOCH = None
-
-
 def boot_epoch():
     """Seconds-since-epoch of the current boot, or None if it can't be read.
 
@@ -196,17 +199,24 @@ def boot_epoch():
     reboots constantly, pid reuse is not a corner case: a session record written
     before the panic names a pid the OS has since handed to something else.
     """
-    global _BOOT_EPOCH
-    if _BOOT_EPOCH is None:
-        try:
-            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 text=True, timeout=5).stdout
-            m = re.search(r"sec\s*=\s*(\d+)", out)
-            _BOOT_EPOCH = int(m.group(1)) if m else False
-        except (OSError, ValueError, subprocess.SubprocessError):
-            _BOOT_EPOCH = False
-    return _BOOT_EPOCH or None
+    return bootinfo.boot_epoch()
+
+
+# kern.boottime is not a constant: macOS derives it as wall-clock minus uptime,
+# so every NTP correction moves it. A record one second off the current value was
+# written on THIS boot -- treating it as a previous one made a live manager read
+# as dead, and the next resume then killed its executor as an "orphan" and
+# started a second manager that could never bind the http port. A real reboot
+# moves the boot epoch by at least the time the reboot took, far more than this.
+BOOT_EPOCH_SLACK = 60
+
+
+def same_boot(rec_boot, cur=None):
+    """Was `rec_boot` recorded on the current boot? Unknown counts as yes."""
+    if rec_boot is None:
+        return True
+    cur = boot_epoch() if cur is None else cur
+    return cur is None or abs(int(rec_boot) - cur) <= BOOT_EPOCH_SLACK
 
 
 def pid_alive(pid, rec_boot=None):
@@ -220,10 +230,8 @@ def pid_alive(pid, rec_boot=None):
     """
     if not pid:
         return False
-    if rec_boot is not None:
-        cur = boot_epoch()
-        if cur is not None and int(rec_boot) != cur:
-            return False
+    if not same_boot(rec_boot):
+        return False
     try:
         os.kill(int(pid), 0)
         return True
@@ -333,8 +341,14 @@ def latest_bench(workdir):
 
 
 def latest_run_log(workdir):
+    """The most recently STARTED run's log, by the run-<ts> in its name.
+
+    Not by mtime: a manager that outlives its record keeps appending to its own
+    log, so mtime names that old run as the latest forever. The campaign derives
+    a run's start from this, and with the wrong log every incident measured the
+    run from hours earlier and re-added that span to the fuzzing budget."""
     results = Path(workdir) / "results"
-    logs = sorted(results.glob("run-*.log"), key=lambda p: p.stat().st_mtime)
+    logs = sorted(results.glob("run-*.log"), key=lambda p: (p.name, p.stat().st_mtime))
     return logs[-1] if logs else None
 
 
@@ -383,6 +397,65 @@ def run_log_stats(workdir):
         if m:
             out[k] = int(m.group(1))
     return out
+
+
+# syz-manager prefixes every log line with its local wall time.
+_LOG_TS_RE = re.compile(r"^(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2}) ")
+
+
+def _log_line_epoch(line):
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.strptime("".join(m.groups()), "%Y%m%d%H%M%S").timestamp()
+    except ValueError:
+        return None
+
+
+def run_fuzz_start_epoch(log):
+    """When this run first executed a program: the first stat line whose exec
+    total is above zero, or None if it never got there.
+
+    Everything before it -- grammar compile, waiting on rpc, the executor
+    handshake -- is preparation, not fuzzing, and the campaign clocks keep the two
+    apart. The stat line comes every ~10s, so this is late by at most that."""
+    if not log or not Path(log).exists():
+        return None
+    rx = _STAT_FIELD_RE["exec total"]
+    try:
+        with Path(log).open(errors="replace") as f:
+            for line in f:
+                m = rx.search(line)
+                if m and int(m.group(1)) > 0:
+                    return _log_line_epoch(line)
+    except OSError:
+        pass
+    return None
+
+
+def run_last_activity_epoch(log, cover=None):
+    """The last moment this run is known to have been alive, or None.
+
+    The newest timestamped line in the run log (the manager writes a stat line
+    every ~10s until it dies), or the cover log's mtime (fsync'd on each new PC,
+    so it survives a panic), whichever is later. This -- not the moment someone
+    noticed the death -- is when a run ended: a crash found on the next boot used
+    to be charged as fuzzing right through the reboot, and once through a 68h
+    power-off."""
+    best = None
+    if log and Path(log).exists():
+        for line in reversed(tail_text(Path(log)).splitlines()):
+            t = _log_line_epoch(line)
+            if t:
+                best = t
+                break
+    try:
+        if cover and Path(cover).exists():
+            best = max(best or 0, Path(cover).stat().st_mtime)
+    except OSError:
+        pass
+    return best
 
 
 def exec_rate(workdir):
@@ -733,6 +806,13 @@ def cmd_inspect(target):
         "http": state.get("http"),
         "run_started": _epoch_iso(started) if started else None,
         "run_started_epoch": started,
+        # For the campaign clocks: preparation ends at the first exec, and a dead
+        # run ended at its last sign of life, not when it was found.
+        "fuzz_started_epoch": run_fuzz_start_epoch(latest_run_log(workdir)),
+        "run_log": str(latest_run_log(workdir) or "") or None,
+        "last_activity_epoch": run_last_activity_epoch(latest_run_log(workdir),
+                                                       cover_log_path(state)),
+        "boot_epoch": boot_epoch(),
         "exec_total": et if et != "" else None,
         "coverage": int(stats["coverage"]) if stats.get("coverage") not in ("", None) else None,
         "rate": stats.get("rate") if stats.get("rate") != "" else None,
@@ -1471,6 +1551,38 @@ def save_grammar(workdir, conf, stamp, dedupe=True):
 
 
 # ---- commands --------------------------------------------------------------
+def port_in_use(http):
+    """pid (or True) if something is listening on the config's http host:port.
+
+    Probes with a bind rather than a connect: a manager that is wedged still
+    holds the port but may not accept, and a bind fails either way. SO_REUSEADDR
+    matches what Go's net.Listen sets, so TIME_WAIT leftovers from a manager that
+    was just stopped do not read as a live one -- only a listener does."""
+    if not http or ":" not in http:
+        return None
+    host, port = http.rsplit(":", 1)
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host or "127.0.0.1", port))
+        return None
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            return None
+    finally:
+        sock.close()
+    try:
+        out = subprocess.run(["lsof", "-nP", "-t", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        return int(out[0]) if out else True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+
+
 def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     if not MANAGER_BIN.exists() or not os.access(MANAGER_BIN, os.X_OK):
         die("syz-manager not built at %s (run: make manager)" % MANAGER_BIN)
@@ -1496,6 +1608,16 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
     http = conf.get("http", "")
     if not workdir:
         die('config has no "workdir": %s' % cfg)
+
+    # Last line of defence against a manager nothing tracks any more: it holds
+    # the http port, so a new one would die at startup -- after its executor was
+    # already launched against it. Refuse with the reason instead.
+    holder = port_in_use(http)
+    if holder:
+        die("http %s is already in use%s; another syz-manager is probably still "
+            "running. Find it with: lsof -nP -iTCP:%s -sTCP:LISTEN"
+            % (http, " (pid %s)" % holder if holder is not True else "",
+               http.rsplit(":", 1)[-1]))
 
     prev = refresh_status(sid)
     if prev and prev.get("status") == "running":

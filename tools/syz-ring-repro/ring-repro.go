@@ -69,6 +69,12 @@ var (
 		"IOConnectCallMethod calls, on device, keeping every open and close (an open produces the handle later "+
 		"calls need; a close can be the bug). Meant to run after -minimize-conn on the resulting culprit. "+
 		"Checkpoints to <dir>/call_state.json and writes the reduced reproducer to <dir>/culprit.syz")
+	flagReplayRing = flag.Bool("replay-ring", false, "replay the ring buffer as it was fuzzed -- every "+
+		"selected slot in order, each as its own program, nothing merged or reduced -- to tell whether the "+
+		"crash reproduces at all. The last step of a minimization that found no subset reproducing on its "+
+		"own. Checkpoints to -state (default <ring>/replay_state.json); a pass that crashes is recovered on "+
+		"the next boot and a second pass verifies it. Writes the concatenated ring to -culprit when it "+
+		"crashes. Honors -target_sig/-confirm_cmd")
 	flagEmitCulprit = flag.Bool("emit-culprit", false, "offline: read the checkpoint written by a prior "+
 		"-minimize-conn run (the positional arg is the same program file) and write the smallest known crashing "+
 		"subset to <dir>/culprit.syz, then exit. Runs nothing on device and never modifies conn_state.json. "+
@@ -170,6 +176,13 @@ func main() {
 	if *flagEmitJSON {
 		if err := runEmitSyscalls(target, dir); err != nil {
 			tool.Failf("emit-json failed: %v", err)
+		}
+		return
+	}
+
+	if *flagReplayRing {
+		if err := runReplayRing(target, dir); err != nil {
+			tool.Failf("replay-ring failed: %v", err)
 		}
 		return
 	}

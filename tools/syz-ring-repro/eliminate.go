@@ -24,7 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -135,15 +135,11 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 	// When a target signature + confirm command are supplied, gate the reboot-as-
 	// crash recovery on a matching panic report, so a second bug that fires during
 	// a probe is not misattributed to that subset (see gate.go).
-	var gate *crashGate
-	if *flagTargetSig != "" && *flagConfirmCmd != "" {
-		gate = &crashGate{targetSig: *flagTargetSig, confirmCmd: strings.Fields(*flagConfirmCmd)}
-		log.Logf(0, "Crash gating ON: only reboots confirmed as signature %s count as a repro",
-			*flagTargetSig)
-	}
+	gate := newGate()
 
 	state := loadDdState(statePath, red.n, progHash(p), red.label, gate)
 	logDdState(state)
+	saveOtherCrashes(state, statePath, culpritPath, red)
 	// culprit.syz is only written when the search completes. Any file left from an
 	// earlier run describes a different (or abandoned) reduction, and a stale one
 	// is easy to mistake for this run's output — drop it now rather than let it
@@ -172,6 +168,22 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		if r, ok := state.Memo[key]; ok {
 			return r
 		}
+		sub := red.extract(mask)
+		// Too large for the executor: it would run a prefix and die, so a clean
+		// return would be a verdict on calls that never ran. Decided without the
+		// device, so the same answer comes back on every replay of the memo.
+		if len(sub.Calls) > maxExecCalls {
+			if !slices.Contains(state.Untestable, key) {
+				state.Untestable = append(state.Untestable, key)
+				if err := saveDdState(statePath, state); err != nil {
+					tool.Failf("checkpoint: %v", err)
+				}
+				log.Logf(0, "Cannot test %s %v: %d calls, over the executor's limit of %d. "+
+					"Skipped -- NOT counted as \"no crash\".", plural(popcount(mask), red.label),
+					setBits(mask), len(sub.Calls), maxExecCalls)
+			}
+			return false
+		}
 		probesThisBoot++
 		probeStart := time.Now()
 		// Checkpoint the pending subset before running it: a crashing subset panics
@@ -182,34 +194,11 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 		if err := saveDdState(statePath, state); err != nil {
 			tool.Failf("checkpoint: %v", err)
 		}
-		sub := red.extract(mask)
 		log.Logf(0, "Testing %s %v — %d calls ...", plural(popcount(mask), red.label), setBits(mask), len(sub.Calls))
 		if err := runProgramOnce(target, sub); err != nil {
 			// A hang is not an executor error and must not be counted as one.
-			// The program wedged a kernel thread, which on this target leaves the
-			// executor in uninterruptible sleep holding the coverage device: no
-			// further probe can run on this boot, so continuing would fabricate
-			// verdicts. Record the pending mask -- it is real evidence about THIS
-			// subset -- and stop, telling the caller what is required.
 			if errors.Is(err, errProgHang) {
-				state.Attempting = ""
-				state.AttemptingAt = 0
-				if state.Hanging == "" {
-					state.Hanging = key
-					state.HangingAt = gateNow()
-				}
-				if serr := saveDdState(statePath, state); serr != nil {
-					tool.Failf("checkpoint: %v", serr)
-				}
-				tool.Failf("subset %v HUNG: no result after %ds (a healthy program "+
-					"here takes ~2ms).\n"+
-					"The wedged executor is in uninterruptible sleep and holds the "+
-					"coverage device, so nothing further can run on this boot -- "+
-					"SIGKILL cannot reach it.\n"+
-					"Capture the stack before rebooting, it names the blocked call:\n"+
-					"  sudo fuzz-session.py diagnose-hang\n"+
-					"Then REBOOT; the checkpoint records this subset and the search "+
-					"resumes from it.", setBits(mask), *flagProgTimeout)
+				failHang(state, statePath, culpritPath, key, sub)
 			}
 			execErrStreak++
 			log.Logf(0, "  (executor error, box still up — NOT recorded, %d in a row: %v)",
@@ -246,12 +235,12 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 	}
 
 	minimal := searchCulprit(red.n, *flagMaxK, pred)
-	verified := verifyCulprit(target, state, statePath, red, minimal, probesThisBoot)
+	verified := verifyCulprit(target, state, statePath, culpritPath, red, minimal, probesThisBoot)
 	// The search has returned, so every subset it wanted has been probed. If the
 	// answer still is not verified, verification has been attempted and failed --
 	// there is no further work that would change the result, and the caller must
 	// be told to stop relaunching us.
-	if !verified && state.exhaustedFor(minimal) {
+	if !verified && (state.exhaustedFor(minimal) || state.CulpritTooLarge) {
 		state.Exhausted = true
 	}
 	// Persist the terminal state so the on-disk checkpoint reflects the finished
@@ -262,7 +251,82 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 	if err := saveDdState(statePath, state); err != nil {
 		tool.Failf("checkpoint: %v", err)
 	}
-	return finishMinimize(p, red, minimal, culpritPath, verified, state.Exhausted)
+	return finishMinimize(p, red, minimal, culpritPath, verified, state.Exhausted, state.CulpritTooLarge)
+}
+
+// maxExecCalls is the executor's per-program call limit (kMaxCalls in
+// executor/executor.cc). A longer program fails with "too many calls in output"
+// part-way through, so it cannot be tested at all -- which is a different
+// outcome from "ran and did not crash", and must never be recorded as one.
+// Fuzzing never reaches it (prog.MaxCalls is 40); a merged ring buffer does.
+const maxExecCalls = 64
+
+// failHang records that the program for mask key never returned, saves it as
+// hang.syz, and exits. The program wedged a kernel thread, which on this target
+// leaves the executor in uninterruptible sleep holding the coverage device: no
+// further program can run on this boot, so continuing would fabricate verdicts.
+// The mask stays out of the memo; the caller counts hangs across reboots and
+// decides when a subset that keeps hanging is the answer.
+func failHang(state *ddState, statePath, culpritPath, key string, sub *prog.Prog) {
+	state.Attempting, state.AttemptingAt = "", 0
+	state.Verifying, state.VerifyingAt = "", 0
+	state.Hanging, state.HangingAt = key, gateNow()
+	saveHang(culpritPath, sub)
+	if err := saveDdState(statePath, state); err != nil {
+		tool.Failf("checkpoint: %v", err)
+	}
+	mask, _ := strconv.ParseUint(key, 16, 64)
+	tool.Failf("subset %v HUNG: no result after %ds (a healthy program here takes ~2ms).\n"+
+		"The wedged executor is in uninterruptible sleep and holds the coverage device, "+
+		"so nothing further can run on this boot -- SIGKILL cannot reach it.\n"+
+		"Capture the stack before rebooting, it names the blocked call:\n"+
+		"  sudo fuzz-session.py diagnose-hang\n"+
+		"Then REBOOT; the checkpoint records this subset and the search resumes from it.",
+		setBits(mask), *flagProgTimeout)
+}
+
+// saveOtherCrashes writes the program of every subset that crashed the box with
+// a different bug, as other_<sig>.syz next to the culprit. The first subset seen
+// for a signature is kept; later ones for the same signature are not written
+// over it. Best-effort: the crash is already recorded in the checkpoint.
+func saveOtherCrashes(state *ddState, statePath, culpritPath string, red reduction) {
+	changed := false
+	for i := range state.OtherCrashes {
+		o := &state.OtherCrashes[i]
+		if o.Saved != "" {
+			continue
+		}
+		mask, err := strconv.ParseUint(o.Mask, 16, 64)
+		if err != nil || mask&^fullMask(red.n) != 0 {
+			continue
+		}
+		path := otherPath(culpritPath, o.Sig)
+		if _, err := os.Stat(path); err != nil {
+			if err := atomicWriteFile(path, red.extract(mask).Serialize()); err != nil {
+				log.Logf(0, "could not save the other bug's program to %s: %v", path, err)
+				continue
+			}
+			log.Logf(0, "Subset %v crashed with a DIFFERENT bug (%s); its program is saved as %s",
+				setBits(mask), o.Sig, path)
+		}
+		o.Saved = path
+		changed = true
+	}
+	if changed {
+		if err := saveDdState(statePath, state); err != nil {
+			tool.Failf("checkpoint: %v", err)
+		}
+	}
+}
+
+// saveHang writes the program that hung next to the culprit, as hang.syz, so the
+// caller can bench it once the same subset keeps hanging. Best-effort: the hang
+// itself is already recorded in the checkpoint.
+func saveHang(culpritPath string, p *prog.Prog) {
+	path := filepath.Join(filepath.Dir(culpritPath), "hang.syz")
+	if err := atomicWriteFile(path, p.Serialize()); err != nil {
+		log.Logf(0, "could not save the hung program to %s: %v", path, err)
+	}
 }
 
 // verifyCulprit re-runs the culprit on its own to confirm it reproduces without
@@ -274,8 +338,8 @@ func minimize(target *prog.Target, p *prog.Prog, statePath, culpritPath string, 
 // under Verifying, run it, and let the panic-reboot be the positive result. A
 // re-check that returns is a *negative* result, recorded in VerifyFailed so it
 // is attempted once and cannot loop.
-func verifyCulprit(target *prog.Target, state *ddState, statePath string, red reduction,
-	minimal uint64, probesThisBoot int) bool {
+func verifyCulprit(target *prog.Target, state *ddState, statePath, culpritPath string,
+	red reduction, minimal uint64, probesThisBoot int) bool {
 	key := maskKey(minimal)
 	units := setBits(minimal)
 	if state.VerifiedCrash == key {
@@ -284,6 +348,15 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 	if slices.Contains(state.VerifyFailed, key) {
 		log.Logf(0, "Culprit %v did NOT crash on its own — the crash during the search probably "+
 			"needed leftover state from an earlier test on the same boot.", units)
+		return false
+	}
+	state.CulpritTooLarge = false
+	sub := red.extract(minimal)
+	if len(sub.Calls) > maxExecCalls {
+		state.CulpritTooLarge = true
+		log.Logf(0, "Culprit %v has %d calls, over the executor's limit of %d: it cannot be "+
+			"run, so it cannot be re-checked. That is not a failed verification.",
+			units, len(sub.Calls), maxExecCalls)
 		return false
 	}
 	if probesThisBoot > 0 {
@@ -297,7 +370,12 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 	if err := saveDdState(statePath, state); err != nil {
 		tool.Failf("checkpoint: %v", err)
 	}
-	if err := runProgramOnce(target, red.extract(minimal)); err != nil {
+	if err := runProgramOnce(target, sub); err != nil {
+		// A hang is not a failed re-check: the culprit did not return, and the
+		// wedged executor holds the device, so nothing else can run this boot.
+		if errors.Is(err, errProgHang) {
+			failHang(state, statePath, culpritPath, key, sub)
+		}
 		log.Logf(0, "  (executor error during re-check: %v)", err)
 	}
 	// Still here, so the culprit did not reproduce in isolation.
@@ -312,7 +390,7 @@ func verifyCulprit(target *prog.Target, state *ddState, statePath string, red re
 }
 
 func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath string,
-	verified, exhausted bool) error {
+	verified, exhausted, tooLarge bool) error {
 	sub := red.extract(minimal)
 	if err := os.WriteFile(culpritPath, sub.Serialize(), 0644); err != nil {
 		return fmt.Errorf("write culprit: %w", err)
@@ -323,6 +401,9 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 	status := "NOT verified (never re-checked on its own)"
 	if verified {
 		status = "verified (crashes on its own)"
+	} else if tooLarge {
+		status = fmt.Sprintf("NOT verified — over the executor's %d-call limit, so it could not be run",
+			maxExecCalls)
 	} else if exhausted {
 		status = "NOT verified — re-checked and it did NOT crash alone (search exhausted)"
 	}
@@ -332,7 +413,11 @@ func finishMinimize(p *prog.Prog, red reduction, minimal uint64, culpritPath str
 		log.Logf(0, "  [%d] %s", i, red.describe(i))
 	}
 	log.Logf(0, "Wrote %d-call reproducer to %s", len(sub.Calls), culpritPath)
-	if exhausted {
+	if tooLarge {
+		log.Logf(0, "")
+		log.Logf(0, "No smaller subset that fits the executor reproduced. Replay the ring "+
+			"buffer as it was fuzzed (-replay-ring) to tell whether the crash reproduces at all.")
+	} else if exhausted {
 		log.Logf(0, "")
 		log.Logf(0, "This is the final answer for this program: no subset reproduces on "+
 			"its own, so the bug needs state an earlier program leaves behind. Treat the "+

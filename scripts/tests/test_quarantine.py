@@ -135,6 +135,45 @@ class Escape(unittest.TestCase):
         self.assertIn("Z", s["hard"])
 
 
+class ExhaustedLead(unittest.TestCase):
+    """A signature minimization could not reduce keeps panicking the box; after
+    tolerate_budget recurrences its lead is benched, labelled unverified."""
+
+    def test_recurrences_are_counted_until_the_budget(self):
+        s = fresh(confirm=2, tolerate_budget=4)
+        q.on_crash(s, "sigE", None)              # first sighting: SUSPECT
+        # (the recurrence that was triaged does not go through on_crash)
+        counts = [q.count_exhausted(s, "sigE") for _ in range(4)]
+        self.assertEqual(counts, [1, 2, 3, 4])
+        self.assertEqual([q.lead_due(s, n) for n in counts], [False, False, False, True])
+        self.assertEqual(s["catalog"]["sigE"]["occurrence_count"], 5)
+        self.assertEqual(s["catalog"]["sigE"]["disposition"], q.SUSPECTED)
+        self.assertEqual(q.disabled_set(s), [])  # counting alone benches nothing
+
+    def test_a_single_selector_lead_is_disabled(self):
+        s = fresh()
+        q.count_exhausted(s, "sigE")
+        res = q.bench_lead(s, "sigE", ["A", "A"], "lead.syz")
+        self.assertEqual((res["category"], res["disposition"]), (q.HARD, q.DISABLED))
+        self.assertEqual(q.disabled_set(s), ["A"])
+        rec = s["catalog"]["sigE"]
+        self.assertEqual(rec["leads"][0]["verified"], False)
+        self.assertIsNone(rec["minimized_sequence"])   # a lead is not a reproducer
+        self.assertEqual(rec["exhausted_count"], 0)    # the count starts over
+
+    def test_a_multi_selector_lead_only_rotates(self):
+        s = fresh()
+        res = q.bench_lead(s, "hang:job_t3", ["A", "B", "C"], "hang.syz")
+        self.assertEqual(res["disposition"], q.ROTATING)
+        self.assertEqual(len(q.disabled_set(s)), 1)    # one member off at a time
+        self.assertIn("hang:job_t3", s["catalog"])     # created on the spot
+
+    def test_a_lead_without_selectors_benches_nothing(self):
+        s = fresh()
+        self.assertIsNone(q.bench_lead(s, "sigE", [], "empty.syz"))
+        self.assertEqual(q.disabled_set(s), [])
+
+
 class DiscoveryContext(unittest.TestCase):
     def test_context_records_currently_disabled(self):
         s = fresh(confirm=1)                             # act on first sight

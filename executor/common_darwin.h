@@ -42,12 +42,73 @@ static long check_input(long scalar_input, long scalar_inputCnt, long inband_inp
 		return 1;
 	if ((const void*)inband_input == NULL && (size_t)inband_inputCnt != 0)
 		return 1;
-	if ((uint64*)scalar_output == NULL && (uint32*)scalar_outputCnt != NULL)
+	// A NULL output with a count pointer is how a selector says "no output":
+	// IOKit only writes through the buffer when the count is non-zero. Rejecting
+	// on the pointer alone dropped every grammar-valid call to such selectors
+	// before it reached the kernel. Reading the count is safe here: the call runs
+	// under NONFAILING, so a bad count pointer faults recoverably.
+	if ((uint64*)scalar_output == NULL && (uint32*)scalar_outputCnt != NULL &&
+	    *(uint32*)scalar_outputCnt != 0)
 		return 1;
-	if ((void*)ool_output == NULL && (size_t*)ool_output_size != NULL)
+	if ((void*)ool_output == NULL && (size_t*)ool_output_size != NULL &&
+	    *(size_t*)ool_output_size != 0)
 		return 1;
 	return 0;
 }
+
+#if SYZ_EXECUTOR
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+// Index of the call being executed on this thread, set by execute_call().
+static __thread int syz_iokit_call_index = -1;
+
+// IOKit outputs never reach the manager: CallInfo carries only the error. When
+// SYZ_IOKIT_OUTPUT_LOG names a file, append one JSON line per IOConnectCall*
+// with the request id (the manager's ExecRequest id), call index, selector,
+// IOReturn and the scalar/struct outputs, so freq_lab can join them with its
+// records. The pointers were already used by IOKit, and this runs under
+// NONFAILING, so reading them is safe.
+static void log_iokit_outputs(uint32 selector, kern_return_t kr, const uint64* scalar_out, const uint32* scalar_cnt,
+			      const void* struct_out, const size_t* struct_cnt)
+{
+	static const char* path = (const char*)-1;
+	if (path == (const char*)-1)
+		path = getenv("SYZ_IOKIT_OUTPUT_LOG");
+	if (path == NULL)
+		return;
+	enum { kMaxScalars = 16,
+	       kMaxStructBytes = 4096 };
+	char buf[512 + kMaxScalars * 24 + kMaxStructBytes * 2];
+	size_t n = snprintf(buf, sizeof(buf), "{\"req\":%llu,\"call\":%d,\"sel\":%u,\"kr\":%d,\"scalar_out\":[",
+			    (unsigned long long)request_id, syz_iokit_call_index, selector, kr);
+	uint32 ns = (scalar_out && scalar_cnt) ? *scalar_cnt : 0;
+	if (ns > kMaxScalars)
+		ns = kMaxScalars;
+	for (uint32 i = 0; i < ns; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, "%s%llu", i ? "," : "", (unsigned long long)scalar_out[i]);
+	n += snprintf(buf + n, sizeof(buf) - n, "],\"struct_out\":\"");
+	size_t nb = (struct_out && struct_cnt) ? *struct_cnt : 0;
+	size_t full = nb;
+	if (nb > kMaxStructBytes)
+		nb = kMaxStructBytes;
+	for (size_t i = 0; i < nb; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, "%02x", ((const uint8*)struct_out)[i]);
+	n += snprintf(buf + n, sizeof(buf) - n, "\",\"struct_out_size\":%zu}\n", full);
+	if (n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+	if (fd < 0)
+		return;
+	if (write(fd, buf, n) > 0)
+		fsync(fd);
+	close(fd);
+}
+#define LOG_IOKIT_OUTPUTS(sel, kr, so, sc, oo, oc) log_iokit_outputs(sel, kr, so, sc, oo, oc)
+#else
+#define LOG_IOKIT_OUTPUTS(sel, kr, so, sc, oo, oc)
+#endif
 
 static long __attribute__((unused)) syz_IOConnectCallMethod(volatile long arg0, volatile long arg1, volatile long arg2, volatile long arg3,
 							    volatile long arg4, volatile long arg5, volatile long arg6, volatile long arg7, volatile long arg8,
@@ -56,14 +117,19 @@ static long __attribute__((unused)) syz_IOConnectCallMethod(volatile long arg0, 
 	long ret;
 
 	// Avoid SIGSEG
-	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9))
+	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)) {
+		// Say so: otherwise errno is whatever the last call left behind, and a
+		// rejected call reads in the log as a kernel error it never produced.
+		errno = EINVAL;
 		return -1;
+	}
 
 	ret = IOConnectCallMethod((mach_port_t)arg0, (uint32)arg1,
 				  (const uint64*)arg2, (uint32)arg3,
 				  (const void*)arg4, (size_t)arg5,
 				  (uint64*)arg6, (uint32*)arg7,
 				  (void*)arg8, (size_t*)arg9);
+	LOG_IOKIT_OUTPUTS((uint32)arg1, ret, (const uint64*)arg6, (const uint32*)arg7, (const void*)arg8, (const size_t*)arg9);
 	errno = ret;
 	if (ret != 0)
 		return -1;
@@ -84,8 +150,12 @@ static long __attribute__((unused)) syz_IOConnectCallAsyncMethod(volatile long a
 	async_ref.port = p;
 
 	// Avoid SIGSEG
-	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9))
+	if (check_input(arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)) {
+		// Say so: otherwise errno is whatever the last call left behind, and a
+		// rejected call reads in the log as a kernel error it never produced.
+		errno = EINVAL;
 		return -1;
+	}
 
 	ret = IOConnectCallAsyncMethod((mach_port_t)arg0, (uint32)arg1,
 				       p, (uint64*)&async_ref, 1,
@@ -93,6 +163,7 @@ static long __attribute__((unused)) syz_IOConnectCallAsyncMethod(volatile long a
 				       (const void*)arg4, (size_t)arg5,
 				       (uint64*)arg6, (uint32*)arg7,
 				       (void*)arg8, (size_t*)arg9);
+	LOG_IOKIT_OUTPUTS((uint32)arg1, ret, (const uint64*)arg6, (const uint32*)arg7, (const void*)arg8, (const size_t*)arg9);
 	errno = ret;
 	if (ret != 0)
 		return -1;

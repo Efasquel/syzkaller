@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -416,8 +418,8 @@ var List = map[string]map[string]*Target{
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 		ARM64: {
-			PtrSize: 8,
-			PageSize: 0x4000,
+			PtrSize:    8,
+			PageSize:   0x4000,
 			DataOffset: 0x400000000,
 			// DataOffset: 0x200000000,
 			CCompiler: "clang",
@@ -429,8 +431,8 @@ var List = map[string]map[string]*Target{
 				// FIXME(HerrSpace): syscall and sprintf were marked as deprecated on macos
 				"-Wno-deprecated-declarations",
 			},
-			KernelArch: "arm64",
-			KernelHeaderArch: "arm64",
+			KernelArch:        "arm64",
+			KernelHeaderArch:  "arm64",
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 	},
@@ -562,7 +564,9 @@ var oses = map[string]osCommon{
 		KernelObject:           "kernel.kasan.t8112",
 		// Note: We need a real g++ here, not the symlink to clang++ common on
 		// macOS systems. Homebrews gcc package suffixes these with the gcc
-		// version to avoid conflicting with the macOS symlink. Currently -11.
+		// version to avoid conflicting with the macOS symlink; when g++-11 is
+		// absent initTarget picks the newest g++-N on PATH (see gnuCPP), and
+		// SYZ_CPP overrides both.
 		CPP:    "g++-11",
 		cflags: []string{"-lc++"},
 	},
@@ -764,6 +768,11 @@ func initTarget(target *Target, OS, arch string) {
 	}
 	if target.CPP == "" {
 		target.CPP = "cpp"
+	}
+	if cpp := os.Getenv("SYZ_CPP"); cpp != "" {
+		target.CPP = cpp
+	} else if OS == Darwin {
+		target.CPP = gnuCPP(target.CPP, os.Getenv("PATH"))
 	}
 	if target.Objdump == "" {
 		target.Objdump = "objdump"
@@ -1119,6 +1128,34 @@ func getSourceDir(target *Target) string {
 		return ret
 	}
 	return os.Getenv("SOURCEDIR")
+}
+
+// gnuCPP returns want if it is on path, otherwise the newest Homebrew-style
+// g++-N found there, otherwise want unchanged (so the error names what is missing).
+// pkg/csource needs GNU cpp for -fdirectives-only, and Homebrew only installs it
+// under a versioned name, which changes with every gcc release.
+func gnuCPP(want, path string) string {
+	if _, err := exec.LookPath(want); err == nil {
+		return want
+	}
+	best, bestVer := "", -1
+	for _, dir := range filepath.SplitList(path) {
+		matches, _ := filepath.Glob(filepath.Join(dir, "g++-*"))
+		for _, m := range matches {
+			ver, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(m), "g++-"))
+			if err != nil || ver <= bestVer {
+				continue
+			}
+			if st, err := os.Stat(m); err != nil || st.Mode()&0111 == 0 {
+				continue
+			}
+			best, bestVer = filepath.Base(m), ver
+		}
+	}
+	if best == "" {
+		return want
+	}
+	return best
 }
 
 func needSyscallDefine(nr uint64) bool     { return true }

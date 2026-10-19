@@ -49,6 +49,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SESSION = SCRIPT_DIR / "fuzz-session.py"
 TRIAGE = SCRIPT_DIR / "triage.py"
+RESULTS = SCRIPT_DIR / "fuzz-results.py"
 BUG_REGISTRY = SCRIPT_DIR / "bug_registry.py"
 CAMPAIGN_DIR = REPO_ROOT / "campaigns"
 STATE_DIR = CAMPAIGN_DIR / ".state"
@@ -66,8 +67,11 @@ BUGS_DIR = CAMPAIGN_DIR / "bugs"
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
-import timefmt  # noqa: E402
-from tablefmt import render, tabulate  # noqa: E402
+import triage as tri  # noqa: E402  (job outcome constants only; runs as a subprocess)
+from lib import bootinfo  # noqa: E402
+from lib import cfgutil  # noqa: E402
+from lib import timefmt  # noqa: E402
+from lib.tablefmt import render, tabulate  # noqa: E402
 
 # `syz-ring-repro -emit-json` translates a minimized culprit into the list of
 # IOConnectCallMethod syscall names to disable (JSON). Prefer the built binary;
@@ -90,21 +94,43 @@ DEFAULTS = {
     "loop": False,
     "poll_seconds": 600,        # how often to check exec total (10 min)
     "hang_after_seconds": 1800,  # frozen this long with manager alive => hang
-    "max_crashes": 20,          # total incidents before the breaker halts
+    # Incidents (crash + hang) on ONE config before that config is abandoned and
+    # the campaign moves to the next. It used to count the whole campaign and
+    # halt it, so a crash-heavy first config starved every config after it.
+    "max_crashes": 20,
     "min_free_gb": 20.0,        # halt if root disk drops below this
     "keep_cores": 3,            # cores retained after pruning
     # The crash-loop breaker exists to catch a PATHOLOGICAL loop -- a config that
     # cannot fuzz at all (manager dies on startup, corpus poisoned so the very
     # first program re-panics) -- not productive fuzzing. On this target a healthy
     # run panics the box every 30-110s, so the old 120s/5 pairing halted a working
-    # campaign within ten minutes of its first real bug. 20s is below anything that
-    # managed to execute programs; a startup failure dies in about a second.
-    "crashloop_window_seconds": 20,   # a run shorter than this never fuzzed anything
+    # campaign within ten minutes of its first real bug.
+    #
+    # "Never fuzzed anything" is measured as programs executed, not seconds. A
+    # time window was tried: both of its ends come from the manager's stat line,
+    # written every 10s, so the error (up to 20s) was as large as the window, and
+    # a healthy run with a quick real bug read as "fast". At 40-50 execs/s, five
+    # seconds of real fuzzing is far past 200; a poisoned corpus panics at 0-30.
+    # The count can be up to 10s stale, which only ever undercounts.
+    "crashloop_min_execs": 200,   # a crash before this many programs is "fast"
     "crashloop_limit": 15,      # this many consecutive such crashes => halt
+    # A manager that dies before executing a single program, with no panic --
+    # a held port, a bad config, a missing binary. Not a crash and not a hang:
+    # it used to be filed as a "hang" one poll (10 min) later and retried
+    # forever; one campaign did that 19 times. Watched closely until the first
+    # exec, halted after this many in a row.
+    "startup_fail_limit": 3,
+    "startup_poll_seconds": 15,     # poll this often until the first exec
+    "startup_retry_seconds": 30,    # pause before retrying a failed start
     "triage_max_boots": 40,     # give up (halt) if triage can't reach a culprit in this many advances
+    # Pause before re-running a triage advance that returned without finishing.
+    # A probe that reproduces reboots the box, so an advance only returns early
+    # on an error; this is a breather, not a wait for anything. It used to be
+    # poll_seconds (10 min), uninterruptible, and on no clock at all.
+    "triage_retry_seconds": 30,
     # Which clock --budget measures.
-    #   "wall"  -- everything the campaign occupied the rig for: session uptime
-    #              PLUS minimization PLUS reboot overhead. "Give this config 24
+    #   "wall"  -- everything the campaign occupied the rig for: preparation
+    #              PLUS fuzzing PLUS minimization PLUS reboot overhead. "Give this config 24
     #              hours of machine time", which is what a comparison between
     #              configurations needs, and the default for that reason.
     #   "real"  -- elapsed time since the config started, counting EVERYTHING:
@@ -113,12 +139,11 @@ DEFAULTS = {
     #              one that keeps running while the campaign is not. Survives the
     #              panic-reboots: the start stamp is persisted, not re-taken on
     #              relaunch, so a crash does not restart the window.
-    #   "fuzz"  -- session uptime only, so a long triage does not eat the budget.
-    #              Note this is uptime, NOT time spent executing programs: the
-    #              manager also starts up, triages the corpus and waits on RPC,
-    #              and on a measured run only 56% of uptime was execution. For
-    #              that figure use `runstats.py show`, which reads syz-manager's
-    #              own counter.
+    #   "fuzz"  -- from each run's first executed program to its end, so neither
+    #              startup nor a long triage eats the budget. Still not pure
+    #              execution time: the manager also re-triages its corpus and
+    #              waits on RPC. For that figure use `runstats.py show`, which
+    #              reads syz-manager's own counter.
     # wall >= fuzz always, so this default can only end a campaign sooner.
     "budget_clock": "wall",
     # Cap on the launchd-captured log. One real campaign produced 7.0MB across
@@ -140,6 +165,15 @@ DEFAULTS = {
     # idle while you were asleep, and charging that would make the wall clock a
     # measure of your schedule rather than the campaign's.
     "max_boot_gap_seconds": 900.0,
+    # Of that gap, the part after the boot is login-to-relaunch, which launchd
+    # keeps to a minute or two. Longer means nobody relaunched the driver (a
+    # manual start days later), which is idle, not overhead.
+    "max_relaunch_seconds": 300.0,
+    # Clone of the results repo (fuzz-results.py). Unset: no results commits.
+    # Set: a commit before every session (re)start -- before the manager
+    # re-triages corpus.db and drops what no longer reproduces -- one per poll
+    # when the corpus or coverage moved, one per incident, and one at the end.
+    "results_repo": None,
 }
 
 BUDGET_CLOCKS = ("fuzz", "wall", "real")
@@ -266,11 +300,32 @@ def recovery_hint():
 
 
 def wall_seconds(s):
-    """Total time this campaign has been the rig's occupant: fuzzing, plus the
-    minimization it took to explain a crash, plus the reboots those crashes
-    cost. Excludes time halted or idle -- nothing accrues while no driver runs."""
-    return (s.get("active_seconds", 0.0) + s.get("triage_seconds", 0.0)
-            + s.get("overhead_seconds", 0.0))
+    """Total time this campaign has been the rig's occupant: preparing each run,
+    fuzzing, plus the minimization it took to explain a crash, plus the reboots
+    those crashes cost. Excludes time halted or idle -- nothing accrues while no
+    driver runs."""
+    return (s.get("prep_seconds", 0.0) + s.get("active_seconds", 0.0)
+            + s.get("triage_seconds", 0.0) + s.get("overhead_seconds", 0.0))
+
+
+def real_seconds(s):
+    """Elapsed time since the current config started, by the wall clock on the
+    wall -- not the campaign's occupancy of the rig.
+
+    Unlike wall_seconds this keeps running while the campaign does not: through a
+    halt, a panic-reboot, a crashloop pause, the box being powered off. That is
+    the point. It is the only clock that can express a window ("2pm to 4pm"),
+    because a window elapses whether or not anything is fuzzing.
+
+    Reads config_started_at, which is stamped once when a config starts and NOT
+    re-taken when the coordinator relaunches. That matters here more than
+    anywhere: this rig reboots on every panic, so a stamp refreshed on relaunch
+    would restart the window at each crash and the budget would never expire.
+    """
+    t0 = timefmt.to_epoch(s.get("config_started_at"))
+    if not t0:
+        return 0.0
+    return max(0.0, time.time() - t0)
 
 
 def real_seconds(s):
@@ -310,7 +365,8 @@ def fmt_hms(sec):
 # is spent and the campaign advances. The lifetime totals below never reset, so
 # "how long did this campaign run?" survives every advance and every wrap. Losing
 # that is why a finished 2h run reported active_seconds 0.0.
-LIFETIME_CLOCKS = {"active_seconds": "total_active_seconds",
+LIFETIME_CLOCKS = {"prep_seconds": "total_prep_seconds",
+                   "active_seconds": "total_active_seconds",
                    "triage_seconds": "total_triage_seconds",
                    "overhead_seconds": "total_overhead_seconds"}
 
@@ -322,6 +378,8 @@ def roll_budget_clocks(s):
         s[tot] = s.get(tot, 0.0) + s.get(cur, 0.0)
         s[cur] = 0.0
     s["run_active_base"] = 0.0
+    s["run_prep_base"] = 0.0
+    s["run_prep_started"] = None
     # The "real" clock's origin is per-config too: dropping it here makes the
     # next config stamp a fresh one when it starts.
     s["config_started_at"] = None
@@ -334,6 +392,74 @@ def lifetime(s, key):
 
 def lifetime_wall(s):
     return sum(lifetime(s, k) for k in LIFETIME_CLOCKS)
+
+
+def boot_epoch():
+    return bootinfo.boot_epoch()
+
+
+# --- per-run accounting ------------------------------------------------------
+# A run has two stretches. Preparation: the coordinator snapshots the inputs and
+# commits results, the manager compiles the grammar and waits for the executor.
+# Fuzzing: from the first executed program to the end of the run. They are
+# prep_seconds and active_seconds, recomputed from the run's own timestamps
+# rather than incremented, so a late or repeated poll cannot skew them;
+# run_prep_base / run_active_base hold what earlier runs of this config banked.
+#
+# The end of a run is its last sign of life, not the moment we noticed. This
+# target reboots on every panic, so nearly every crash is noticed on the NEXT
+# boot; measuring to then charged the reboot as fuzzing -- and charged it twice,
+# since reconcile_gap also counted it as overhead. One campaign was charged
+# 68h41m of fuzzing for a box that sat powered off over a weekend.
+RUN_ALIVE = "alive"
+
+
+def run_end_epoch(info, now=None):
+    """When a run that is no longer alive ended: its last sign of life (the run
+    log's newest line, the cover log's mtime). Never later than the boot that
+    followed it, never earlier than its start."""
+    now = time.time() if now is None else now
+    started = info.get("run_started_epoch")
+    end = info.get("last_activity_epoch") or started or now
+    boot = info.get("boot_epoch") or boot_epoch()
+    if boot and started and boot > started:
+        end = min(end, boot)
+    end = min(end, now)
+    if started:
+        end = max(end, started)
+    return end
+
+
+def account_run(s, info, end):
+    """Set this config's prep/active clocks for the open run, up to `end`.
+    Returns how long the manager lived (end minus its start), or None."""
+    started = info.get("run_started_epoch")
+    prep_from = s.get("run_prep_started") or started or end
+    fuzz_from = info.get("fuzz_started_epoch")
+    if fuzz_from is not None and fuzz_from <= end:
+        prep = max(0.0, fuzz_from - prep_from)
+        active = max(0.0, end - max(fuzz_from, prep_from))
+    else:                                   # never executed a program
+        prep, active = max(0.0, end - prep_from), 0.0
+    s["prep_seconds"] = s.get("run_prep_base", 0.0) + prep
+    s["active_seconds"] = s.get("run_active_base", 0.0) + active
+    return (end - started) if started else None
+
+
+def close_run(s, info, end):
+    """Account the open run up to `end` and bank it. A no-op when no run is
+    open, so every exit path can call it without counting a run twice."""
+    if not s.get("run_prep_started"):
+        return None
+    ran = account_run(s, info, end)
+    s["run_prep_base"] = s["prep_seconds"]
+    s["run_active_base"] = s["active_seconds"]
+    s["run_prep_started"] = None
+    # Which run was banked, and up to when: a manager that outlives the close
+    # (any halt path that fails to stop it) is re-attached from here, not from
+    # its own start, or its time would be counted twice.
+    s["run_closed"] = {"started": info.get("run_started_epoch"), "end": end}
+    return ran
 
 
 def die(msg):
@@ -420,15 +546,19 @@ def load_def(name):
 def init_state(name):
     return {
         "name": name, "status": "running", "cursor": 0,
-        # Three disjoint clocks; wall_seconds() is their sum. Keeping them apart
+        # Four disjoint clocks; wall_seconds() is their sum. Keeping them apart
         # is what lets a writeup say "24h fuzzing, 31h wall, of which 4h
         # minimization" instead of picking one number and hiding the rest.
-        "active_seconds": 0.0,      # manager executing programs
+        "prep_seconds": 0.0,        # snapshot, grammar compile, up to the first exec
+        "active_seconds": 0.0,      # first exec -> end of the run
         "triage_seconds": 0.0,      # minimizing a culprit (not fuzzing)
         "overhead_seconds": 0.0,    # observed panic-reboot gaps
         "session_id": None, "current_config": None,
         "run_started": None, "last_exec_total": None,
         "crashes": 0, "hangs": 0, "consec_fast_crashes": 0,
+        # Per-config counters, reset when the campaign moves to the next config.
+        "config_incidents": 0, "startup_failures": 0,
+        "abandoned": [],            # configs max_crashes gave up on
         "incidents": [], "started_at": now_iso(), "updated_at": now_iso(),
         "halt_reason": None,
         # coordinator: fuzzing <-> triaging. On a new crash the campaign hands
@@ -436,6 +566,9 @@ def init_state(name):
         "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
         "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
         "exhausted_sigs": [],
+        # Second bugs a triage job surfaced, waiting for a job of their own, and
+        # per-job bookkeeping (panics routed, bugs announced / queued).
+        "triage_queue": [], "triage_seen": {},
         # Start the watermark at the newest report that already exists, so the
         # campaign's first crash fingerprints one fresh panic instead of replaying
         # every historical report in the dir (they are ~2MB each).
@@ -521,6 +654,9 @@ COORDINATOR_DEFAULTS = {
     "triage_seconds": 0.0, "overhead_seconds": 0.0,
     "total_active_seconds": 0.0, "total_triage_seconds": 0.0,
     "total_overhead_seconds": 0.0,
+    "prep_seconds": 0.0, "total_prep_seconds": 0.0,
+    "config_incidents": 0, "startup_failures": 0, "abandoned": [],
+    "triage_queue": [], "triage_seen": {},
 }
 
 
@@ -540,17 +676,65 @@ def free_gb():
 
 
 def breaker(s, d):
-    """Reason to halt the campaign, or None."""
-    total = s["crashes"] + s["hangs"]
-    if total >= d["max_crashes"]:
-        return "reached max_crashes (%d incidents)" % total
+    """Reason to halt the campaign, or None. Config-level limits are in
+    config_breaker: they move on to the next config instead."""
     fg = free_gb()
     if fg < d["min_free_gb"]:
         return "low disk (%.1fGB free < %.1fGB)" % (fg, d["min_free_gb"])
     if s["consec_fast_crashes"] >= d["crashloop_limit"]:
-        return ("crash loop (%d crashes under %ds of runtime)"
-                % (s["consec_fast_crashes"], d["crashloop_window_seconds"]))
+        return ("crash loop (%d crashes in a row before %d programs executed)"
+                % (s["consec_fast_crashes"], d["crashloop_min_execs"]))
+    limit = d.get("startup_fail_limit", DEFAULTS["startup_fail_limit"])
+    if s.get("startup_failures", 0) >= limit:
+        return ("syz-manager failed to start %d times in a row (died before "
+                "executing anything); last log line: %s"
+                % (s["startup_failures"], s.get("last_startup_error") or "?"))
     return None
+
+
+def config_breaker(s, d):
+    """Reason to abandon the current config and move on, or None."""
+    n = s.get("config_incidents", 0)
+    if n >= d["max_crashes"]:
+        return "reached max_crashes (%d incidents on this config)" % n
+    return None
+
+
+def reset_config_counters(s):
+    """Zero what is counted per config. Lifetime totals are left alone."""
+    s["config_incidents"] = 0
+    s["consec_fast_crashes"] = 0
+    s["startup_failures"] = 0
+
+
+def advance_config(s):
+    """Leave the current config: bank its clocks, reset its counters."""
+    s["cursor"] += 1
+    s["results_started"] = False
+    roll_budget_clocks(s)
+    s["session_id"] = None
+    s["last_exec_total"] = None
+    reset_config_counters(s)
+    # A queued second bug belongs to the config it crashed in. Its program stays
+    # in the triage job that found it, and the quarantine already has it as
+    # SUSPECT, so a recurrence later still gets it triaged.
+    for item in s.get("triage_queue") or []:
+        log("dropping queued triage of %s (config advanced); its program is %s"
+            % (item["sig"], item["program"]))
+    s["triage_queue"] = []
+
+
+def run_log_tail(info):
+    """The last meaningful line of the run's manager log ('' if none) -- for a
+    manager that died at startup, that is the reason."""
+    p = info.get("run_log")
+    try:
+        lines = [ln.strip() for ln in Path(p).read_text(errors="replace").splitlines()
+                 if ln.strip()] if p else []
+    except OSError:
+        return ""
+    fatal = [ln for ln in lines if "FATAL" in ln or "SYZFAIL" in ln]
+    return (fatal or lines or [""])[-1][:300]
 
 
 def prune_cores(keep):
@@ -581,23 +765,36 @@ def prune_cores(keep):
 
 
 # --- incident handling -------------------------------------------------------
-def record_incident(s, d, kind, info):
-    """Update counters and the crash-loop tracker for one crash/hang."""
+def record_incident(s, d, kind, info, end=None):
+    """Update counters and the crash-loop tracker for one crash/hang, and close
+    the run's clocks at `end` (default: its last sign of life)."""
+    if end is None:
+        end = run_end_epoch(info)
     started = info.get("run_started_epoch")
-    ran_for = (time.time() - started) if started else None
-    fast = (kind == "crash" and ran_for is not None
-            and ran_for < d["crashloop_window_seconds"])
+    ran_for = close_run(s, info, end)
+    if ran_for is None and started:
+        ran_for = max(0.0, end - started)
+    # "Fast" means the run executed almost nothing before the panic (see
+    # crashloop_min_execs): independent of how long startup took, and of the
+    # 10s granularity of the stat line. No stat line at all reads as zero.
+    fuzz_from = info.get("fuzz_started_epoch")
+    fuzzed = max(0.0, end - fuzz_from) if fuzz_from and fuzz_from <= end else 0.0
+    execs = info.get("exec_total") or 0
+    fast = kind == "crash" and execs < d["crashloop_min_execs"]
     s["consec_fast_crashes"] = s["consec_fast_crashes"] + 1 if fast else 0
-    if ran_for:
-        s["active_seconds"] = s.get("run_active_base", 0.0) + ran_for
-        s["run_active_base"] = s["active_seconds"]
+    if fuzz_from:
+        s["startup_failures"] = 0          # this run did start
+    s["config_incidents"] = s.get("config_incidents", 0) + 1
     if kind == "crash":
         s["crashes"] += 1
     else:
         s["hangs"] += 1
+    target = fuzzed_target(s["current_config"])
     s["incidents"].append({
         "config": s["current_config"], "kind": kind, "at": now_iso(),
+        "fuzzed_kext": target["kext"], "kext_id": target["kext_id"],
         "ran_seconds": round(ran_for) if ran_for else None,
+        "fuzzed_seconds": round(fuzzed),
         "exec_total": info.get("exec_total"),
         "panic_evidence": info.get("panic_evidence"),
     })
@@ -610,6 +807,42 @@ def record_incident(s, d, kind, info):
 def collect_and_prune(s, d, kind):
     session("collect", s["session_id"], kind)
     prune_cores(d["keep_cores"])
+    results_commit(s, d, kind, detach=True)
+
+
+def results_commit(s, d, event, cfg=None, detach=False):
+    """Record the current config's results in the results repo (fuzz-results.py).
+
+    Best effort by construction: a results failure is logged and fuzzing goes
+    on. detach=True returns at once (polls and incidents must not stall the
+    loop); the synchronous calls are the (re)start, which must capture corpus.db
+    before the manager re-triages it, and the end, after which nothing runs."""
+    repo = (d or {}).get("results_repo")
+    cfg = cfg or s.get("current_config")
+    if not repo or not cfg:
+        return
+    prefix = s["name"] if len(d["items"]) <= 1 else "%s/%s" % (s["name"], config_id(cfg))
+    cmd = [sys.executable, str(RESULTS), "--repo", repo, "commit", cfg,
+           "--event", event, "--campaign", s["name"], "--tag-prefix", prefix,
+           "--campaign-def", str(def_path(s["name"])),
+           "--wall-seconds", str(round(lifetime_wall(s))),
+           "--push", "detach" if event in ("restart", "corpus", "crash", "hang") else "wait"]
+    if event in ("start", "restart"):
+        cmd.append("--no-freq")         # fast path: the manager is waiting on us
+    out = open(STATE_DIR / ("%s.results.log" % s["name"]), "a")
+    try:
+        if detach:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        else:
+            rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, timeout=600).returncode
+            if rc != 0:
+                log("results commit (%s) failed; see %s" % (event, out.name))
+    except (OSError, subprocess.SubprocessError) as e:
+        log("results commit (%s) failed: %s" % (event, e))
+    finally:
+        out.close()
 
 
 # --- coordinator: crash -> triage -> bench -> resume -------------------------
@@ -674,12 +907,47 @@ def latest_panic_signature(s):
             log("could not fingerprint %s: %s" % (r.name, e))
             continue
         sig = fp["signature"]
+        # Kept for the incident and for status: the backtrace's crashing kext is
+        # how a crash outside the fuzzed driver gets noticed.
+        s["last_panic"] = {"signature": sig, "title": fp.get("title"),
+                           "crashing_kext": fp.get("crashing_kext"), "report": r.name}
         try:
             s["panic_sig_watermark"] = max(s.get("panic_sig_watermark", 0.0),
                                            r.stat().st_mtime)
         except OSError:
             pass
     return sig
+
+
+def fuzzed_target(cfg):
+    """What a config fuzzes: its Pishi kext_id, the IOKit services it opens
+    (from syz_IOServiceOpen$<Service>_<UserClient>) and its workdir's kext
+    directory (workdir/<Kext>/<run>). The config names no kext, so this is the
+    best there is to compare a backtrace's crashing kext against."""
+    try:
+        conf = cfgutil.load(cfg) if cfg else {}
+    except (OSError, ValueError):
+        conf = {}
+    services = set()
+    for name in conf.get("enable_syscalls") or []:
+        if name.startswith("syz_IOServiceOpen$"):
+            services.add(name.split("$", 1)[1].rsplit("_", 1)[0])
+    workdir = conf.get("workdir")
+    return {"kext_id": (conf.get("kext_coverage") or {}).get("kext_id"),
+            "kext": Path(workdir).parent.name if workdir else None,
+            "services": sorted(services)}
+
+
+def kext_matches(target, crashing):
+    """Whether a backtrace's crashing kext is the one being fuzzed: True, False,
+    or None when there is nothing to compare (no kext, or the kernel itself)."""
+    if not crashing or crashing == "kernel":
+        return None
+    names = [n for n in [target.get("kext")] + target.get("services", []) if n]
+    if not names:
+        return None
+    c = crashing.lower()
+    return any(c in n.lower() or n.lower() in c for n in names)
 
 
 def config_triage_flags(cfg):
@@ -712,15 +980,20 @@ def config_triage_flags(cfg):
     return out
 
 
-def begin_triage(s, d, sig):
+def begin_triage(s, d, sig, ring=None):
     """Pause fuzzing and stand up a triage job for a new bug. Returns True on
-    success; on any failure the campaign just resumes fuzzing (no phase change)."""
-    info = inspect(s["session_id"]) if s.get("session_id") else {"found": False}
-    workdir = info.get("workdir")
-    if not workdir:
-        log("cannot triage %s: session workdir unknown; resuming fuzzing" % sig)
-        return False
-    ring = Path(workdir) / "ring_buffer"
+    success; on any failure the campaign just resumes fuzzing (no phase change).
+
+    `ring` defaults to the session's ring buffer; a queued second bug brings its
+    own (a one-slot ring holding the program that crashed with it)."""
+    if ring is None:
+        info = inspect(s["session_id"]) if s.get("session_id") else {"found": False}
+        workdir = info.get("workdir")
+        if not workdir:
+            log("cannot triage %s: session workdir unknown; resuming fuzzing" % sig)
+            return False
+        ring = Path(workdir) / "ring_buffer"
+    ring = Path(ring)
     if not ring.is_dir():
         log("cannot triage %s: no ring buffer at %s; resuming fuzzing" % (sig, ring))
         return False
@@ -747,7 +1020,13 @@ def begin_triage(s, d, sig):
     tri.update(config_triage_flags(cfg_path))
     # Pin the target signature so triage's crash gate is active from the first
     # subset (a second bug firing during minimization won't misdirect it).
-    args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force"]
+    args = ["new", job, "--ring", str(ring), "--target-sig", sig, "--force",
+            "--campaign", s["name"]]
+    if cfg_path:
+        args += ["--config", config_id(cfg_path)]
+        kext = fuzzed_target(cfg_path).get("kext")
+        if kext:
+            args += ["--fuzzed-kext", kext]
     for flag, key in (("--executor", "executor"), ("--ringrepro", "ringrepro"),
                       ("--kcov-device", "kcov_device"), ("--kext-id", "kext_id"),
                       ("--sandbox", "sandbox"), ("--max-k", "max_k"),
@@ -787,27 +1066,208 @@ def _bench_culprit(s, culprit):
         log("already benched in %s: %s" % (cfg.name, n))
 
 
-def route_triage_panics(st, campaign=None, config=None):
-    """Catalog the panics that minimization itself produced.
+def bench_lead_program(s, cfg, key, program, why):
+    """Bench `program`'s selectors under quarantine key `key` as an UNVERIFIED
+    lead. Returns True if anything was benched."""
+    try:
+        seq = culprit_sequence(program)
+    except RuntimeError as e:
+        log("  cannot read selectors from %s (%s); nothing benched" % (program, e))
+        return False
+    qs = load_qstate(cfg)
+    res = qm.bench_lead(qs, key, seq, program)
+    if res is None:
+        log("  %s names no selector; nothing benched" % program)
+        return False
+    save_qstate(cfg, qs)
+    apply_disabled(cfg, qs)
+    log("  benched UNVERIFIED lead for %s (%s): %s -> %s/%s; disabled=%s"
+        % (key, why, program, res["category"], res["disposition"], res["disabled"]))
+    return True
+
+
+def bench_hang(s, job, cfg, program):
+    """A triage job that kept hanging: bench the program that hung. It gets its
+    own quarantine key -- a hang has no panic signature, and filing it under the
+    crash being minimized would claim it reproduces that crash."""
+    if not (cfg and program and Path(program).exists()):
+        log("  hang culprit missing (%s); nothing benched" % program)
+        return
+    bench_lead_program(s, cfg, "hang:%s" % job, program, "hung %d times in triage"
+                       % tri.MAX_HANGS)
+
+
+def newest_ring_program(workdir, dst):
+    """Copy the newest program in workdir's ring buffer to dst, without its id
+    header. The program running when the box panicked, as far as the ring knows.
+    Returns dst, or None."""
+    best = None
+    for p in (Path(workdir) / "ring_buffer").glob("slot_*.syz"):
+        try:
+            head, _, body = p.read_text().partition("\n")
+            n = int(head[3:]) if head.startswith("id=") else None
+        except (OSError, ValueError):
+            continue
+        if n is not None and (best is None or n > best[0]):
+            best = (n, body)
+    if best is None:
+        return None
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(best[1])
+    return str(dst)
+
+
+def exhausted_recurrence(s, sig, info):
+    """An exhausted signature panicked the box again. Count it in the quarantine,
+    and once it has recurred tolerate_budget times, bench the newest ring program
+    as an UNVERIFIED lead -- otherwise nothing ever stops it rebooting the box."""
+    cfg = s.get("current_config")
+    if not cfg:
+        return
+    qs = load_qstate(cfg)
+    n = qm.count_exhausted(qs, sig)
+    save_qstate(cfg, qs)
+    budget = qm._p(qs, "tolerate_budget")
+    why = (s.get("exhausted_why") or {}).get(sig) or "no-repro"
+    if not qm.lead_due(qs, n):
+        log("crash %s: exhausted (%s), not re-triaged; recurrence %d of %d before a "
+            "lead is benched" % (sig, why, n, budget))
+        return
+    lead = newest_ring_program(info.get("workdir") or "",
+                               STATE_DIR / "leads" / ("%s_%s.syz" % (sig, timefmt.now_ts())))
+    if not lead:
+        log("crash %s: exhausted, %d recurrences, but no ring program to bench" % (sig, n))
+        return
+    log("crash %s: exhausted (%s) and recurred %d times; benching the newest ring "
+        "program as a lead" % (sig, why, n))
+    bench_lead_program(s, cfg, sig, lead, "newest ring program, recurrence %d" % n)
+
+
+def triage_seen(s, job):
+    """Per-job bookkeeping: panic reports routed, second bugs announced, and
+    second bugs queued. Dropped when the job ends."""
+    seen = s.setdefault("triage_seen", {}).setdefault(job, {})
+    for k in ("routed", "others", "queued"):
+        seen.setdefault(k, [])
+    return seen
+
+
+def route_triage_panics(s, st, job):
+    """Catalog the panics a triage job produced, each once.
 
     A subset that reproduces the bug panics the box, and triage.py files that
-    panic in the JOB's ledger -- nothing routed it to the bug inventory. For the
-    target signature that is merely redundant, but a DIFFERENT bug surfacing
-    during minimization was recorded only as a triage incident and never appeared
-    as a reportable bug at all. route_one dedups by report basename, so
-    re-routing something already filed is a no-op.
+    panic in the JOB's ledger -- nothing else routes it to the bug inventory.
+    The target's panics are evidence the minimizer caused on purpose (origin
+    triage, not a sighting). A DIFFERENT signature is a genuine find nobody was
+    looking for (origin fuzz-during-triage): it is announced, and seeded in the
+    quarantine. Routing used to repeat every incident on every advance.
     """
+    seen = triage_seen(s, job)
+    target = (st or {}).get("target_signature")
     for inc in (st or {}).get("incidents", []):
         rep = inc.get("report")
-        if not rep:
+        if not rep or rep in seen["routed"]:
             continue
+        seen["routed"].append(rep)       # a report that is gone will not come back
+        sig = inc.get("signature")
+        other = bool(sig and target and sig != target)
         for dpath in PANIC_DIRS:
             cand = dpath / rep
             if _exists(cand):
-                # Caused by the minimizer re-running a known-crashing subset, not
-                # found by fuzzing: filed as evidence, not counted as a sighting.
-                route_bug_registry(str(cand), campaign, config, origin="triage")
+                route_bug_registry(str(cand), s.get("name"), s.get("current_config"),
+                                   origin="fuzz-during-triage" if other else "triage")
                 break
+        if other:
+            note_second_bug(s, job, inc)
+
+
+def note_second_bug(s, job, inc):
+    """Announce a second bug a triage job tripped over, and seed it SUSPECT."""
+    seen = triage_seen(s, job)
+    sig = inc["signature"]
+    if sig in seen["others"]:
+        return
+    seen["others"].append(sig)
+    log("SECOND BUG during triage %s: %s -- %s (crashing kext %s), not the target "
+        "%s; filed as a genuine find" % (job, sig, inc.get("title") or "?",
+                                         inc.get("kext") or "?", s.get("triage_bug_sig")))
+    cfg = s.get("current_config")
+    if not cfg:
+        return
+    qs = load_qstate(cfg)
+    rec = qs["catalog"].get(sig)
+    if rec is None:
+        qm.on_crash(qs, sig, None)
+        save_qstate(cfg, qs)
+        log("  quarantine: %s seeded SUSPECT" % sig)
+    else:
+        log("  quarantine: %s already known (%s)" % (sig, rec.get("disposition")))
+
+
+def why_not_triage(s, sig):
+    """Why a second bug should NOT get a triage of its own, or None."""
+    if sig == s.get("triage_bug_sig"):
+        return "it is the bug being triaged"
+    if sig in (s.get("exhausted_sigs") or []):
+        return "it is exhausted"
+    cfg = s.get("current_config")
+    rec = load_qstate(cfg)["catalog"].get(sig) if cfg else None
+    if rec and rec.get("disposition") not in (None, qm.SUSPECTED):
+        return "the quarantine already handles it (%s)" % rec["disposition"]
+    return None
+
+
+def queue_second_bugs(s, st, job):
+    """Queue a triage for each second bug whose crashing program triage saved."""
+    seen = triage_seen(s, job)
+    for sig, ob in sorted(((st or {}).get("other_bugs") or {}).items()):
+        if sig in seen["queued"] or not Path(ob.get("program") or "").exists():
+            continue
+        seen["queued"].append(sig)
+        why = why_not_triage(s, sig)
+        if not why and any(q["sig"] == sig for q in s.get("triage_queue") or []):
+            why = "it is already queued"
+        if why:
+            log("second bug %s: not queued for triage: %s" % (sig, why))
+            continue
+        s.setdefault("triage_queue", []).append(
+            {"sig": sig, "program": ob["program"], "from_job": job,
+             "config": s.get("current_config"), "at": now_iso()})
+        log("second bug %s: queued for its own triage after %s (program %s)"
+            % (sig, job, ob["program"]))
+
+
+def start_queued_triage(s, d):
+    """Start the next queued second-bug triage, if any is still worth it.
+    Returns True when the campaign is triaging again."""
+    while s.get("triage_queue"):
+        item = s["triage_queue"].pop(0)
+        sig = item["sig"]
+        if item.get("config") != s.get("current_config"):
+            log("dropping queued triage of %s: queued under another config" % sig)
+            continue
+        budget = d["items"][min(s["cursor"], len(d["items"]) - 1)]["budget_seconds"]
+        if budget_spent(s, d) >= budget:
+            log("dropping queued triage of %s: the budget is spent (program %s; it is "
+                "SUSPECT, so a recurrence will still be triaged)" % (sig, item["program"]))
+            continue
+        why = why_not_triage(s, sig)
+        if why:
+            log("dropping queued triage of %s: %s" % (sig, why))
+            continue
+        ring = STATE_DIR / "queued" / ("%s_%s" % (sig, timefmt.now_ts())) / "ring_buffer"
+        try:
+            ring.mkdir(parents=True, exist_ok=True)
+            (ring / "slot_0000.syz").write_text("id=0\n" + Path(item["program"]).read_text())
+        except OSError as e:
+            log("dropping queued triage of %s: cannot stage its program: %s" % (sig, e))
+            continue
+        log("starting the queued triage of second bug %s (found by %s)"
+            % (sig, item["from_job"]))
+        if begin_triage(s, d, sig, ring=ring):
+            return True
+    return False
 
 
 def advance_triage(s, d):
@@ -829,65 +1289,91 @@ def advance_triage(s, d):
         save_state(s)
         log("HALT: %s" % s["halt_reason"])
         return
+    # Persisted so the next boot can split this advance at the panic it may end
+    # in: up to the crashing probe is minimization, after it is the reboot.
+    s["triage_advance_started"] = advance_started
     save_state(s)
     log("triage advance %d/%d for job %s"
         % (s["triage_boots"], d["triage_max_boots"], job))
-    triage("run", job)
+    triage("run", job, "--reboot-on-hang")
     # Charge this advance to the triage clock. A crashing subset reboots the box
-    # mid-run and we never get here -- that lost interval is reboot overhead, and
-    # reconcile_gap picks it up on the next boot.
+    # mid-run and we never get here -- reconcile_triage_gap does it next boot.
     s["triage_seconds"] = s.get("triage_seconds", 0.0) + (time.time() - advance_started)
+    s["triage_advance_started"] = None
+    save_state(s)     # or a driver death here re-charges the advance next boot
 
     st = triage_state(job)
-    route_triage_panics(st, s.get("name"), s.get("current_config"))
+    route_triage_panics(s, st, job)
+    queue_second_bugs(s, st, job)
+    # A program hung, the executor holds the coverage device, and triage could
+    # not reboot the box. Nothing can run until someone does: fuzzing would die
+    # at startup and every further advance would fail the same way.
+    if st and st.get("needs_reboot"):
+        s["status"] = "halted"
+        s["halt_reason"] = ("triage job %s hung and the box must be rebooted, but it "
+                            "could not reboot itself: %s"
+                            % (job, st["needs_reboot"].get("why")))
+        save_state(s)
+        log("HALT: %s" % s["halt_reason"])
+        return
     stage = st.get("stage") if st else "?"
     if not st or stage not in ("DONE", "STUCK"):
-        log("triage %s at stage %s; will advance again" % (job, stage))
-        time.sleep(d["poll_seconds"])
+        pause = d.get("triage_retry_seconds", DEFAULTS["triage_retry_seconds"])
+        log("triage %s at stage %s; will advance again in %ds" % (job, stage, pause))
+        save_state(s)
+        paused = time.time()
+        wait_for_stop(s, d, pause)          # a halt or brake lands within seconds
+        s["triage_seconds"] = s.get("triage_seconds", 0.0) + (time.time() - paused)
         return
 
-    # STUCK is a result, not a failure: minimization proved that no subset
-    # reproduces alone, so the bug needs accumulated state. Bench the culprit's
-    # selectors anyway -- quarantine exists to keep fuzzing productive, and the
-    # smallest sequence seen to crash is still the best evidence we have -- but
-    # say plainly that it is unproven, and record it as unverified so the dossier
-    # never presents a lead as a reproducer.
+    # STUCK is a result, not a failure, and its kind says what there is to bench:
+    #   unverified  a subset crashed during the search but not again on its own.
+    #               Benched as an UNVERIFIED lead -- the smallest sequence seen to
+    #               crash is still the best evidence -- and recorded as unproven.
+    #   hang        the search kept hanging. The hung program is benched under its
+    #               own quarantine key (it is not the target crash), and the target
+    #               is exhausted: minimizing it again would hang the same way.
+    #   no-repro, ring-*  nothing smaller than the whole ring reproduced. Benching
+    #               "the whole program" would disable syscalls on no evidence, so
+    #               the signature is recorded as exhausted instead; handle_crash
+    #               counts its recurrences and benches a lead after the budget.
     verified = stage == "DONE"
-    # "Nothing reproduced, ever" is not a finding about the bug -- it means the
-    # search never reached the driver (see triage.py::stage_no_repro). Its culprit
-    # is the whole program by elimination, so benching from it would disable
-    # syscalls on the strength of a measurement that never happened. Record the
-    # signature instead so the same dead search is not run again: this bug was
-    # re-triaged three times in a row, 6,000 probes each, before that was noticed.
-    no_repro = (not verified) and st.get("stuck_kind") == "no-repro"
+    kind = None if verified else st.get("stuck_kind")
     sig = s.get("triage_bug_sig")
-    if no_repro:
-        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
-        log("  NOT benching: a search that never reproduced anything is evidence "
-            "about the environment, not about the bug")
+    cfg = s.get("current_config")
+    if not verified:
+        log("triage %s STUCK (%s): %s"
+            % (job, kind, st.get("stuck_reason", "no verified culprit")))
+    if kind in tri.NO_CULPRIT_KINDS or kind == "hang":
+        if kind == "hang":
+            bench_hang(s, job, cfg, st.get("hang_culprit"))
+        else:
+            log("  NOT benching: there is no culprit smaller than the whole ring")
         if sig and sig not in s.setdefault("exhausted_sigs", []):
             s["exhausted_sigs"].append(sig)
-            log("  %s recorded as exhausted; it will not be re-triaged until the "
-                "environment changes (fuzz-campaign.py forget-exhausted %s)"
-                % (sig, s["name"]))
-    elif not verified:
-        log("triage %s STUCK: %s" % (job, st.get("stuck_reason", "no verified culprit")))
-        log("  benching its selectors anyway so fuzzing can continue, but the "
-            "reproducer is UNVERIFIED -- it is a lead, not a proof")
-
-    culprit = st.get("final_culprit") or st.get("conn_culprit")
-    cfg = s.get("current_config")
-    if no_repro:
-        pass
-    elif culprit and Path(culprit).exists() and sig and cfg:
-        quarantine_apply_culprit(s, sig, cfg, culprit)
-        # Write the reproducer back into the bug inventory. The quarantine knows
-        # the culprit and triage holds the .syz, but the dossier -- the thing that
-        # becomes a vendor report -- knew neither, and reported method: None.
-        attribute_bug(sig, culprit, job, verified)
+        if sig:
+            s.setdefault("exhausted_why", {})[sig] = kind
+            log("  %s recorded as exhausted (%s): not re-triaged; after %d more "
+                "recurrences its newest ring program is benched as an UNVERIFIED "
+                "lead (fuzz-campaign.py forget-exhausted %s to retry)"
+                % (sig, kind, qm.DEFAULT_PARAMS["tolerate_budget"], s["name"]))
     else:
-        log("triage %s %s but missing culprit/sig/config; suppression skipped"
-            % (job, stage))
+        if not verified:
+            log("  benching its selectors anyway so fuzzing can continue, but the "
+                "reproducer is UNVERIFIED -- it is a lead, not a proof")
+        elif st.get("calls_reduced") is False:
+            log("  calls could not be reduced; the verified connection culprit is "
+                "the reproducer")
+        culprit = st.get("final_culprit") or st.get("conn_culprit")
+        if culprit and Path(culprit).exists() and sig and cfg:
+            quarantine_apply_culprit(s, sig, cfg, culprit)
+            # Write the reproducer back into the bug inventory. The quarantine knows
+            # the culprit and triage holds the .syz, but the dossier -- the thing
+            # that becomes a vendor report -- knew neither, and reported method: None.
+            attribute_bug(sig, culprit, job, verified)
+        else:
+            log("triage %s %s but missing culprit/sig/config; suppression skipped"
+                % (job, stage))
     # The quarantine owns the disable/rotate decision, but the campaign still
     # records which signatures it has spent a triage on -- that is what `status`
     # reports and what makes a re-triage of the same bug visible.
@@ -897,14 +1383,25 @@ def advance_triage(s, d):
     s["triage_job"] = None
     s["triage_bug_sig"] = None
     s["triage_boots"] = 0
+    # Every panic this job caused is filed. Without moving the watermark past
+    # them, the next fuzzing crash would fingerprint them all again -- and if its
+    # own report were unreadable, would take a triage panic's signature for it.
+    s["panic_sig_watermark"] = max(s.get("panic_sig_watermark", 0.0),
+                                   _newest_report_mtime())
+    (s.get("triage_seen") or {}).pop(job, None)
     save_state(s)
-    log("triage %s %s; bug %s benched (%s); resuming fuzzing"
+    log("triage %s %s; bug %s %s; resuming fuzzing"
         % (job, "COMPLETE" if verified else "STUCK", sig,
-           "verified reproducer" if verified else "UNVERIFIED lead"))
+           "benched (verified reproducer)" if verified
+           else "exhausted (%s)" % kind if sig in s.get("exhausted_sigs", [])
+           else "benched (UNVERIFIED lead)"))
+    # A second bug this job (or an earlier one) surfaced goes next, before fuzzing.
+    if start_queued_triage(s, d):
+        save_state(s)
 
 
 # --- the loop ----------------------------------------------------------------
-def ensure_running(s, cfg):
+def ensure_running(s, cfg, d=None):
     """Make sure a live session exists for cfg; resume if a record exists.
 
     Returns the inspect dict for the (now running) session. Resets the
@@ -920,17 +1417,53 @@ def ensure_running(s, cfg):
     # New run: exec_total resets to 0, so reset the coverage-stall rotation clock.
     s["q_last_cover"] = None
     s["q_cover_exec_mark"] = 0
-    # Baseline for this run: active_seconds is recomputed as base + elapsed, never
-    # incremented, so partial intervals count and nothing is double counted.
-    s["run_active_base"] = s.get("active_seconds", 0.0)
     sid = config_id(cfg)
     info = inspect(sid)
     if info.get("found") and info.get("status") == "running" and info.get("pid_alive"):
         log("session %s already running (pid %s); attaching supervisor"
             % (sid, info.get("pid")))
+        # Attaching continues the open run. Re-basing here used to re-add the
+        # run's elapsed time on every reattach. Only a run this state never
+        # opened (a manager that outlived its supervisor) is opened now, from
+        # the manager's own start.
+        if not s.get("run_prep_started"):
+            closed = s.get("run_closed") or {}
+            if (closed.get("end") and closed.get("started") is not None
+                    and closed["started"] == info.get("run_started_epoch")):
+                # This very run was already banked up to closed["end"]: continue
+                # it from there. account_run then counts only what came after.
+                s["run_prep_started"] = closed["end"]
+                s["run_prep_base"] = s.get("prep_seconds", 0.0)
+                s["run_active_base"] = s.get("active_seconds", 0.0)
+            else:
+                s["run_prep_started"] = info.get("run_started_epoch") or time.time()
+                s["run_prep_base"] = s.get("prep_seconds", 0.0)
+                s["run_active_base"] = s.get("run_active_base", s.get("active_seconds", 0.0))
     else:
+        # A run left open (rotation, halt) is closed before the next one opens.
+        if s.get("run_prep_started") and s.get("session_id") == sid and info.get("found"):
+            close_run(s, info, run_end_epoch(info))
+        # Open the run before anything slow: preparation starts here, with the
+        # snapshot and the results commit, not when the manager is launched.
+        s["run_prep_base"] = s.get("prep_seconds", 0.0)
+        s["run_active_base"] = s.get("active_seconds", 0.0)
+        s["run_prep_started"] = time.time()
+        # Name the session BEFORE starting it. It used to be saved only after
+        # `session start` returned, so a panic in between (grammar compile,
+        # corpus re-triage: the riskiest seconds of a run) left session_id None:
+        # the next boot reconciled nothing, and the --force start overwrote the
+        # ring buffer that held the crash.
+        s["session_id"] = sid
+        s["current_config"] = cfg
+        save_state(s)
         verb = "resume" if info.get("found") else "start"
         target = sid if verb == "resume" else cfg
+        # Before the manager starts: it re-triages corpus.db and silently drops
+        # every program that no longer reproduces, which is how a whole corpus
+        # was lost once. This commit is the copy that survives that.
+        first = not s.get("results_started")
+        results_commit(s, d, "start" if first else "restart", cfg=cfg)
+        s["results_started"] = True
         rc, _ = session(verb, target, "--force")
         if rc != 0:
             # fall back to a fresh start if resume failed (e.g. no record)
@@ -960,13 +1493,38 @@ def handle_crash(s, d, info):
     """
     panics = info.get("panics", [])
     log("crash: %d panic report(s); bug inventory -> %s" % (len(panics), BUGS_DIR))
+    # The incident record_incident just wrote for this crash: what is learned
+    # here (signature, kexts, bug ids, decision) is written onto it, so status
+    # and the state file say what each crash WAS, not only that it happened.
+    inc = s["incidents"][-1] if s.get("incidents") else {}
+    if inc.get("kind") != "crash":
+        inc = {}
+    bug_ids = []
     for pth in panics:
         # provenance: which run found it, so one deduped inventory can still be
         # sliced per campaign (bug_registry list --campaign <name>)
-        route_bug_registry(pth, s.get("name"), s.get("current_config"))
+        bug_ids += route_bug_registry(pth, s.get("name"), s.get("current_config")) or []
+    if bug_ids:
+        inc["bug_ids"] = list(dict.fromkeys(bug_ids))
     sig = latest_panic_signature(s)
     if not sig:
         log("crash: no readable panic signature; resuming without a decision")
+        inc["decision"] = "unreadable"
+        return False
+    last = s.get("last_panic") or {}
+    inc["signature"] = sig
+    if last.get("signature") == sig:
+        inc["title"] = last.get("title")
+        inc["crashing_kext"] = last.get("crashing_kext")
+        match = kext_matches(fuzzed_target(s.get("current_config")), last.get("crashing_kext"))
+        inc["kext_match"] = match
+        if match is False:
+            log("crash %s: the backtrace blames %s, not the fuzzed kext %s"
+                % (sig, last.get("crashing_kext"), inc.get("fuzzed_kext") or "?"))
+    if sig in (s.get("exhausted_sigs") or []):
+        exhausted_recurrence(s, sig, info)
+        inc["decision"] = "exhausted (%s)" % ((s.get("exhausted_why") or {}).get(sig)
+                                              or "no-repro")
         return False
     if sig in (s.get("exhausted_sigs") or []):
         log("crash %s: already exhausted a full minimization that reproduced "
@@ -974,33 +1532,100 @@ def handle_crash(s, d, info):
             "retry after fixing the environment)" % (sig, s["name"]))
         return False
     if quarantine_decide(s, sig) != "triage":
+        rec = (load_qstate(s["current_config"])["catalog"].get(sig) or {}
+               if s.get("current_config") else {})
+        inc["decision"] = rec.get("disposition") or "resume"
         return False
-    return begin_triage(s, d, sig)
+    started = begin_triage(s, d, sig)
+    inc["decision"] = "triage" if started else "triage failed"
+    if started:
+        inc["triage_job"] = s.get("triage_job")
+    return started
 
 
-def reconcile_gap(s, d):
-    """Charge the interval since the driver last saved to reboot overhead.
+def reconcile_gap(s, d, since=None, now=None):
+    """Charge the interval from `since` to now to reboot overhead.
 
-    The driver dies with the box, so the panic-to-login interval is invisible to
+    `since` is when the last accounted activity ended: the closed run's last
+    sign of life, or the last checkpoint when there is nothing better. The
+    driver dies with the box, so the panic-to-login interval is invisible to
     every other clock. Measuring it is the difference between "the campaign ran
-    2h" and "the campaign ran 2h and spent 40m rebooting to do it" -- and on a
-    target that panics every 40s, that gap is a real fraction of the run."""
-    prev = s.get("updated_at")
-    if not prev:
-        return
-    then = timefmt.to_epoch(prev)   # tolerates the legacy 'Z' form on disk
-    if then is None:
-        return
-    gap = time.time() - then
-    if gap <= 0:
+    2h" and "the campaign ran 2h and spent 40m rebooting to do it".
+
+    When a boot happened in between, [boot, now] is login to relaunch and gets
+    its own small cap (max_relaunch_seconds). The whole gap is capped at
+    max_boot_gap_seconds: anything longer is not overhead but the rig sitting
+    idle (or off) -- charging it would measure your schedule, not the campaign."""
+    now = time.time() if now is None else now
+    if since is None:
+        since = timefmt.to_epoch(s.get("updated_at"))   # tolerates legacy 'Z'
+    if since is None:
         return
     cap = d.get("max_boot_gap_seconds", DEFAULTS["max_boot_gap_seconds"])
+    relaunch_cap = d.get("max_relaunch_seconds", DEFAULTS["max_relaunch_seconds"])
+    boot = boot_epoch()
+    raw = max(0.0, now - since)
+    if boot and since < boot <= now:
+        gap = max(0.0, boot - since) + min(now - boot, relaunch_cap)
+    else:
+        gap = raw
     if gap > cap:
-        log("gap of %s since the last checkpoint exceeds the %s reboot cap; "
+        log("gap of %s since the last activity exceeds the %s reboot cap; "
             "counting the cap and treating the rest as idle"
-            % (fmt_hms(gap), fmt_hms(cap)))
+            % (fmt_hms(raw), fmt_hms(cap)))
         gap = cap
     s["overhead_seconds"] = s.get("overhead_seconds", 0.0) + gap
+
+
+def triage_probe_epoch(job, lo, hi):
+    """The last moment a triage job is known to have been probing, in [lo, hi].
+
+    syz-ring-repro fsyncs its checkpoint before and after every probe and stamps
+    the probe it is about to run, so the newest of those is within one probe of
+    the panic that killed it."""
+    st = triage_state(job) if job else None
+    if not st or not st.get("dir"):
+        return None
+    best = None
+    # The ring replay rewrites its checkpoint before every slot, like a probe.
+    for name in ("conn_state.json", "call_state.json", "replay_state.json"):
+        p = Path(st["dir"]) / name
+        cands = []
+        try:
+            cands.append(p.stat().st_mtime)
+        except OSError:
+            continue
+        ck = read_json(p) or {}
+        cands += [ck.get(k) for k in ("attempting_at", "verifying_at", "hanging_at",
+                                      "pending_at")]
+        for t in cands:
+            if t and lo <= t <= hi and (best is None or t > best):
+                best = t
+    return best
+
+
+def reconcile_triage_gap(s, d, last_save, now=None):
+    """Account a triage advance the panic cut short.
+
+    A probe that reproduces panics the box and kills the advance before it can
+    charge itself. Up to that probe the box was minimizing; after it, rebooting.
+    This used to charge all of it as reboot overhead, capped at 15 minutes, so a
+    long minimization boot both vanished from the minimizing clock and was
+    labelled as rebooting."""
+    now = time.time() if now is None else now
+    started = s.get("triage_advance_started")
+    s["triage_advance_started"] = None
+    if not started:
+        reconcile_gap(s, d, since=last_save, now=now)
+        return
+    boot = boot_epoch()
+    if not (boot and started < boot <= now):
+        # The driver died without a reboot: no panic to split at.
+        reconcile_gap(s, d, since=started, now=now)
+        return
+    crash = triage_probe_epoch(s.get("triage_job"), started, boot) or started
+    s["triage_seconds"] = s.get("triage_seconds", 0.0) + (crash - started)
+    reconcile_gap(s, d, since=crash, now=now)
 
 
 def reconcile_boot(s, d):
@@ -1010,24 +1635,122 @@ def reconcile_boot(s, d):
     incident we owe a bundle. panic_evidence tells crash from hang: a real panic
     leaves a *.kernel.core.log/*.panic; a wedge that took the box down without
     one is treated as a hang. Idempotent -- a collected run has uncollected=None.
+
+    Returns when the run it closed ended (for reconcile_gap), RUN_ALIVE if the
+    session survived the driver, or None when there was no open run.
     """
     sid = s.get("session_id")
     if not sid:
-        return
+        return None
     info = inspect(sid)
     if not info.get("found"):
-        return
+        return None
     if info.get("status") == "running" and info.get("pid_alive"):
-        return                       # survived; supervisor will re-attach
+        return RUN_ALIVE             # survived; supervisor will re-attach
+    end = run_end_epoch(info) if s.get("run_prep_started") else None
+    if end is not None:
+        # The record can be the previous run's: the session is named before its
+        # manager starts, and the box may have gone down in between.
+        end = max(end, s["run_prep_started"])
     if not info.get("uncollected"):
-        return                       # already collected, nothing owed
+        if end is not None:
+            close_run(s, info, end)  # already collected; just stop its clocks
+        return end
+    if info.get("status") == "stopped" and not info.get("panic_evidence"):
+        # Stopped on purpose (halt, stop, rotation) and never collected: not an
+        # incident. Filing it as a hang is how a halt-then-resume used to add a
+        # phantom hang to the campaign. Snapshot it so its ring is kept and the
+        # record reads collected.
+        log("boot reconcile: %s was stopped deliberately, not lost; snapshot only" % sid)
+        if end is not None:
+            close_run(s, info, end)
+        session("collect", sid, "snapshot")
+        save_state(s)
+        return end
     kind = "crash" if info.get("panic_evidence") else "hang"
     log("boot reconcile: %s ended uncollected -> %s" % (sid, kind))
-    record_incident(s, d, kind, info)
+    record_incident(s, d, kind, info, end)
     collect_and_prune(s, d, kind)
     if kind == "crash":
         handle_crash(s, d, info)   # may flip phase to triaging; the loop honours it
     save_state(s)
+    return end
+
+
+def _etime_seconds(text):
+    """ps ELAPSED ([[dd-]hh:]mm:ss) -> seconds."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        d_, text = text.split("-", 1)
+        try:
+            days = int(d_)
+        except ValueError:
+            return None
+    parts = text.split(":")
+    try:
+        parts = [int(x) for x in parts]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def stuck_executor_seconds(d):
+    """Age of the longest-running `syz-executor exec`, if it exceeds the limit.
+
+    syz-executor forks one short-lived `exec` process per program, so a normal one
+    lives milliseconds. One alive for minutes means a syscall that never returned:
+    the box is wedged, whatever the manager's counters say.
+    """
+    limit = d.get("exec_stuck_seconds", DEFAULTS["exec_stuck_seconds"])
+    if not limit:
+        return None
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "etime,command"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    worst = 0
+    for line in (out or "").splitlines()[1:]:
+        line = line.strip()
+        if "syz-executor exec" not in line:
+            continue
+        secs = _etime_seconds(line.split(None, 1)[0])
+        if secs and secs > worst:
+            worst = secs
+    return worst if worst >= limit else None
+
+
+def wait_for_stop(s, d, seconds):
+    """Sleep up to `seconds`, returning early if a stop is requested.
+
+    Returns "halted", "brake", or None if the full interval elapsed quietly.
+    The brake is checked here as well as at startup: it is the stop you reach
+    for when the box is misbehaving, and having to wait out a poll interval for
+    it defeats the purpose.
+    """
+    step = d.get("stop_check_seconds", DEFAULTS["stop_check_seconds"])
+    deadline = time.time() + seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        time.sleep(min(step, remaining))
+        if load_state(s["name"]).get("status") == "halted":
+            return "halted"
+        held = brake_held(s["name"])
+        if held:
+            path, why = held
+            log("BRAKE while running: %s%s" % (path, " -- %s" % why if why else ""))
+            s["status"] = "halted"
+            s["halt_reason"] = "brake: %s" % (why or path)
+            save_state(s)
+            return "brake"
 
 
 def _etime_seconds(text):
@@ -1114,6 +1837,7 @@ def supervise(s, d, sid, budget):
     """
     poll = d["poll_seconds"]
     hang_after = d["hang_after_seconds"]
+    fuzzing = False
     last_et = s.get("last_exec_total")
     last_progress = time.time()
     while True:
@@ -1124,9 +1848,21 @@ def supervise(s, d, sid, budget):
         # in one go coupled them, so `halt` took up to ten minutes to be seen --
         # long enough to feel broken and to invite killing the driver instead,
         # which is how a half-stopped campaign gets left behind.
-        stop = wait_for_stop(s, d, poll)
+        #
+        # Never sleep past the budget either. The polls are phased from when
+        # supervision started, not from the deadline, so a check that lands just
+        # short of it used to buy a whole extra poll: a 1h campaign checked at
+        # 59m06s and ran to 1h09m.
+        # Until the first exec, a manager that dies is a startup failure, and
+        # it should be noticed in seconds, not at the next 10-minute poll.
+        step = poll if fuzzing else min(poll, d.get("startup_poll_seconds",
+                                                    DEFAULTS["startup_poll_seconds"]))
+        stop = wait_for_stop(s, d, min(step, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
-            log("campaign halted by user")
+            s["halt_reason"] = s.get("halt_reason") or "halted by user"
+            session("stop", sid)
+            return "halted"
+        if stop == "brake":
             session("stop", sid)
             return "halted"
         if stop == "brake":
@@ -1138,12 +1874,13 @@ def supervise(s, d, sid, budget):
         info = inspect(sid)
         now = time.time()
         if not info.get("found") or not info.get("pid_alive"):
-            return "crash" if info.get("panic_evidence") else "hang"
-        started = info.get("run_started_epoch")
-        if started:
-            s["active_seconds"] = s.get("run_active_base", 0.0) + max(0.0, now - started)
-        else:                                   # no run start on record; fall back
-            s["active_seconds"] += poll
+            if info.get("panic_evidence"):
+                return "crash"
+            return "hang" if info.get("fuzz_started_epoch") else "startup"
+        if info.get("fuzz_started_epoch") and not fuzzing:
+            fuzzing = True
+            s["startup_failures"] = 0
+        account_run(s, info, now)
         et = info.get("exec_total")
         if et is not None and et != last_et:
             last_et = et
@@ -1176,14 +1913,19 @@ def supervise(s, d, sid, budget):
         # handles by re-applying the config and resuming the same config.
         if quarantine_rotate_due(s):
             return "rotate"
+        # Commits only when the corpus or coverage moved (fuzz-results decides).
+        results_commit(s, d, "corpus", detach=True)
         if budget_spent(s, d) >= budget:
             return "budget"
-        # breaker can trip mid-run (disk), so re-check each poll
+        # breaker can trip mid-run (disk), so re-check each poll. Stop the manager
+        # like the other halt paths: left running, it fuzzed on unsupervised and
+        # held /dev/pishi, and a later resume re-attached to a run already closed.
         reason = breaker(s, d)
         if reason:
             s["status"] = "halted"
             s["halt_reason"] = reason
             save_state(s)
+            session("stop", sid)
             return "halted"
         save_state(s)
 
@@ -1222,7 +1964,7 @@ def cmd_run(name):
             "in %s)" % (d["max_log_mb"], coord_path))
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
-        s.setdefault(k, v)
+        s.setdefault(k, type(v)(v) if isinstance(v, (list, dict)) else v)   # never share a default
     if s["status"] in ("done", "halted"):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
@@ -1239,13 +1981,17 @@ def cmd_run(name):
     # reading when the box starts misbehaving -- not only in the setup doc.
     log("  brake (stop)  : touch %s" % GLOBAL_BRAKE)
     # Whatever killed the last driver -- a panic-reboot mid-fuzz or mid-triage --
-    # the interval since its last checkpoint is overhead this campaign paid.
-    # Charged before any phase branching, because both phases lose the box.
-    reconcile_gap(s, d)
-    # In triaging phase there is no fuzzing session to reconcile; the box is
-    # (or was) running triage, resumed by the phase branch below.
-    if s["phase"] != "triaging":
-        reconcile_boot(s, d)
+    # the time since the last thing we accounted is split between the phase that
+    # was running and the reboot. Read the checkpoint before anything saves.
+    last_save = timefmt.to_epoch(s.get("updated_at"))
+    if s["phase"] == "triaging":
+        # No fuzzing session to reconcile; the box is (or was) running triage,
+        # resumed by the phase branch below.
+        reconcile_triage_gap(s, d, last_save)
+    else:
+        end = reconcile_boot(s, d)
+        if end != RUN_ALIVE:          # a live manager was fuzzing all along
+            reconcile_gap(s, d, since=end if end is not None else last_save)
 
     while True:
         # `fuzz-campaign.py halt` writes the status into the state FILE. Only
@@ -1276,14 +2022,13 @@ def cmd_run(name):
             # wall budget without ever noticing. Check before spending another
             # boot on triage. Only the wall clock can expire here; a fuzz-clock
             # budget deliberately does not charge triage at all.
+            # A job is not abandoned half-way when the budget runs out: it is
+            # finished (still bounded by triage_max_boots), its result benched,
+            # and the config advanced after -- see the budget check below.
             item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
             if budget_spent(s, d) >= item["budget_seconds"]:
-                log("budget spent (%s clock) while triaging %s; stopping the "
-                    "campaign with the triage job left resumable"
-                    % (d.get("budget_clock"), s.get("triage_job")))
-                s["status"] = "done"
-                save_state(s)
-                return
+                log("budget spent (%s clock) while triaging %s; finishing the job, "
+                    "then moving on" % (d.get("budget_clock"), s.get("triage_job")))
             advance_triage(s, d)
             if s["status"] == "halted":
                 return
@@ -1293,17 +2038,42 @@ def cmd_run(name):
                 log("loop: wrapping cursor to 0")
                 s["cursor"] = 0
                 roll_budget_clocks(s)
+                reset_config_counters(s)
             else:
                 s["status"] = "done"
                 save_state(s)
-                log("campaign %r done: fuzz %s, triage %s, reboots %s, wall %s"
-                    % (name, fmt_hms(lifetime(s, "active_seconds")),
+                log("campaign %r done: prep %s, fuzz %s, triage %s, reboots %s, wall %s"
+                    % (name, fmt_hms(lifetime(s, "prep_seconds")),
+                       fmt_hms(lifetime(s, "active_seconds")),
                        fmt_hms(lifetime(s, "triage_seconds")),
                        fmt_hms(lifetime(s, "overhead_seconds")),
                        fmt_hms(lifetime_wall(s))))
                 return
         item = d["items"][s["cursor"]]
         cfg, budget = item["config"], item["budget_seconds"]
+        # A config max_crashes gave up on stays given up for this campaign: a
+        # looping campaign skips it, and one with nothing left to run halts.
+        gone = {a["config"] for a in s.get("abandoned", [])}
+        if cfg in gone:
+            if all(it["config"] in gone for it in d["items"]):
+                s["status"] = "halted"
+                s["halt_reason"] = "every config was abandoned (max_crashes)"
+                save_state(s)
+                log("HALT: %s" % s["halt_reason"])
+                return
+            log("skipping %s: abandoned earlier" % config_id(cfg))
+            advance_config(s)
+            save_state(s)
+            continue
+        why = config_breaker(s, d)
+        if why:
+            log("ABANDON %s: %s; moving to the next config" % (config_id(cfg), why))
+            s.setdefault("abandoned", []).append(
+                {"config": cfg, "reason": why, "at": now_iso()})
+            results_commit(s, d, "end", cfg=cfg)
+            advance_config(s)
+            save_state(s)
+            continue
         # Stamp the real clock's origin once per config. Guarded on absence, not
         # overwritten: every panic-reboot relaunches this loop, and re-stamping
         # would restart the window on each crash.
@@ -1311,14 +2081,23 @@ def cmd_run(name):
             s["config_started_at"] = now_iso()
             save_state(s)
         remaining = budget - budget_spent(s, d)
-        log("config %d/%d: %s (%.0f min left of %.1fh %s budget; "
-            "fuzz %s, triage %s, reboots %s)"
+        if remaining <= 0:
+            # Spent while triaging (the only phase that can overrun it). The
+            # manager was stopped at the crash; starting it again only to stop it
+            # at the first budget check would cost a whole preparation.
+            log("budget spent on %s (during triage); advancing" % config_id(cfg))
+            results_commit(s, d, "end", cfg=cfg)
+            advance_config(s)
+            save_state(s)
+            continue
+        log("config %d/%d: %s (%.0f min left of %.1fh %s budget; this config so "
+            "far: prep %s, fuzz %s, triage %s, reboots %s)"
             % (s["cursor"] + 1, len(d["items"]), config_id(cfg),
-               remaining / 60, budget / 3600, d.get("budget_clock", "fuzz"),
-               fmt_hms(s.get("active_seconds")), fmt_hms(s.get("triage_seconds")),
-               fmt_hms(s.get("overhead_seconds"))))
+               remaining / 60, budget / 3600, d.get("budget_clock", "wall"),
+               fmt_hms(s.get("prep_seconds")), fmt_hms(s.get("active_seconds")),
+               fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
         try:
-            ensure_running(s, cfg)
+            ensure_running(s, cfg, d)
         except RuntimeError as e:
             s["status"] = "halted"
             s["halt_reason"] = str(e)
@@ -1329,33 +2108,63 @@ def cmd_run(name):
         outcome = supervise(s, d, s["session_id"], budget)
 
         if outcome == "halted":
-            log("HALT: %s" % s.get("halt_reason"))
+            close_run(s, inspect(s["session_id"]), time.time())
+            s["halt_reason"] = s.get("halt_reason") or "halted by user"
+            save_state(s)
+            log("HALT: %s" % s["halt_reason"])
+            results_commit(s, d, "halt", cfg=cfg)
             return
         if outcome == "budget":
+            close_run(s, inspect(s["session_id"]), time.time())
             log("budget spent on %s; snapshot + advance" % config_id(cfg))
             session("collect", s["session_id"], "snapshot")
             session("stop", s["session_id"])
-            s["cursor"] += 1
-            roll_budget_clocks(s)
-            s["session_id"] = None
-            s["last_exec_total"] = None
+            results_commit(s, d, "end", cfg=cfg)
+            advance_config(s)
             save_state(s)
             continue
+        if outcome == "startup":
+            info = inspect(s["session_id"])
+            end = run_end_epoch(info)
+            started = info.get("run_started_epoch")
+            close_run(s, info, end)
+            s["startup_failures"] = s.get("startup_failures", 0) + 1
+            why = run_log_tail(info)
+            s["last_startup_error"] = why
+            s["incidents"].append({
+                "config": cfg, "kind": "startup", "at": now_iso(),
+                "ran_seconds": round(end - started) if started else None,
+                "exec_total": None, "panic_evidence": False, "log_tail": why})
+            limit = d.get("startup_fail_limit", DEFAULTS["startup_fail_limit"])
+            log("startup failure %d/%d on %s: syz-manager died before executing "
+                "anything -- %s" % (s["startup_failures"], limit, config_id(cfg),
+                                    why or "(empty run log)"))
+            session("collect", s["session_id"], "startup")
+            save_state(s)
+            if s["startup_failures"] < limit:
+                wait_for_stop(s, d, d.get("startup_retry_seconds",
+                                          DEFAULTS["startup_retry_seconds"]))
+            continue                     # the breaker halts at the limit
         if outcome == "rotate":
             # A SOFT group rotated: stop and resume the SAME config (budget kept);
             # ensure_running re-applies the now-rotated disabled set on resume.
             log("SOFT rotation due on %s; restarting to apply" % config_id(cfg))
-            if inspect(s["session_id"]).get("pid_alive"):
+            info = inspect(s["session_id"])
+            close_run(s, info, time.time() if info.get("pid_alive") else run_end_epoch(info))
+            if info.get("pid_alive"):
                 session("stop", s["session_id"])
             s["session_id"] = None
             save_state(s)
             continue
-        # crash or hang: stop if still alive, record, collect.
+        # crash or hang: stop if still alive, record, collect. A manager we stop
+        # ran until now; a dead one ended at its last sign of life, not at the
+        # poll that noticed (up to poll_seconds later).
         info = inspect(s["session_id"])
+        end = time.time() if info.get("pid_alive") else run_end_epoch(info)
         if info.get("pid_alive"):
             session("stop", s["session_id"])
             info = inspect(s["session_id"])
-        record_incident(s, d, outcome, info)
+        record_incident(s, d, outcome, info, end)
         collect_and_prune(s, d, outcome)
         # Coordinator: the quarantine SUSPECT gate decides whether a crash earns a
         # triage. A NEW signature becomes SUSPECT and just resumes (enabled); a
@@ -1551,9 +2360,11 @@ def status_lines(name, prev=None):
     if cfg:
         item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
         row("current", config_id(cfg))
-        row("budget", "%.2f / %.2f h used (%s clock)"
+        row("budget", "%.2f / %.2f h used (%s clock, this config)"
             % (budget_spent(s, d) / 3600, item["budget_seconds"] / 3600,
-               d.get("budget_clock", "fuzz")))
+               d.get("budget_clock", "wall")))
+        if s.get("config_started_at"):
+            row("config start", timefmt.fmt(s["config_started_at"]))
         # A config is a workdir. Say plainly whether this run inherited a corpus.
         cf_facts = corpus_facts(cfg)
         if cf_facts:
@@ -1564,19 +2375,22 @@ def status_lines(name, prev=None):
         else:
             row("corpus", "none yet -- this config starts from scratch")
 
-    # Three clocks, campaign-lifetime (never reset by a config advance). Reported
+    # Four clocks, campaign-lifetime (never reset by a config advance). Reported
     # separately because "24h of fuzzing" and "24h of campaign" are different
     # claims, and a writeup that conflates them overstates the fuzzing.
-    # Honest label. This counter is session-alive wall time, NOT time spent
-    # executing programs: it includes manager startup, corpus triage, RPC waits
-    # and the manager's own minimization. On a measured 24h run it overstated
-    # actual fuzzing by 77% (18.9h alive vs 10.7h executing). syz-manager keeps
-    # the real figure in its bench series; `runstats.py show` reports it.
-    row("session up", fmt_hms(lifetime(s, "active_seconds")),
-        "  (manager alive -- NOT time executing; see runstats.py show)")
-    row("minimizing", fmt_hms(lifetime(s, "triage_seconds")), "  (triage)")
-    row("rebooting", fmt_hms(lifetime(s, "overhead_seconds")), "  (panic -> back up)")
-    row("wall", fmt_hms(lifetime_wall(s)), "  (sum of the three)")
+    # "fuzzing" starts at the run's first executed program, so the startup
+    # (snapshot, grammar compile, executor handshake) is its own line. It still
+    # includes the manager re-triaging its corpus and waiting on RPC; for pure
+    # execution time `runstats.py show` reads syz-manager's own counter.
+    out.append("  time, whole campaign:")
+    row("  preparing", fmt_hms(lifetime(s, "prep_seconds")),
+        "  (snapshot, grammar compile, until the first exec)")
+    row("  fuzzing", fmt_hms(lifetime(s, "active_seconds")),
+        "  (first exec -> end of run; see runstats.py for execution time)")
+    row("  minimizing", fmt_hms(lifetime(s, "triage_seconds")), "  (triage)")
+    row("  rebooting", fmt_hms(lifetime(s, "overhead_seconds")),
+        "  (panic -> back up, and dead time)")
+    row("  wall", fmt_hms(lifetime_wall(s)), "  (sum of the four)")
 
     # What the box actually did, not just how long it was up: on this target a
     # campaign can burn an hour of wall clock and execute very little.
@@ -1598,17 +2412,34 @@ def status_lines(name, prev=None):
         _delta(execs, prev.get("execs"), "%+,d".replace(",", "")))
     if cov not in (None, ""):
         row("coverage", "%s basic block(s)" % cov, _delta(_int(cov), prev.get("cov")))
-    row("incidents", "%d crash / %d hang" % (s["crashes"], s["hangs"]),
+    row("incidents", "%d crash / %d hang  (this config: %d of max_crashes %d)"
+        % (s["crashes"], s["hangs"], s.get("config_incidents", 0), d["max_crashes"]),
         _delta(s["crashes"], prev.get("crashes")))
+    if s.get("startup_failures"):
+        row("startup", "%d failed start(s) in a row (halts at %d): %s"
+            % (s["startup_failures"], d.get("startup_fail_limit",
+                                            DEFAULTS["startup_fail_limit"]),
+               s.get("last_startup_error") or "?"))
+    for a in s.get("abandoned", []):
+        row("abandoned", "%s  (%s, %s)" % (config_id(a["config"]), a.get("reason"),
+                                           timefmt.fmt(a.get("at"), short=True)))
     row("phase", s.get("phase", "fuzzing"))
     if s.get("phase") == "triaging":
         row("triaging", "job %s, bug %s (advance %d/%d)"
             % (s.get("triage_job"), s.get("triage_bug_sig"),
                s.get("triage_boots", 0), d["triage_max_boots"]))
+        tst = triage_state(s.get("triage_job")) if s.get("triage_job") else None
+        if tst:
+            row("  progress", tri.progress_line(tri.progress(tst)))
+    if s.get("triage_queue"):
+        row("triage queue", "%d second bug(s) waiting: %s"
+            % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
     if s.get("exhausted_sigs"):
-        row("exhausted", "%d sig(s) reproduced NOTHING under minimization -- "
-            "environment, not bug (%s)"
-            % (len(s["exhausted_sigs"]), ", ".join(s["exhausted_sigs"][-3:])))
+        why = s.get("exhausted_why") or {}
+        row("exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
+            % (len(s["exhausted_sigs"]),
+               ", ".join("%s %s" % (g, why.get(g, "no-repro"))
+                         for g in s["exhausted_sigs"][-3:])))
     if s.get("suppressed_sigs"):
         row("benched sigs", "%d (%s)"
             % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
@@ -1616,13 +2447,34 @@ def status_lines(name, prev=None):
     row("updated", timefmt.fmt(s.get("updated_at")))
     row("started", timefmt.fmt(s.get("started_at")))
     for inc in s["incidents"][-5:]:
-        out.append("    - %s  %-6s %s  (ran %ss, panic=%s)"
-                   % (timefmt.fmt(inc["at"]), inc["kind"], config_id(inc["config"]),
-                      inc.get("ran_seconds"), inc.get("panic_evidence")))
+        out.append("    - " + incident_line(inc))
 
     sample = {"execs": execs, "cov": _int(cov), "crashes": s["crashes"],
               "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
     return out, sample
+
+
+def incident_line(inc):
+    """One incident for status: when, what, where, and what it turned out to be."""
+    line = "%s  %-7s %s  ran %ss" % (timefmt.fmt(inc["at"]), inc["kind"],
+                                     config_id(inc["config"]), inc.get("ran_seconds"))
+    if inc.get("signature"):
+        line += "  sig %s" % inc["signature"]
+    if inc.get("bug_ids"):
+        line += " %s" % ",".join(inc["bug_ids"])
+    if inc.get("crashing_kext"):
+        line += "  in %s" % inc["crashing_kext"]
+        if inc.get("kext_match") is False:
+            line += " (NOT the fuzzed %s)" % (inc.get("fuzzed_kext") or "kext")
+    if inc.get("decision"):
+        line += "  -> %s" % inc["decision"]
+        if inc.get("triage_job"):
+            line += " %s" % inc["triage_job"]
+    elif inc["kind"] == "crash" and not inc.get("panic_evidence"):
+        line += "  (no panic report)"
+    if inc.get("log_tail"):
+        line += "  -- %s" % inc["log_tail"][:80]
+    return line
 
 
 def _int(v):
@@ -1911,6 +2763,16 @@ def cmd_doctor(name):
         if _exists(ap):
             add("INFO", "launchd agent INSTALLED for %s (%s)" % (u, ap))
 
+    # A probe that hangs leaves an executor holding /dev/pishi until a reboot;
+    # triage reboots by itself only if sudo lets this user run shutdown.
+    if can_reboot():
+        add("OK", "triage can reboot after a hang (sudo -n %s)" % " ".join(tri.REBOOT_CMD[2:]))
+    else:
+        add("WARN", "%s cannot run `%s` without a password: a hang during triage will "
+                    "halt the campaign until someone reboots. Add to /etc/sudoers.d/fuzz: "
+                    "`%s ALL=(root) NOPASSWD: /sbin/shutdown -r now`"
+            % (me, " ".join(tri.REBOOT_CMD[2:]), me))
+
     fails = sum(1 for lvl, _ in checks if lvl == "FAIL")
     warns = sum(1 for lvl, _ in checks if lvl == "WARN")
     print("doctor: campaign %s" % name)
@@ -1925,6 +2787,16 @@ def cmd_doctor(name):
     else:
         print("-> looks good")
     return 1 if fails else 0
+
+
+def can_reboot():
+    """True when sudo lets this user run triage's reboot command, no password."""
+    try:
+        return subprocess.run(["/usr/bin/sudo", "-n", "-l"] + tri.REBOOT_CMD[2:],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def cmd_list():
@@ -1949,12 +2821,15 @@ def cmd_list():
     tabulate(rows, ("CAMPAIGN", "STATUS", "CONFIG", "CRASH/HANG", "FUZZED", "WALL"))
 
 
-def _set_status(name, status):
+def _set_status(name, status, reason=None):
     s = load_state(name)
     s["status"] = status
+    if reason:
+        s["halt_reason"] = reason
     if status == "running":
         s["halt_reason"] = None
         s["consec_fast_crashes"] = 0
+        s["startup_failures"] = 0
     save_state(s)
     log("campaign %r -> %s" % (name, status))
 
@@ -1963,7 +2838,7 @@ def cmd_halt(name):
     s = load_state(name)
     if s.get("session_id"):
         session("stop", s["session_id"])
-    _set_status(name, "halted")
+    _set_status(name, "halted", reason="halted by user")
 
 
 def cmd_resume(name):
@@ -2341,6 +3216,23 @@ def _signal(pid, sig, what):
         return False
 
 
+def agent_domains(name):
+    """launchd domains this campaign's agent may be loaded in: gui/<uid> of each
+    user with its plist in ~/Library/LaunchAgents, and of the state file's
+    owner (install chowns it to the agent user)."""
+    label = plist_label(name)
+    uids = []
+    try:
+        uids.append(state_path(name).stat().st_uid)
+    except OSError:
+        pass
+    for pw in pwd.getpwall():
+        if pw.pw_uid >= 500 and _exists(
+                Path(pw.pw_dir) / "Library" / "LaunchAgents" / ("%s.plist" % label)):
+            uids.append(pw.pw_uid)
+    return ["gui/%d" % u for u in dict.fromkeys(uids) if u != 0]
+
+
 def cmd_stop(name, grace=30, keep_agent=False):
     """End a campaign's fuzzing for good, whether or not a supervisor is alive.
 
@@ -2360,7 +3252,7 @@ def cmd_stop(name, grace=30, keep_agent=False):
     # 1. Nothing may bring it back while we work.
     if not keep_agent:
         label = plist_label(name)
-        for dom in ("gui/502", "system"):
+        for dom in agent_domains(name) + ["system"]:
             subprocess.run(["launchctl", "bootout", "%s/%s" % (dom, label)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log("  launchd job %s booted out (if it was loaded)" % label)
@@ -2721,7 +3613,8 @@ def route_bug_registry(panic_path, campaign=None, config=None, origin="fuzz"):
     """Best-effort: catalog a panic in the bug registry (the reportable inventory
     that end-of-campaign replay iterates). Tolerated crashes are catalogued too."""
     if not BUG_REGISTRY.exists():
-        return
+        return []
+    ids = []
     try:
         BUGS_DIR.mkdir(parents=True, exist_ok=True)
         p = subprocess.run(
@@ -2733,15 +3626,17 @@ def route_bug_registry(panic_path, campaign=None, config=None, origin="fuzz"):
         if p.returncode != 0:
             log("bug_registry route rc=%d for %s: %s"
                 % (p.returncode, Path(panic_path).name, (p.stdout or "").strip()))
-            return
+            return ids
         # Echo the routing decision (NEW BUG / new crash / dup + the bug id and
         # key). Silently succeeding here is what made the bug inventory feel like
         # it was not being written at all.
         for line in (p.stdout or "").splitlines():
             if line.strip():
                 log("bug_registry: %s  <- %s" % (line.strip(), Path(panic_path).name))
+                ids += re.findall(r"\bBUG-\d+\b", line)
     except Exception as e:  # noqa: BLE001 - cataloguing must never stall the campaign
         log("bug_registry route failed for %s: %s" % (panic_path, e))
+    return ids
 
 
 def cmd_replay(name, as_json=False):
@@ -2882,10 +3777,11 @@ def cmd_include(name, syscalls, config=None, all_=False, dry_run=False):
 def cmd_forget_exhausted(name, sig=None):
     """Clear signatures recorded as exhausted so they can be triaged again.
 
-    A signature lands there when a full minimization reproduced NOTHING, which
-    means the search could not reach the driver. Once the environment is fixed
-    (the usual cause is a missing executor_name), the bug is worth another pass --
-    but only then, which is why this is a deliberate command and not automatic.
+    A signature lands there when minimization found nothing smaller than the
+    whole ring to blame: nothing reproduced at all (often the environment -- a
+    missing executor_name), only the unmerged ring did, or the search kept
+    hanging. Once the cause is fixed, the bug is worth another pass -- but only
+    then, which is why this is a deliberate command and not automatic.
     """
     s = load_state(name)
     if not s:
@@ -2899,10 +3795,12 @@ def cmd_forget_exhausted(name, sig=None):
             die("%s is not recorded as exhausted for %s (have: %s)"
                 % (sig, name, ", ".join(have)))
         have.remove(sig)
+        (s.get("exhausted_why") or {}).pop(sig, None)
         print("forgot %s; it will be triaged again on its next crash" % sig)
     else:
         print("forgot %d signature(s): %s" % (len(have), ", ".join(have)))
         have = []
+        s["exhausted_why"] = {}
     s["exhausted_sigs"] = have
     save_state(s)
     return 0
@@ -2975,16 +3873,17 @@ def main():
     sp.add_argument("--crashloop-limit", type=int,
                     help="consecutive fast crashes before halting (default %d)"
                          % DEFAULTS["crashloop_limit"])
-    sp.add_argument("--crashloop-window-seconds", type=int,
-                    help="a run shorter than this counts as a fast crash (default %d)"
-                         % DEFAULTS["crashloop_window_seconds"])
+    sp.add_argument("--crashloop-min-execs", type=int,
+                    help="a crash before this many programs executed counts as "
+                         "fast (default %d)" % DEFAULTS["crashloop_min_execs"])
     sp.add_argument("--triage-max-boots", type=int,
                     help="advances before giving up on a triage (default %d)"
                          % DEFAULTS["triage_max_boots"])
     sp.add_argument("--budget-clock", choices=BUDGET_CLOCKS,
-                    help="what --budget-hours measures: 'fuzz' charges session "
-                         "uptime (NOT time executing programs -- expect ~55-60%%%% "
-                         "of it), 'wall' also charges minimization and reboots, "
+                    help="what --budget-hours measures: 'fuzz' charges time from "
+                         "each run's first executed program (startup excluded; "
+                         "still not pure execution time), 'wall' also charges "
+                         "startup, minimization and reboots, "
                          "'real' is elapsed time since the config started and "
                          "keeps running through halts, reboots and downtime -- "
                          "the one that means 'stop 2h from now' "
@@ -3077,7 +3976,7 @@ def main():
                  "kcov_device": args.kcov_device, "kext_id": args.kext_id,
                  "sandbox": args.sandbox, "max_k": args.max_k},
                 {"crashloop_limit": args.crashloop_limit,
-                 "crashloop_window_seconds": args.crashloop_window_seconds,
+                 "crashloop_min_execs": args.crashloop_min_execs,
                  "triage_max_boots": args.triage_max_boots,
                  "budget_clock": args.budget_clock})
     elif args.cmd == "stop":

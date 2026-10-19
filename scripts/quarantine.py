@@ -44,8 +44,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cfgutil  # noqa: E402
-import timefmt  # noqa: E402
+from lib import cfgutil  # noqa: E402
+from lib import timefmt  # noqa: E402
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -263,6 +263,66 @@ def on_crash(state, sig, seq=None, now=None):
         decision = "confirmed"
 
     return {"decision": decision, "category": rec["category"],
+            "disposition": rec["disposition"], "disabled": disabled_set(state)}
+
+
+def count_exhausted(state, sig, now=None):
+    """Count a recurrence of a signature whose minimization produced nothing to
+    bench (no reproduction, or only the whole ring).
+
+    on_crash cannot take it: past `confirm` a seq-less SUSPECT would be classified
+    from an empty sequence. Counted on the record like any occurrence, plus
+    exhausted_count, the recurrences since its last lead was benched -- the
+    coordinator benches one once that reaches tolerate_budget (lead_due).
+    """
+    now = now or now_iso()
+    rec = state["catalog"].get(sig)
+    if rec is None:
+        on_crash(state, sig, None, now)
+        rec = state["catalog"][sig]
+    else:
+        rec["occurrence_count"] += 1
+        rec["last_seen"] = now
+    rec["exhausted_count"] = rec.get("exhausted_count", 0) + 1
+    return rec["exhausted_count"]
+
+
+def lead_due(state, count):
+    """True when an exhausted signature has recurred often enough to bench a lead."""
+    return count >= _p(state, "tolerate_budget")
+
+
+def bench_lead(state, sig, seq, source, now=None):
+    """Bench an UNVERIFIED lead: selectors that were never shown to reproduce sig.
+
+    Used where minimization could not produce a culprit (the program running when
+    an exhausted signature recurred) or produced something other than the target
+    crash (a program that kept hanging). One selector is disabled outright; several
+    become a SOFT group, so only one of them is off at a time -- the gentle option,
+    since the evidence is weak. Recorded under `leads` with its source, never as
+    the record's minimized_sequence, so it is not mistaken for a reproducer.
+    Returns on_crash's summary, or None when seq names no selector.
+    """
+    now = now or now_iso()
+    distinct = distinct_selectors(seq or [])
+    if not distinct:
+        return None
+    rec = state["catalog"].get(sig)
+    if rec is None:
+        on_crash(state, sig, None, now)
+        rec = state["catalog"][sig]
+    if len(distinct) > 1:
+        add_soft_group(state, distinct, sig, now)
+        cat, disp = SOFT, ROTATING
+    else:
+        _add_hard(state, distinct)
+        cat, disp = HARD, DISABLED
+    if rec["disposition"] not in (DISABLED, ROTATING):
+        rec["category"], rec["disposition"] = cat, disp
+    rec.setdefault("leads", []).append(
+        {"selectors": distinct, "source": str(source), "at": now, "verified": False})
+    rec["exhausted_count"] = 0
+    return {"decision": "lead", "category": rec["category"],
             "disposition": rec["disposition"], "disabled": disabled_set(state)}
 
 

@@ -38,9 +38,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import crash_fingerprint as cf  # noqa: E402
-from tablefmt import render as _render_table  # noqa: E402
-from fsutil import hardlink_or_copy  # noqa: E402
-import timefmt  # noqa: E402
+from lib.tablefmt import render as _render_table  # noqa: E402
+from lib.fsutil import hardlink_or_copy  # noqa: E402
+from lib import timefmt  # noqa: E402
 
 # Investigation gates, in order. A dossier advances through these; the registry
 # records the current one so a bug is never "where was I?" again.
@@ -48,10 +48,13 @@ STATUSES = ("new", "investigating", "poc", "reported", "fixed", "dup")
 
 # How a panic came to be. "fuzz" is a genuine find; "triage" is one the minimizer
 # caused ON PURPOSE while re-running a known-crashing subset. Both belong in the
-# evidence log -- a triage panic still proves the bug -- but only fuzz-origin
-# crashes may be counted as sightings, because crash frequency is a
-# prioritization signal and investigating a bug must not inflate its own rank.
-ORIGINS = ("fuzz", "triage")
+# evidence log -- a triage panic still proves the bug -- but only genuine finds
+# may be counted as sightings, because crash frequency is a prioritization
+# signal and investigating a bug must not inflate its own rank.
+# "fuzz-during-triage" is a DIFFERENT bug that a minimization probe tripped over:
+# nobody was looking for it, so it is a genuine find and counts as a sighting.
+ORIGINS = ("fuzz", "triage", "fuzz-during-triage")
+SIGHTING_ORIGINS = ("fuzz", "fuzz-during-triage")
 # Rows written before the field existed: they predate any triage routing, so
 # reading them as fuzz-origin is correct rather than merely convenient.
 DEFAULT_ORIGIN = "fuzz"
@@ -206,7 +209,7 @@ def _elide(body, width=_ELIDE_AT):
 def render_evidence(rec):
     """The auto-owned evidence block: the crash manifestations seen for this
     bug, newest last, each with the facts that identify it."""
-    n_fuzz = sum(1 for c in rec["crashes"] if crash_origin(c) == "fuzz")
+    n_fuzz = sum(1 for c in rec["crashes"] if is_sighting(c))
     n_tri = len(rec["crashes"]) - n_fuzz
     lines = [render_reproducer(rec), "", "## Evidence log", "",
              "| when | origin | report | fault | far | culprit | pc | pgz | sig |",
@@ -278,6 +281,11 @@ def crash_origin(c):
     return c.get("origin") or DEFAULT_ORIGIN
 
 
+def is_sighting(c):
+    """A genuine find, as opposed to a panic minimization caused on purpose."""
+    return crash_origin(c) in SIGHTING_ORIGINS
+
+
 def bug_reports_dir(bugs_dir, rec):
     return os.path.join(bugs_dir, rec["id"], "reports")
 
@@ -344,7 +352,7 @@ def route_one(reg, bugs_dir, a, campaign=None, config=None, origin=DEFAULT_ORIGI
 # --- INDEX ------------------------------------------------------------------
 def write_index(bugs_dir, reg):
     rows = sorted(reg["bugs"].values(), key=lambda r: r["id"])
-    n_fuzz = sum(1 for r in rows for c in r["crashes"] if crash_origin(c) == "fuzz")
+    n_fuzz = sum(1 for r in rows for c in r["crashes"] if is_sighting(c))
     n_tri = sum(len(r["crashes"]) for r in rows) - n_fuzz
     lines = ["# Bug registry", "",
              "%d bug(s), %d crash(es) found by fuzzing%s." % (
@@ -359,7 +367,7 @@ def write_index(bugs_dir, reg):
                ) if sigs else "-"
         rp = r.get("reproducer") or {}
         repro = "-" if not rp else ("verified" if rp.get("verified") else "unverified")
-        mine = sum(1 for c in r["crashes"] if crash_origin(c) == "fuzz")
+        mine = sum(1 for c in r["crashes"] if is_sighting(c))
         tri = len(r["crashes"]) - mine
         lines.append("| %s | %s | %s | %s | `%s` | `%s` | %d%s | [%s](%s) |" % (
             r["id"], r["status"], r["report_status"], repro, sig, r["bug_key"],
@@ -389,7 +397,7 @@ def cmd_route(args):
             getattr(args, "config", None), origin)
         tag = "NEW BUG " if new_bug else ("new crash" if new_crash else "dup      ")
         print("%s  %s [%s]  %s%s" % (tag, bug_id, status, a["bug_key"],
-                                     "  (triage-origin)" if origin == "triage" else ""))
+                                     "  (%s-origin)" % origin if origin != DEFAULT_ORIGIN else ""))
     save_registry(args.bugs, reg)
     write_index(args.bugs, reg)
 
@@ -436,7 +444,7 @@ def cmd_list(args):
     out = []
     for r in rows:
         mine = [c for c in r["crashes"] if not want or c.get("campaign") == want]
-        n_fuzz = sum(1 for c in mine if crash_origin(c) == "fuzz")
+        n_fuzz = sum(1 for c in mine if is_sighting(c))
         n_tri = len(mine) - n_fuzz
         # Sightings and self-inflicted panics are different facts, so they get
         # different shapes: "3" is three finds, "3 (+4)" is three finds and four

@@ -5,6 +5,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 // Subprocess allows to start and wait for a subprocess.
@@ -50,7 +52,15 @@ public:
 		    "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0",
 		    // Disable rseq since we don't use it and we want to [ab]use it ourselves for kernel testing.
 		    "GLIBC_TUNABLES=glibc.pthread.rseq=0",
+		    nullptr,
 		    nullptr};
+		// The child gets a fixed environment; pass through the one variable the
+		// darwin IOKit wrappers read (freq_lab's call-output log), when it is set.
+		static std::string iokit_output_log;
+		if (const char* v = getenv("SYZ_IOKIT_OUTPUT_LOG")) {
+			iokit_output_log = std::string("SYZ_IOKIT_OUTPUT_LOG=") + v;
+			child_envp[2] = iokit_output_log.c_str();
+		}
 
 		if (posix_spawnp(&pid_, argv[0], &actions, &attr,
 				 const_cast<char**>(argv), const_cast<char**>(child_envp)))

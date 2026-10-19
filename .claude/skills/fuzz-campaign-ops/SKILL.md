@@ -80,10 +80,13 @@ tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 means nothing moved, which is the signal you are watching for — an absolute
 counter looks identical whether the box is fuzzing hard or wedged.
 
-Three clocks are reported separately: **fuzzing** (manager executing),
-**minimizing** (triage), **rebooting**. `--budget-clock` picks which one
-`--budget-hours` measures; the default `fuzz` means minimizing a bug never eats
-the fuzzing budget. Never quote wall time as fuzzing time.
+Four clocks are reported separately: **preparing** (snapshot, grammar compile,
+until the first exec), **fuzzing** (first exec to the run's last sign of life),
+**minimizing** (triage), **rebooting** (panic to back up, and dead time).
+`--budget-clock` picks what `--budget-hours` measures: the default `wall` charges
+all four, `fuzz` only fuzzing (so neither startup nor minimizing a bug eats the
+budget), `real` the elapsed time since the config started. Never quote wall time
+as fuzzing time.
 
 ## Stopping a box that will not stay up
 
@@ -114,6 +117,23 @@ before any session starts. Anything written into it becomes the halt reason.
   `sys/darwin/*.txt` has uncommitted changes, the descriptions hash moves too.
 - **Budget seems not to advance** — the per-config clock resets on a config
   advance by design; the lifetime totals in `status` are the ones that never do.
+- **A config was skipped** — `status` lists it under `abandoned`: it reached
+  `max_crashes` incidents (per config) and the campaign moved on.
+- **Halted with "... hung and the box must be rebooted"** — a triage probe
+  wedged the executor (it holds `/dev/pishi`) and `sudo -n /sbin/shutdown -r
+  now` was refused. Reboot by hand, `resume`, and add the sudoers rule from
+  `fuzz-run-setup.md` (doctor warns when it is missing).
+- **A signature keeps crashing but is never triaged** — `status` lists it under
+  `exhausted` with the kind (`no-repro`, `ring-only`, `hang`, ...). Recurrences
+  are counted; after 4 the newest ring program is benched as an unverified lead.
+  `forget-exhausted` re-allows triage once the cause is fixed.
+- **An incident says "NOT the fuzzed <kext>"** — the backtrace blames a kext
+  other than the one this config targets (a shared IOKit family, the kernel's
+  own zone code reached through the driver, or a genuinely different driver).
+  Worth a look before attributing the bug to the target.
+- **Halted with "failed to start N times"** — the manager died before its first
+  exec; the reason quotes the run log. Look in
+  `<workdir>/artifacts/startup-failures/`. A held http port is the usual cause.
 
 ## Sequence for a fresh run
 

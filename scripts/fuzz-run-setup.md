@@ -42,11 +42,12 @@ device fine.
 
 ---
 
-## Two privileged prerequisites (one-time, `sudo`)
+## Privileged prerequisites (one-time, `sudo`)
 
-There is really only one, and it fails **silently** — the campaign keeps fuzzing and
-just never notices a crash — so `doctor` checks it explicitly. The second item is here
-because `doctor` warns about it and the obvious "fix" is a bad one.
+The first fails **silently** — the campaign keeps fuzzing and just never notices a
+crash — so `doctor` checks it explicitly. The second is here because `doctor` warns
+about it and the obvious "fix" is a bad one. The third lets triage recover from a hang
+on its own.
 
 ### 1. Panic reports must be readable by `fuzz`
 
@@ -100,6 +101,23 @@ excludes `*.kernel.core.gz` from incident bundles (`PANIC_GLOBS` takes only the
 
 If core dumping is ever re-enabled and the cores start accumulating again, prune them
 from a small root-owned periodic LaunchDaemon rather than widening the directory.
+
+### 3. Let triage reboot the box after a hang
+
+A minimization probe that hangs leaves its executor wedged in the kernel (STAT `U`),
+holding `/dev/pishi` until the machine reboots: SIGKILL cannot reach it, and nothing
+else can run on that boot. Triage captures the stack (`diagnose-hang`) and then
+reboots with `sudo -n /sbin/shutdown -r now`. Allow exactly that command:
+
+```sh
+echo 'fuzz ALL=(root) NOPASSWD: /sbin/shutdown -r now' | sudo tee /etc/sudoers.d/fuzz-reboot
+sudo chmod 0440 /etc/sudoers.d/fuzz-reboot
+sudo visudo -cf /etc/sudoers.d/fuzz-reboot                     # -> parsed OK
+sudo -u fuzz sudo -n -l /sbin/shutdown -r now                  # -> prints the command
+```
+
+Without it a hang **halts** the campaign with the reason, and someone has to reboot
+by hand. `doctor` warns when the rule is missing.
 
 ---
 
@@ -287,14 +305,30 @@ and letting the next start silently re-halt it.
 
 ### What the breaker will do
 
-The campaign **halts itself** on any of: `max_crashes` total incidents (default 20),
-free disk under `min_free_gb` (20), `crashloop_limit` consecutive crashes that
-never fuzzed anything (15 runs shorter than `crashloop_window_seconds`, 20s), or
-triage failing to reach a culprit in `triage_max_boots` advances (40). The window
-is deliberately below anything that managed to execute programs: a healthy run on
-this target panics every 30-110s, and the old 120s/5 pairing halted a working
-campaign within ten minutes of its first real bug. A halt is a safe stop, not a failure — `resume` clears it. For a multi-day
-unattended run, raise `max_crashes` in `campaigns/jpeg.json`.
+The campaign **halts itself** on any of: free disk under `min_free_gb` (20),
+`crashloop_limit` consecutive kernel panics that hit before the run fuzzed
+anything (15 in a row, each before `crashloop_min_execs`, 200, programs ran),
+`startup_fail_limit` managers in a row that died before executing a single
+program (3), or triage failing to reach a culprit in `triage_max_boots` advances
+(40). "Fuzzed anything" is counted in programs, not seconds: a poisoned corpus
+panics at 0-30 execs, while even five seconds of real fuzzing is over 200 at
+40-50 execs/s. A time window was tried and could not tell them apart -- the
+manager's stat line comes every 10s, so its error was as large as the window,
+and a healthy run with a quick real bug read as a crash loop. Only fuzzing runs
+count: panics caused on purpose during minimization never do. A halt is a safe stop, not a
+failure — `resume` clears it.
+
+`max_crashes` (20) is **per config** and does not halt: a config that reaches
+it is **abandoned** — recorded in `status`, skipped if the campaign loops — and
+the campaign moves on to the next one. Only when every config is abandoned does
+it halt. For a multi-day unattended run on a crash-heavy driver, raise
+`max_crashes` in the campaign definition.
+
+A manager that dies before its first exec without a panic (a held http port, a
+bad config, a missing binary) is a **startup failure**: noticed within
+`startup_poll_seconds` (15s), collected under `artifacts/startup-failures/`,
+retried after 30s, and the third in a row halts with the run log's last
+`FATAL` line as the reason.
 
 ### A config **is** a workdir
 
@@ -346,6 +380,21 @@ The deltas are the point. An absolute counter looks identical one refresh later
 whether the box is fuzzing hard or wedged; a blank delta column means nothing
 moved, which is exactly the signal you are watching for.
 
+Each recent incident says what the crash turned out to be: its signature, its
+BUG id in the registry, the kext the backtrace blames, and what the coordinator
+decided. A crash in a kext other than the fuzzed one is called out — the config
+names no kext, so "fuzzed" means the workdir's kext directory and the services
+the config opens:
+
+```
+    - 16/10 12:24:02  crash   AppleSMC_261016_cov_handfixed  ran 312s  sig 5fe467b592862b54 BUG-0004  in AppleSMC  -> triage AppleSMC_261016_1h_handfixed_t2
+    - 16/10 13:02:40  crash   AppleSMC_261016_cov_handfixed  ran 95s  sig 1c2e... BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
+```
+
+While triaging, a `progress` row reads the job's checkpoint: subsets tested and
+crashed, the subset under test, panics from other bugs, hangs — or, during the
+ring replay, the pass and slot.
+
 ### Dates
 
 Stored timestamps are ISO 8601 **with a real offset** — `2026-09-01T14:56:39+02:00`
@@ -364,40 +413,84 @@ reinterpreted — it simply now *displays* as the hour it actually happened.
 
 ### Reading the clocks
 
-`status` reports three disjoint clocks plus their sum:
+`status` reports four disjoint clocks plus their sum, for the whole campaign:
 
 ```
-fuzzing     : 4h12m  (manager executing)
-minimizing  : 0h51m  (triage)
-rebooting   : 0h23m  (panic -> back up)
-wall        : 5h26m  (sum of the three)
+  time, whole campaign:
+    preparing   : 0h06m  (snapshot, grammar compile, until the first exec)
+    fuzzing     : 4h12m  (first exec -> end of run; see runstats.py for execution time)
+    minimizing  : 0h51m  (triage)
+    rebooting   : 0h23m  (panic -> back up, and dead time)
+    wall        : 5h32m  (sum of the four)
 ```
 
-`--budget-hours` measures **wall** by default: session uptime plus minimization
-plus reboot overhead. That is "give this config 24 hours of machine time", which
-is what comparing one configuration against another needs. `--budget-clock fuzz`
-charges session uptime only, so a stubborn bug's minimization cannot eat the
-budget — useful when you care about fuzzing throughput rather than a fixed
-envelope. `wall >= fuzz` always, so the default can only end a campaign sooner.
+A run's **preparing** stretch is everything from the coordinator opening it
+(snapshot, results commit, manager launch, grammar compile, executor handshake)
+to the first stat line with `exec total > 0`. **fuzzing** runs from there to the
+run's last sign of life — the newest run-log line or cover-log write — not to
+the moment the death was noticed. That matters on this target: nearly every
+crash is noticed on the next boot, and measuring to then charged the reboot as
+fuzzing. A triage advance cut short by its own crashing probe is split the same
+way: minimizing up to the last probe, rebooting after it.
 
-> **`fuzzing` in `status` is session uptime, not time executing programs.** The
-> manager also starts up, triages the corpus and waits on RPC; on a measured run
-> only **56%** of uptime was execution (18.9 h alive → 10.7 h executing). For the
-> real figure, `runstats.py show <run>` reads syz-manager's own counter and
-> prints an `efficiency` line. Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
+`--budget-hours` measures **wall** by default: preparing plus fuzzing plus
+minimization plus reboot overhead. That is "give this config 24 hours of machine
+time", which is what comparing one configuration against another needs.
+`--budget-clock fuzz` charges the fuzzing line only, so neither startup nor a
+stubborn bug's minimization can eat the budget. `--budget-clock real` is elapsed
+time since the config started, startup included: ask for 1h and it stops 1h
+later. `wall >= fuzz` always, so the default can only end a campaign sooner.
+
+> **`fuzzing` in `status` is still not time executing programs.** The manager
+> also re-triages its corpus and waits on RPC; on a measured run only **56%** of
+> uptime was execution (18.9 h alive → 10.7 h executing). For the real figure,
+> `runstats.py show <run>` reads syz-manager's own counter and prints an
+> `efficiency` line.
+
+Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
 say "24h fuzzing, 31h wall, of which 4h minimization" rather than picking one
 number and hiding the rest. Nothing accrues while the campaign is halted or idle,
-and a reboot gap longer than `max_boot_gap_seconds` (15 min) is treated as idle
-rather than overhead — otherwise the wall clock would measure your sleep schedule.
+and a reboot gap is charged at most `max_boot_gap_seconds` (15 min), of which at
+most `max_relaunch_seconds` (5 min) for boot-to-relaunch; the rest is treated as
+idle rather than overhead — otherwise the wall clock would measure your sleep
+schedule.
 
 ### When triage gets STUCK
 
-Minimization can finish without a verified reproducer: the culprit crashed during
-the search but not when re-run on its own, which means the bug needs state an
-earlier program left behind. That is a **result**, not a failure. The job stops at
-`STUCK`, the campaign benches the selectors anyway so fuzzing continues, and the
-bug dossier records the sequence as an *unverified lead* rather than a
-reproducer. Re-running will not improve it.
+Minimization can finish without a verified reproducer. That is a **result**, not a
+failure, and re-running will not improve it. The job's `stuck_kind` says which:
+
+| kind | what happened | what the campaign does |
+|---|---|---|
+| `unverified` | a connection subset crashed during the search but not when re-run on its own: the bug needs state an earlier program left behind | benches the selectors anyway; the dossier records an *unverified lead* |
+| `no-repro` | no subset reproduced, **and** the ring replayed exactly as fuzzed did not crash either | benches nothing; the signature is *exhausted* |
+| `ring-only` | no subset of the merged program reproduced, but the ring replayed as fuzzed crashed twice: merging loses what the bug needs. The ring is kept in the job as `ring/` | benches nothing; *exhausted* |
+| `ring-unverified` / `ring-other` | the ring crashed once only / panicked with a different bug | benches nothing; *exhausted* |
+| `hang` | the job hung 3 times (each hang costs a reboot) | benches the hung program under its own quarantine key `hang:<job>`; the target is *exhausted* |
+
+When the connection culprit was verified but the call stage cannot reduce it, the job
+still ends `DONE`, with the connection culprit as the reproducer.
+
+An **exhausted** signature is not triaged again (that would repeat the same answer).
+Its recurrences are counted in the quarantine, and after `tolerate_budget` (4) of them
+the newest program in the ring buffer is benched as an *unverified lead* so it stops
+costing a reboot each time. `fuzz-campaign.py forget-exhausted <campaign> [sig]`
+allows a new triage once the cause is fixed.
+
+If the budget runs out while a job is in progress, the job is finished first, its
+result benched, and then the campaign moves to the next config.
+
+### A second bug during triage
+
+A probe that panics the box with a **different** signature is not counted for the
+bug being minimized (the crash gate filters it), but it is not lost either. The
+coordinator log says `SECOND BUG during triage`, the panic is filed in the bug
+registry as `fuzz-during-triage` (a genuine sighting), the quarantine records it as
+SUSPECT, and the subset that crashed is saved as `other_<sig>.syz` in the job. A
+triage for it is queued (`status` shows `triage queue`) and starts when the current
+job ends, from that one program. The queue is dropped when the config's budget is
+spent or the campaign moves to another config; the bug stays SUSPECT, so its next
+recurrence while fuzzing is triaged as usual.
 
 ### Switching which campaign runs
 

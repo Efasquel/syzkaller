@@ -1559,6 +1559,9 @@ void* worker_thread(void* arg)
 void execute_call(syz_thread_t* th)
 {
 	const call_t* call = &syscalls[th->call_num];
+#if GOOS_darwin
+	syz_iokit_call_index = th->call_index;
+#endif
 	debug("#%d [%llums] -> %s(",
 	      th->id, current_time_ms() - start_time_ms, call->name);
 	for (int i = 0; i < th->num_args; i++) {
