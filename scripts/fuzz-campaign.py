@@ -32,12 +32,14 @@ Commands:
 import argparse
 import atexit
 import fcntl
+import fnmatch
 import signal
 import getpass
 import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -155,6 +157,9 @@ DEFAULTS = {
     # it is decoupled from poll_seconds, which is expensive (an HTTP round trip
     # to the manager) and therefore rare.
     "stop_check_seconds": 5,
+    # Open a Terminal running `status -w` at every driver start, i.e. after every
+    # panic-reboot, so the phase is on screen before you could have typed it.
+    "watch_window": True,
     # One `syz-executor exec` process per program, so a healthy one lives
     # milliseconds. Alive this long means a syscall that never returned -- a
     # direct hang signal, rather than waiting hang_after_seconds to infer one
@@ -553,6 +558,10 @@ def init_state(name):
         # campaign's first crash fingerprints one fresh panic instead of replaying
         # every historical report in the dir (they are ~2MB each).
         "panic_sig_watermark": _newest_report_mtime(),
+        # What the box is doing right now (see set_activity), finer than phase.
+        "activity": None, "activity_detail": "", "activity_since": None,
+        # Most basic blocks each config's cover logs ever showed (see note_coverage).
+        "bb_covered": {},
     }
 
 
@@ -637,7 +646,24 @@ COORDINATOR_DEFAULTS = {
     "prep_seconds": 0.0, "total_prep_seconds": 0.0,
     "config_incidents": 0, "startup_failures": 0, "abandoned": [],
     "triage_queue": [], "triage_seen": {},
+    "activity": None, "activity_detail": "", "activity_since": None,
+    "bb_covered": {},
 }
+
+
+def note_coverage(s, sid, info):
+    """Keep the most basic blocks a config's cover logs have shown.
+
+    inspect reads the logs of the CURRENT session only, so a sweep would lose
+    each config's figure the moment the campaign moved on, and a halted campaign
+    would have nothing to show once its workdir is gone. Max, not last: an
+    archived log that is pruned by hand would otherwise read as lost coverage.
+    """
+    bb = info.get("bb_all")
+    if bb is None:
+        return
+    covered = s.setdefault("bb_covered", {})
+    covered[sid] = max(int(bb), int(covered.get(sid) or 0))
 
 
 def load_state(name):
@@ -647,7 +673,118 @@ def load_state(name):
 
 def save_state(s):
     s["updated_at"] = now_iso()
+    # A campaign that stops is in the "halted"/"done" activity, whichever of the
+    # eight halt paths set the status. Hooked here so none of them can forget.
+    if s.get("status") in ("halted", "done") and s.get("activity") != s["status"]:
+        set_activity(s, s["status"], s.get("halt_reason") or "", save=False)
     write_json(state_path(s["name"]), s)
+
+
+# --- activity ----------------------------------------------------------------
+# What the box is doing right now, in one word, with the moment it started. The
+# phase (fuzzing | triaging) is the coordinator's decision; this is the finer
+# story you want between two panics, when there is no time to type a command:
+# has fuzzing actually restarted, or is the box still reconciling the last boot,
+# preparing a manager, or on advance 7 of a minimization? Written to the state
+# file at every transition, read by `status` and `list`, and posted as a macOS
+# notification for the transitions worth looking up for.
+ACTIVITY_COLOUR = {"fuzzing": "green", "halted": "red", "done": "grey"}
+NOTIFY_ON = ("fuzzing", "triaging", "halted", "done")   # crashes announce themselves
+
+
+def gui_available():
+    """Whether the GUI side effects (notifications, the watch window) can and
+    should happen: macOS, and not opted out. FUZZ_NO_GUI=1 is for shells and tests."""
+    return sys.platform == "darwin" and not os.environ.get("FUZZ_NO_GUI")
+
+
+def set_activity(s, what, detail="", save=True):
+    """Record what the box is doing now. A no-op when nothing changed, so a
+    relaunch that finds itself where it left off keeps the original start time.
+    Returns True when the activity moved."""
+    detail = detail or ""
+    if s.get("activity") == what and (s.get("activity_detail") or "") == detail:
+        return False
+    s["activity"], s["activity_detail"], s["activity_since"] = what, detail, now_iso()
+    if save:
+        save_state(s)
+    if what in NOTIFY_ON:
+        notify(s["name"], what.upper(), detail)
+    return True
+
+
+def activity_seconds(s):
+    t0 = timefmt.to_epoch(s.get("activity_since"))
+    return max(0.0, time.time() - t0) if t0 else 0.0
+
+
+
+def notify(name, title, body=""):
+    """Post a macOS notification in the fuzz user's session. Best effort: the
+    coordinator log is the record, this is the glance."""
+    if not gui_available():
+        return False
+
+    def q(t):
+        return str(t).replace("\\", "\\\\").replace('"', '\\"')
+    script = ('display notification "%s" with title "fuzz-campaign %s" subtitle "%s"'
+              % (q(body[:200]), q(name), q(title)))
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", script], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        log("notify failed: %s" % e)
+        return False
+
+
+def announce_incident(s):
+    """Notify what the last incident WAS -- signature, BUG id, kext, decision --
+    once the coordinator has decided, not merely that something crashed."""
+    if s.get("incidents"):
+        inc = s["incidents"][-1]
+        notify(s["name"], inc["kind"].upper(), incident_line(inc))
+
+
+def watch_command_path(name):
+    return STATE_DIR / ("%s.watch.command" % name)
+
+
+def watch_running(name):
+    """A `status <name> -w` already on screen, ours or yours."""
+    rx = re.compile(r"fuzz-campaign\.py status %s (-w|--watch)\b" % re.escape(name))
+    return any(rx.search(cmd) for _, cmd in running_processes("fuzz-campaign.py status"))
+
+
+def open_watch_window(name, d):
+    """Put `status -w` on screen in a Terminal window.
+
+    Called at every driver start -- which on this box means after every
+    panic-reboot -- so the phase is readable the moment auto-login lands, with
+    nothing typed between two crashes. Opens even when the driver is about to
+    exit (brake, halted): that is the status you most want to see. Never
+    stacked: a launchd relaunch with a watch already running leaves it alone.
+    """
+    if not d.get("watch_window", True) or not gui_available():
+        return False
+    path = watch_command_path(name)
+    py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#!/bin/sh\n# written by `fuzz-campaign.py run %s`; opened in Terminal "
+            "at each driver start\ncd %s && exec %s %s status %s -w\n"
+            % (name, shlex.quote(str(REPO_ROOT)), shlex.quote(py),
+               shlex.quote(str(SCRIPT_DIR / "fuzz-campaign.py")), shlex.quote(name)))
+        os.chmod(path, 0o775)
+        if watch_running(name):
+            return False
+        subprocess.run(["/usr/bin/open", "-a", "Terminal", str(path)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        log("watch window not opened: %s" % e)
+        return False
 
 
 # --- circuit breaker + core pruning ------------------------------------------
@@ -1275,6 +1412,13 @@ def advance_triage(s, d):
     save_state(s)
     log("triage advance %d/%d for job %s"
         % (s["triage_boots"], d["triage_max_boots"], job))
+    # The activity names only the bug, so its clock runs over the whole
+    # minimization rather than restarting at every advance; the advance and
+    # stage are read live by status. Each advance is still announced.
+    set_activity(s, "triaging", "bug %s" % s.get("triage_bug_sig"))
+    notify(s["name"], "TRIAGING", "bug %s: advance %d/%d, %s"
+           % (s.get("triage_bug_sig"), s["triage_boots"], d["triage_max_boots"],
+              (triage_state(job) or {}).get("stage") or "starting"))
     triage("run", job, "--reboot-on-hang")
     # Charge this advance to the triage clock. A crashing subset reboots the box
     # mid-run and we never get here -- reconcile_triage_gap does it next boot.
@@ -1402,6 +1546,7 @@ def ensure_running(s, cfg, d=None):
     if info.get("found") and info.get("status") == "running" and info.get("pid_alive"):
         log("session %s already running (pid %s); attaching supervisor"
             % (sid, info.get("pid")))
+        set_activity(s, "fuzzing" if info.get("fuzz_started_epoch") else "preparing", sid)
         # Attaching continues the open run. Re-basing here used to re-add the
         # run's elapsed time on every reattach. Only a run this state never
         # opened (a manager that outlived its supervisor) is opened now, from
@@ -1438,6 +1583,7 @@ def ensure_running(s, cfg, d=None):
         save_state(s)
         verb = "resume" if info.get("found") else "start"
         target = sid if verb == "resume" else cfg
+        set_activity(s, "preparing", "%s %s" % (verb, sid))
         # Before the manager starts: it re-triages corpus.db and silently drops
         # every program that no longer reproduces, which is how a whole corpus
         # was lost once. This commit is the copy that survives that.
@@ -1649,10 +1795,12 @@ def reconcile_boot(s, d):
         return end
     kind = "crash" if info.get("panic_evidence") else "hang"
     log("boot reconcile: %s ended uncollected -> %s" % (sid, kind))
+    set_activity(s, "collecting", "%s on %s (found at boot)" % (kind, sid))
     record_incident(s, d, kind, info, end)
     collect_and_prune(s, d, kind)
     if kind == "crash":
         handle_crash(s, d, info)   # may flip phase to triaging; the loop honours it
+    announce_incident(s)
     save_state(s)
     return end
 
@@ -1781,7 +1929,9 @@ def supervise(s, d, sid, budget):
         if info.get("fuzz_started_epoch") and not fuzzing:
             fuzzing = True
             s["startup_failures"] = 0
+            set_activity(s, "fuzzing", sid)
         account_run(s, info, now)
+        note_coverage(s, sid, info)
         et = info.get("exec_total")
         if et is not None and et != last_et:
             last_et = et
@@ -1841,6 +1991,8 @@ def cmd_run(name):
     except OSError:
         log("another driver for %r is already running; exiting" % name)
         return
+    # Before even the brake: whatever happens next, it should be on screen.
+    open_watch_window(name, d)
     # The brake is checked FIRST, before the state is even read, because its whole
     # purpose is to stop a box that keeps panicking -- including one that panics
     # as soon as fuzzing resumes. Anything we do before this is something the
@@ -1870,6 +2022,7 @@ def cmd_run(name):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
         return
+    set_activity(s, "booting", "reconciling the last boot")
     log("campaign %r starting: %d config(s), %.1fh budget each, loop=%s, phase=%s"
         % (name, len(d["items"]), d["budget_hours"], d["loop"], s["phase"]))
     # Where the three ledgers live. They are campaign-scoped, not session-scoped,
@@ -2065,23 +2218,25 @@ def cmd_run(name):
         if info.get("pid_alive"):
             session("stop", s["session_id"])
             info = inspect(s["session_id"])
+        set_activity(s, "collecting", "%s on %s" % (outcome, config_id(cfg)))
         record_incident(s, d, outcome, info, end)
         collect_and_prune(s, d, outcome)
         # Coordinator: the quarantine SUSPECT gate decides whether a crash earns a
         # triage. A NEW signature becomes SUSPECT and just resumes (enabled); a
         # recurrence that needs confirming, or an escape, is triaged; a tolerated
         # recurrence is handled in place. See quarantine_decide.
-        if outcome == "crash" and handle_crash(s, d, info):
-            save_state(s)
-            continue                     # loop re-enters the triaging phase
+        triaging = outcome == "crash" and handle_crash(s, d, info)
+        announce_incident(s)
         save_state(s)
+        if triaging:
+            continue                     # loop re-enters the triaging phase
         # policy: restart same config -- loop re-enters ensure_running (resume)
 
 
 # --- authoring + control -----------------------------------------------------
 def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
             max_crashes, min_free_gb, keep_cores, force, triage_opts=None,
-            breaker_opts=None):
+            breaker_opts=None, watch_window=True):
     path = def_path(name)
     if path.exists() and not force:
         die("campaign %r already exists (%s); use --force to overwrite" % (name, path))
@@ -2098,7 +2253,7 @@ def cmd_new(name, configs, budget_hours, loop, poll_seconds, hang_after_seconds,
         "name": name, "configs": rel, "budget_hours": budget_hours, "loop": loop,
         "poll_seconds": poll_seconds, "hang_after_seconds": hang_after_seconds,
         "max_crashes": max_crashes, "min_free_gb": min_free_gb,
-        "keep_cores": keep_cores,
+        "keep_cores": keep_cores, "watch_window": watch_window,
     }
     # The device flags begin_triage passes to `triage.py new`. Without them triage
     # falls back to its own defaults (no kcov device, no kext id), which is not
@@ -2731,6 +2886,10 @@ def _set_status(name, status, reason=None):
         s["halt_reason"] = None
         s["consec_fast_crashes"] = 0
         s["startup_failures"] = 0
+        # Nothing runs until the agent relaunches the driver; say so rather than
+        # leaving "HALTED" under a status that reads "running".
+        set_activity(s, "waiting", "resumed; waiting for the driver to relaunch",
+                     save=False)
     save_state(s)
     log("campaign %r -> %s" % (name, status))
 
@@ -3760,6 +3919,8 @@ def main():
     sp.add_argument("--max-crashes", type=int, default=DEFAULTS["max_crashes"])
     sp.add_argument("--min-free-gb", type=float, default=DEFAULTS["min_free_gb"])
     sp.add_argument("--keep-cores", type=int, default=DEFAULTS["keep_cores"])
+    sp.add_argument("--no-watch-window", dest="watch_window", action="store_false",
+                    help="do not open a Terminal running `status -w` at each driver start")
     sp.add_argument("--force", action="store_true")
     # Baked into the def's "triage" block and replayed to `triage.py new` on every
     # bug the coordinator decides to minimize. Mirror what the manual runs used.
@@ -3879,7 +4040,8 @@ def main():
                 {"crashloop_limit": args.crashloop_limit,
                  "crashloop_min_execs": args.crashloop_min_execs,
                  "triage_max_boots": args.triage_max_boots,
-                 "budget_clock": args.budget_clock})
+                 "budget_clock": args.budget_clock},
+                watch_window=args.watch_window)
     elif args.cmd == "stop":
         sys.exit(cmd_stop(args.name, args.grace, args.keep_agent))
     elif args.cmd == "brake":

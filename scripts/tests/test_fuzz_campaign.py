@@ -7,7 +7,9 @@ include_syscalls (rotate a benched syscall back in). The culprit -> name list
 translation (syz-ring-repro -emit-json) is exercised by the Go tests.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -17,6 +19,9 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+# Never post a notification or open a Terminal from a test run on the box.
+os.environ.setdefault("FUZZ_NO_GUI", "1")
 
 
 def _load_campaign():
@@ -2032,3 +2037,167 @@ class ResultsCommitTest(unittest.TestCase):
         cmd = run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("--tag-prefix") + 1], "C/K_x")
         self.assertEqual(cmd[cmd.index("--push") + 1], "wait")
+
+
+class ActivityTest(unittest.TestCase):
+    """What the box is doing, as one word with a start time. It is the line you
+    read between two panics, when there is no time to type a command -- so it
+    must be first on screen, survive a reboot, and keep its start time across
+    the relaunch that follows one."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.state_dir = self.dir / "state"
+        self.state_dir.mkdir()
+        self._p = mock.patch.object(fc, "STATE_DIR", self.state_dir)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self._tmp.cleanup()
+
+    def _status(self, s, cfg, colour=False):
+        with mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "load_def",
+                               lambda n: dict(fc.DEFAULTS, items=[
+                                   {"config": str(cfg), "budget_seconds": 3600}],
+                                   name=n)), \
+             mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+             mock.patch.object(fc, "free_gb", lambda: 100.0), \
+             mock.patch.object(fc, "style", type(fc.style)(colour)):
+            lines, _ = fc.status_lines("camp")
+        return lines
+
+    def test_unchanged_activity_keeps_its_start_time(self):
+        s = fc.init_state("camp")
+        self.assertTrue(fc.set_activity(s, "triaging", "advance 1/40"))
+        t0 = s["activity_since"]
+        self.assertFalse(fc.set_activity(s, "triaging", "advance 1/40"))
+        self.assertEqual(s["activity_since"], t0)
+        self.assertTrue(fc.set_activity(s, "triaging", "advance 2/40"))
+
+    def test_halting_sets_the_activity_whichever_path_halted(self):
+        """Eight places set status = "halted"; the save hook covers them all."""
+        s = fc.init_state("camp")
+        fc.set_activity(s, "fuzzing", "cfg")
+        s["status"], s["halt_reason"] = "halted", "crash loop (15 crashes)"
+        fc.save_state(s)
+        self.assertEqual(s["activity"], "halted")
+        self.assertEqual(s["activity_detail"], "crash loop (15 crashes)")
+        on_disk = json.loads((self.state_dir / "camp.json").read_text())
+        self.assertEqual(on_disk["activity"], "halted")
+
+    def test_resume_says_it_is_waiting_for_the_driver(self):
+        s = fc.init_state("camp")
+        s["status"] = "halted"
+        fc.save_state(s)
+        with mock.patch.object(fc, "log", lambda m: None):
+            fc._set_status("camp", "running")
+        self.assertEqual(fc.load_state("camp")["activity"], "waiting")
+
+
+
+class GlanceTest(unittest.TestCase):
+    """The two things that reach your eyes without a command: the Terminal
+    window the driver opens at each start, and the notifications."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self._p = mock.patch.object(fc, "STATE_DIR", self.dir / "state")
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self._tmp.cleanup()
+
+    def test_watch_window_is_written_and_opened_once(self):
+        calls = []
+        with mock.patch.object(fc, "gui_available", lambda: True), \
+             mock.patch.object(fc, "watch_running", lambda n: False), \
+             mock.patch.object(fc.subprocess, "run", lambda *a, **k: calls.append(a[0])):
+            self.assertTrue(fc.open_watch_window("camp", dict(fc.DEFAULTS)))
+        cmd = self.dir / "state" / "camp.watch.command"
+        self.assertTrue(os.access(cmd, os.X_OK))
+        self.assertIn("fuzz-campaign.py status camp -w", cmd.read_text())
+        self.assertEqual(calls[0][:3], ["/usr/bin/open", "-a", "Terminal"])
+        # A relaunch with a watch already on screen does not stack a second one.
+        with mock.patch.object(fc, "gui_available", lambda: True), \
+             mock.patch.object(fc, "watch_running", lambda n: True), \
+             mock.patch.object(fc.subprocess, "run", lambda *a, **k: calls.append(a[0])):
+            self.assertFalse(fc.open_watch_window("camp", dict(fc.DEFAULTS)))
+        self.assertEqual(len(calls), 1)
+        # And a campaign authored --no-watch-window never opens one.
+        with mock.patch.object(fc, "gui_available", lambda: True), \
+             mock.patch.object(fc.subprocess, "run", lambda *a, **k: calls.append(a[0])):
+            self.assertFalse(fc.open_watch_window("camp", dict(fc.DEFAULTS, watch_window=False)))
+        self.assertEqual(len(calls), 1)
+
+    def test_watch_running_matches_only_a_watch_of_this_campaign(self):
+        def with_procs(procs, name):
+            with mock.patch.object(fc, "running_processes", lambda p: procs):
+                return fc.watch_running(name)
+        watch = [(1, "/usr/bin/python3 scripts/fuzz-campaign.py status camp -w")]
+        self.assertTrue(with_procs(watch, "camp"))
+        self.assertFalse(with_procs(watch, "cam"))
+        self.assertTrue(with_procs([(2, "python3 fuzz-campaign.py status camp --watch")], "camp"))
+        self.assertFalse(with_procs([(3, "python3 fuzz-campaign.py status camp")], "camp"))
+        self.assertFalse(with_procs([(4, "python3 fuzz-campaign.py status camp2 -w")], "camp"))
+
+    def test_notify_is_an_osascript_and_never_raises(self):
+        calls = []
+        with mock.patch.object(fc, "gui_available", lambda: True), \
+             mock.patch.object(fc.subprocess, "run", lambda *a, **k: calls.append(a[0])):
+            self.assertTrue(fc.notify("camp", "FUZZING", 'cfg "x"'))
+        self.assertEqual(calls[0][:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('title "fuzz-campaign camp"', calls[0][2])
+        self.assertIn('subtitle "FUZZING"', calls[0][2])
+        self.assertIn('cfg \\"x\\"', calls[0][2])            # quotes escaped, not injected
+
+        def boom(*a, **k):
+            raise OSError("no session")
+        with mock.patch.object(fc, "gui_available", lambda: True), \
+             mock.patch.object(fc.subprocess, "run", boom), \
+             mock.patch.object(fc, "log", lambda m: None):
+            self.assertFalse(fc.notify("camp", "HALTED", "x"))
+
+    def test_gui_side_effects_are_off_outside_macos_or_when_opted_out(self):
+        env = {k: v for k, v in os.environ.items() if k != "FUZZ_NO_GUI"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(fc.sys, "platform", "darwin"):
+                self.assertTrue(fc.gui_available())
+            with mock.patch.object(fc.sys, "platform", "linux"):
+                self.assertFalse(fc.gui_available())
+        with mock.patch.dict(os.environ, {"FUZZ_NO_GUI": "1"}), \
+             mock.patch.object(fc.sys, "platform", "darwin"):
+            self.assertFalse(fc.gui_available())
+
+    def test_only_the_transitions_worth_looking_up_for_notify(self):
+        posted = []
+        with mock.patch.object(fc, "notify", lambda *a: posted.append(a[1])), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            s = fc.init_state("camp")
+            for what in ("booting", "preparing", "fuzzing", "collecting", "triaging"):
+                fc.set_activity(s, what, "x")
+        self.assertEqual(posted, ["FUZZING", "TRIAGING"])
+
+
+class TriageAdvanceActivityTest(unittest.TestCase):
+    def test_an_advance_names_the_bug_stage_and_count(self):
+        s = fc.init_state("camp")
+        s.update(phase="triaging", triage_job="camp_t1", triage_bug_sig="S")
+        d = dict(fc.DEFAULTS, triage_max_boots=40)
+        posted = []
+        with mock.patch.object(fc, "triage", lambda *a, **k: (0, "")), \
+             mock.patch.object(fc, "triage_state", lambda job: {"stage": "MINIMIZE_CALLS"}), \
+             mock.patch.object(fc, "route_triage_panics", lambda *a: None), \
+             mock.patch.object(fc, "queue_second_bugs", lambda *a: None), \
+             mock.patch.object(fc, "wait_for_stop", lambda *a: None), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "notify", lambda *a: posted.append(a[2])), \
+             mock.patch.object(fc, "log", lambda m: None):
+            fc.advance_triage(s, d)
+        self.assertIn("bug S: advance 1/40, MINIMIZE_CALLS", posted)
+        self.assertEqual(s["activity"], "triaging")
+        self.assertEqual(s["activity_detail"], "bug S")      # per bug, not per advance
