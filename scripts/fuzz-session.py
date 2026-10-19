@@ -73,6 +73,7 @@ from lib import bootinfo  # noqa: E402
 from lib import cfgutil  # noqa: E402
 from lib import timefmt  # noqa: E402
 from lib.fsutil import hardlink_or_copy  # noqa: E402
+from lib.style import style, GLYPH  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -127,38 +128,6 @@ DEFAULT_EXECUTORS = 1   # single device == single executor; override with -e/--n
 
 # Metrics pulled from the last bench record. Keys are syz-manager stat names.
 BENCH_KEYS = ("coverage", "corpus", "exec total", "crashes", "crash types", "uptime")
-
-
-# ---- terminal colouring ----------------------------------------------------
-class _Style:
-    """ANSI colouring that switches itself off when output is not a terminal.
-
-    Piping lint into grep/a file must stay plain text, so escape codes are only
-    emitted on a real tty. Honours the NO_COLOR convention and TERM=dumb.
-    """
-    CODES = {"red": "31", "green": "32", "yellow": "33",
-             "cyan": "36", "grey": "90", "bold": "1"}
-
-    def __init__(self, enabled):
-        self.enabled = enabled
-
-    def __call__(self, text, *names):
-        if not self.enabled or not names:
-            return text
-        return "\033[%sm%s\033[0m" % (";".join(self.CODES[n] for n in names), text)
-
-
-style = _Style(
-    os.environ.get("NO_COLOR") is None
-    and os.environ.get("TERM") != "dumb"
-    and hasattr(sys.stdout, "isatty") and sys.stdout.isatty())
-
-# Tick/cross read better than ASCII, but a non-UTF-8 stdout would raise on
-# print, so fall back rather than risk crashing the lint over decoration.
-if (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") == "utf8":
-    GLYPH = {"ok": "✓", "error": "✗", "warn": "!", "note": "·"}
-else:
-    GLYPH = {"ok": "*", "error": "x", "warn": "!", "note": "-"}
 
 
 # ---- small helpers ---------------------------------------------------------
@@ -815,6 +784,13 @@ def cmd_inspect(target):
         "boot_epoch": boot_epoch(),
         "exec_total": et if et != "" else None,
         "coverage": int(stats["coverage"]) if stats.get("coverage") not in ("", None) else None,
+        # Basic blocks from the on-disk cover logs, not the manager's stats:
+        # readable after a crash, after a stop, and from another account. bb_all
+        # is the union over this run and the archived ones -- the most this
+        # workdir's corpus has ever reached.
+        "cover_log": str(cover_log_path(state)),
+        "bb_run": bb_unique([cover_log_path(state)]),
+        "bb_all": bb_unique([cover_log_path(state)] + cover_log_archives(workdir)),
         "rate": stats.get("rate") if stats.get("rate") != "" else None,
         "reports": [str(p) for p in reports],
         "panic_evidence": bool(panics),
@@ -1933,9 +1909,23 @@ def status_lines(sid, rawcover=False):
     ev = crash_events(state)
     http = state.get("http", "")
     execs = live_executors(state)
+    # Headline: alive or not, with the two numbers that say whether it is doing
+    # anything. The word is coloured on a tty so it reads from across the room.
+    status = state.get("status") or "?"
+    alive = status == "running" and state_pid_alive(state)
+    if alive:
+        head = "%s (pid %s, %d executor%s, up %s, %s exec/s)" % (
+            style(status.upper(), "green", "bold"), state.get("pid"), len(execs),
+            "" if len(execs) == 1 else "s", fmt_uptime(m["uptime"]), rl["rate"] or "-")
+    else:
+        head = "%s (since %s)" % (
+            style(status.upper(), "red" if status == "crashed" else "yellow", "bold"),
+            state.get("stopped_at") or "?")
     L = [
         "session   : %s" % sid,
-        "status    : %s" % state.get("status"),
+        "status    : %s" % head,
+        "",
+        "-- process --",
         "config    : %s" % state.get("config"),
         "workdir   : %s" % workdir,
         "http      : %s" % (("http://%s" % http) if http else "-"),
@@ -1971,6 +1961,7 @@ def status_lines(sid, rawcover=False):
         else:
             bb = "- (cover_log not set; add kext_coverage.cover_log, or --rawcover)"
     L += [
+        "",
         "-- metrics (run log = live ~10s; bench = ~60s) --",
         "coverage   : %s (syz signal)" % (rl["coverage"] or m["coverage"] or "-"),
         "basic blks : %s" % bb,
@@ -1978,6 +1969,8 @@ def status_lines(sid, rawcover=False):
         "exec total : %s (this run) / %s (all runs)" % (
             rl["exec total"] or m["exec total"] or "-", lifetime or "-"),
         "exec rate  : %s/sec" % (rl["rate"] or "-"),
+        "",
+        "-- incidents --",
         "incidents  : %s crash / %s hang (+%s snapshot) collected" % (
             ev.get("crash", 0), ev.get("hang", 0), ev.get("snapshot", 0)),
         "crash types: %s" % (m["crash types"] or "-"),

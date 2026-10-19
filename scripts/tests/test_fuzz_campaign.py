@@ -2096,6 +2096,54 @@ class ActivityTest(unittest.TestCase):
             fc._set_status("camp", "running")
         self.assertEqual(fc.load_state("camp")["activity"], "waiting")
 
+    def test_status_puts_the_activity_second_with_its_duration(self):
+        from datetime import datetime, timedelta, timezone
+        cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
+        s = fc.init_state("camp")
+        s.update(activity="triaging", activity_detail="bug S",
+                 activity_since=(datetime.now(timezone.utc)
+                                 - timedelta(minutes=12)).isoformat())
+        lines = self._status(s, cfg)
+        # The headline IS the activity; there is no separate "running" line.
+        self.assertTrue(lines[0].startswith("campaign camp : TRIAGING"), lines[0])
+        self.assertIn("TRIAGING bug S", lines[0])
+        self.assertIn("for %s" % fc.fmt_hms(12 * 60 + 4), lines[0])
+        self.assertNotIn("running", lines[0])
+        # The old phase row is folded into it, and the block is grouped.
+        self.assertFalse(any(ln.strip().startswith("phase") for ln in lines))
+        self.assertIn("", lines)
+
+    def test_status_colours_the_word_only_when_asked(self):
+        cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
+        s = fc.init_state("camp")
+        fc.set_activity(s, "fuzzing", "cfg")
+        plain = self._status(s, cfg, colour=False)[0]
+        coloured = self._status(s, cfg, colour=True)[0]
+        self.assertNotIn("\033[", plain)
+        self.assertIn("\033[32;1mFUZZING\033[0m cfg", coloured)   # green, word only
+
+    def test_status_before_any_activity_falls_back_to_the_phase(self):
+        cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
+        s = fc.init_state("camp")
+        s.pop("activity")        # a state file written before activity existed
+        head = self._status(s, cfg)[0]
+        self.assertIn("running", head)             # the status still says something here
+        self.assertIn("phase fuzzing", head)
+
+    def test_list_shows_the_activity(self):
+        camps = self.dir / "camps"
+        camps.mkdir()
+        (camps / "camp.json").write_text("{}")
+        s = fc.init_state("camp")
+        fc.set_activity(s, "fuzzing", "cfg")
+        buf = io.StringIO()
+        with mock.patch.object(fc, "CAMPAIGN_DIR", camps), \
+             mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[], name=n)), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             contextlib.redirect_stdout(buf):
+            fc.cmd_list()
+        self.assertIn("FUZZING %s" % fc.fmt_hms(0), buf.getvalue())
+        self.assertNotIn("running", buf.getvalue())   # the activity IS the status column
 
 
 class GlanceTest(unittest.TestCase):
@@ -2201,3 +2249,298 @@ class TriageAdvanceActivityTest(unittest.TestCase):
         self.assertIn("bug S: advance 1/40, MINIMIZE_CALLS", posted)
         self.assertEqual(s["activity"], "triaging")
         self.assertEqual(s["activity_detail"], "bug S")      # per bug, not per advance
+
+
+class HaltedHeadlineTest(unittest.TestCase):
+    def test_a_halted_campaign_says_it_once(self):
+        """Status, activity and halt reason used to be three lines saying the
+        same thing; the halt reason is only repeated when it adds something."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            cfg = write_cfg(d, {"target": "darwin/arm64", "workdir": str(d)})
+            s = fc.init_state("camp")
+            s.update(status="halted", halt_reason="crash loop (15 crashes)")
+            with mock.patch.object(fc, "STATE_DIR", d / "state"), \
+                 mock.patch.object(fc, "load_state", lambda n: s), \
+                 mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+                 mock.patch.object(fc, "free_gb", lambda: 100.0), \
+                 mock.patch.object(fc, "style", type(fc.style)(False)):
+                fc.save_state(s)                      # the hook sets activity=halted
+                lines, _ = fc.status_lines("camp")
+        self.assertTrue(lines[0].startswith(
+            "campaign camp : HALTED/CRASH-LOOP crash loop (15 crashes)"), lines[0])
+        self.assertEqual(sum("crash loop (15" in ln for ln in lines), 1)
+
+    def test_the_kind_of_stop_is_read_from_the_reason(self):
+        """Every halt path writes a reason in its own words; the kind is what
+        you need first, so it is recognised from them rather than stored."""
+        for reason, kind in [
+                ("brake: /Users/Shared/fuzz-run/STOP -- boot loop 03:12", "brake"),
+                ("halted by user", "user"), ("stopped by user", "user"),
+                ("crash loop (15 crashes in a row before 50 programs executed)", "crash-loop"),
+                ("low disk (12.0GB free < 20.0GB)", "disk"),
+                ("syz-manager failed to start 5 times in a row (died before ...)", "startup"),
+                ("triage stuck on S after 40 boots (job j)", "triage"),
+                ("triage job j hung and the box must be rebooted, but ...", "triage"),
+                ("every config was abandoned (max_crashes)", "abandoned"),
+                ("could not start session for x.cfg", "error"), (None, "?")]:
+            self.assertEqual(fc.halt_kind(reason), kind, reason)
+        s = fc.init_state("camp")
+        s.update(activity="halted", halt_reason="brake: STOP")
+        self.assertEqual(fc.activity_word(s), "HALTED/BRAKE")
+
+
+class StopPlanTest(unittest.TestCase):
+    """What is left of the current config's budget, named by its clock."""
+
+    def _d(self, clock="fuzz", hours=24):
+        return dict(fc.DEFAULTS, budget_clock=clock,
+                    items=[{"config": "/c/cfg.cfg", "budget_seconds": hours * 3600}])
+
+    def test_fuzz_clock_counts_fuzzing_left(self):
+        s = fc.init_state("camp")
+        s["active_seconds"] = 6 * 3600
+        self.assertEqual(fc.stop_plan(s, self._d()),
+                         "%s / %s (fuzzing)" % (fc.fmt_hms(18 * 3600), fc.fmt_hms(24 * 3600)))
+        self.assertEqual(fc.stop_plan(s, self._d(clock="wall")),
+                         "%s / %s (total)" % (fc.fmt_hms(18 * 3600), fc.fmt_hms(24 * 3600)))
+
+    def test_real_clock_names_the_moment(self):
+        from datetime import datetime, timedelta, timezone
+        s = fc.init_state("camp")
+        t0 = datetime.now(timezone.utc) - timedelta(hours=1)
+        s["config_started_at"] = t0.isoformat()
+        self.assertEqual(fc.stop_plan(s, self._d(clock="real", hours=2)),
+                         "at %s (%s, real)" % (fc.timefmt.fmt_epoch(t0.timestamp() + 7200, short=True),
+                                                fc.fmt_hms(7200)))
+
+    def test_a_stopped_campaign_has_nothing_left(self):
+        s = fc.init_state("camp")
+        s["status"] = "halted"
+        self.assertIsNone(fc.stop_plan(s, self._d()))
+
+    def test_status_and_list_show_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            cfg = write_cfg(d, {"target": "darwin/arm64", "workdir": str(d)})
+            camps = d / "camps"
+            camps.mkdir()
+            (camps / "camp.json").write_text("{}")
+            s = fc.init_state("camp")
+            s["current_config"] = str(cfg)
+            fc.set_activity(s, "fuzzing", "cfg", save=False)
+            buf = io.StringIO()
+            with mock.patch.object(fc, "STATE_DIR", d / "state"), \
+                 mock.patch.object(fc, "CAMPAIGN_DIR", camps), \
+                 mock.patch.object(fc, "load_state", lambda n: s), \
+                 mock.patch.object(fc, "load_def", lambda n: dict(
+                     fc.DEFAULTS, budget_clock="fuzz", items=[
+                         {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+                 mock.patch.object(fc, "free_gb", lambda: 100.0), \
+                 mock.patch.object(fc, "style", type(fc.style)(False)), \
+                 contextlib.redirect_stdout(buf):
+                lines, _ = fc.status_lines("camp")
+                fc.cmd_list()
+        self.assertTrue(lines[1].startswith("  updated       : "), lines[1])
+        # Under the session header: it is this config's budget, not the campaign's end.
+        self.assertIn("    stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)),
+                      lines)
+        self.assertLess(lines.index("  session (1/1 - no loop):"),
+                        lines.index("    stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600))))
+        self.assertIn("STOP ", buf.getvalue())
+        self.assertNotIn("THEN", buf.getvalue())
+        self.assertIn("%s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)), buf.getvalue())
+
+
+class BasicBlocksTest(unittest.TestCase):
+    """Coverage in status is basic blocks from the cover logs. The manager's
+    `coverage` stat is its signal count and used to be printed under that name."""
+
+    def test_note_coverage_keeps_the_max_per_config(self):
+        s = fc.init_state("camp")
+        fc.note_coverage(s, "a", {"bb_all": 300})
+        fc.note_coverage(s, "a", {"bb_all": 250})       # a pruned archive: not a loss
+        fc.note_coverage(s, "b", {"bb_all": 40})
+        fc.note_coverage(s, "b", {})                     # no cover log: nothing to say
+        self.assertEqual(s["bb_covered"], {"a": 300, "b": 40})
+
+    def _status(self, s, cfg, live):
+        with mock.patch.object(fc, "STATE_DIR", cfg.parent / "state"), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                 {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+             mock.patch.object(fc, "inspect", lambda sid: live), \
+             mock.patch.object(fc, "free_gb", lambda: 100.0), \
+             mock.patch.object(fc, "style", type(fc.style)(False)):
+            return fc.status_lines("camp")[0]
+
+    def test_status_reads_blocks_from_the_logs_and_names_the_signal_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
+            s = fc.init_state("camp")
+            s.update(session_id="a", current_config=str(cfg), bb_covered={"a": 900, "b": 40})
+            lines = self._status(s, cfg, {"found": True, "bb_all": 1204, "bb_run": 317,
+                                          "coverage": 9412})
+            rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
+            self.assertIn("317 (total: 1,204)", rows["basic blocks"])
+            self.assertIn("b 40", rows["earlier cfgs"])
+            self.assertIn("9412  (syz-manager's coverage stat, not blocks)", rows["signal"])
+            self.assertNotIn("coverage", rows)
+            # Manager gone (post-crash, or a halted campaign): the recorded max stands.
+            lines = self._status(s, cfg, {"found": False})
+            rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
+            self.assertIn("- (total: 900)", rows["basic blocks"])
+
+
+class TriageBlockTest(unittest.TestCase):
+    """The triage block: one fact per row, read from the job's checkpoint."""
+
+    def _lines(self, job_state, boots=7):
+        s = fc.init_state("camp")
+        s.update(phase="triaging", triage_job="j", triage_boots=boots)
+        rows = []
+        with mock.patch.object(fc, "triage_state", lambda job: job_state):
+            return fc.triage_lines(s, dict(fc.DEFAULTS, triage_max_boots=40),
+                                   lambda *a: rows.append(a))
+
+    def test_minimization_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "call_state.json").write_text(json.dumps(
+                {"n_units": 40, "memo": {"a": True, "b": False, "c": False},
+                 "attempting": "ff", "untestable": ["x"]}))
+            lines = self._lines({"stage": "MINIMIZE_CALLS", "dir": tmp,
+                                 "incidents": [{}, {"other": True}], "hangs": [{}],
+                                 "other_bugs": {"beef01": {}}})
+        self.assertEqual(lines[0], "  triage (job j, boot 7 / 40):")
+        got = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines[1:]}
+        self.assertEqual(got["stage"], "MINIMIZE_CALLS")
+        self.assertEqual(got["progress"],
+                         "3 subsets tested for 40 calls, 1 crashing  (1 over the 64-call limit)")
+        self.assertEqual(got["other bugs"], "1 panic(s): beef01")
+        self.assertNotIn("panics", got)       # the target's panics are the "crashed" count
+        self.assertEqual(got["hangs"], "1")
+
+    def test_replay_stage_and_a_job_not_started(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "replay_state.json").write_text(json.dumps(
+                {"pending": "verify", "pending_slot": "slot_0002", "slots": 5}))
+            lines = self._lines({"stage": "REPLAY_RING", "dir": tmp, "incidents": []})
+        self.assertIn("    progress    : verify pass at slot slot_0002 of 5 slots", lines)
+        lines = self._lines(None, boots=1)
+        self.assertIn("    stage       : starting", lines)
+        self.assertEqual(lines[0], "  triage (job j, boot 1 / 40):")
+
+
+class AnomalyColourTest(unittest.TestCase):
+    """Colour marks anomalies only; normal rows stay plain, and strings that
+    double as notification bodies are never coloured."""
+
+    def test_kext_mismatch_is_coloured_for_status_only(self):
+        inc = {"at": "2026-10-19T10:00:00+00:00", "kind": "crash", "config": "/c/x.cfg",
+               "ran_seconds": 5, "crashing_kext": "IOSurface", "kext_match": False,
+               "fuzzed_kext": "AppleSMC"}
+        with mock.patch.object(fc, "style", type(fc.style)(True)):
+            self.assertNotIn("\033[", fc.incident_line(inc))            # notification body
+            self.assertIn("\033[33;1m (NOT the fuzzed AppleSMC)\033[0m",
+                          fc.incident_line(inc, colour=True))
+
+    def test_stale_state_and_dead_manager_under_fuzzing_go_red(self):
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
+            s = fc.init_state("camp")
+            s.update(session_id="a", current_config=str(cfg), activity="fuzzing",
+                     activity_since=fc.now_iso(),
+                     updated_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
+            live = {"found": True, "pid_alive": False, "http": "127.0.0.1:1"}
+            with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
+                 mock.patch.object(fc, "load_state", lambda n: s), \
+                 mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 mock.patch.object(fc, "inspect", lambda sid: live), \
+                 mock.patch.object(fc, "free_gb", lambda: 100.0), \
+                 mock.patch.object(fc, "style", type(fc.style)(True)):
+                lines, _ = fc.status_lines("camp")
+                s["activity"] = "triaging"
+                s["updated_at"] = fc.now_iso()
+                calm, _ = fc.status_lines("camp")
+        rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
+        self.assertIn("\033[31;1m", rows["updated"])
+        self.assertIn("\033[31;1m  (manager down)\033[0m", rows["web ui"])
+        rows = {ln.split(":")[0].strip(): ln for ln in calm if ":" in ln}
+        self.assertNotIn("\033[", rows["updated"])
+        self.assertNotIn("\033[", rows["web ui"])          # expected while triaging
+
+
+class QuarantineViewTest(unittest.TestCase):
+    """What the quarantine took out of the search space: one line in status,
+    the full picture from `quarantine <name>`."""
+
+    def _qs(self):
+        qs = fc.qm.init_state(config="/c/x.cfg")
+        fc.qm.on_crash(qs, "HARD1")                                    # suspect
+        fc.qm.on_crash(qs, "HARD1", seq=["syz_IOConnectCallMethod$X_5"])  # confirmed HARD
+        fc.qm.on_crash(qs, "SOFT1")
+        fc.qm.on_crash(qs, "SOFT1", seq=["syz_IOConnectCallMethod$X_2",
+                                         "syz_IOConnectCallMethod$X_7"])  # SOFT group
+        fc.qm.on_crash(qs, "NEW1")                                     # still suspect
+        return qs
+
+    def test_summary_counts_what_is_benched_and_why(self):
+        self.assertEqual(fc.quarantine_summary(fc.qm.init_state()), "none")
+        self.assertEqual(fc.quarantine_summary(fc.qm.init_state(), 38), "0 / 38 disabled")
+        self.assertEqual(fc.quarantine_summary(self._qs()),
+                         "2 disabled (1 hard, 1 soft), 1 suspect")
+        self.assertEqual(fc.quarantine_summary(self._qs(), 38),
+                         "2 / 38 disabled (1 hard, 1 soft), 1 suspect")
+
+    def test_benchable_syscalls_resolves_globs_and_skips_service_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sys/darwin").mkdir(parents=True)
+            (root / "sys/darwin/iokit_X.txt").write_text(
+                "syz_IOServiceOpen$X_Client(name ptr[in, string])\n"
+                "syz_IOConnectCallMethod$X_Client_0(c connection)\n"
+                "syz_IOConnectCallMethod$X_Client_1(c connection)\n"
+                "syz_IOConnectTrap$X_Client_0(c connection)\n"
+                "\tnot_a_syscall(indented)\n"
+                "syz_IOConnectCallMethod$Y_Client_0(c connection)\n")
+            cfg = write_cfg(root, {"target": "darwin/arm64", "enable_syscalls": [
+                "syz_IOServiceOpen$X_Client", "syz_IOConnectCallMethod$X_Client_*",
+                "syz_IOConnectTrap$X_Client_0"]})
+            with mock.patch.object(fc, "REPO_ROOT", root):
+                self.assertEqual(fc.benchable_syscalls(str(cfg)), [
+                    "syz_IOConnectCallMethod$X_Client_0", "syz_IOConnectCallMethod$X_Client_1",
+                    "syz_IOConnectTrap$X_Client_0"])
+            with mock.patch.object(fc, "REPO_ROOT", root / "elsewhere"):
+                self.assertIsNone(fc.benchable_syscalls(str(cfg)))   # no descriptions here
+
+    def test_detailed_view_is_one_row_per_crash_with_short_selectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_cfg(Path(tmp), {"target": "darwin/arm64"})
+            with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
+                 mock.patch.object(fc, "benchable_syscalls", lambda c: None):
+                lines = fc.quarantine_lines(str(cfg), self._qs())
+        self.assertEqual(lines[0], "quarantine for target : 2 disabled (1 hard, 1 soft), 1 suspect")
+        self.assertEqual(lines[1], "  selectors are syz_IOConnectCallMethod$<name>")
+        rows = {ln.split()[0]: ln.split() for ln in lines if ln.startswith("  ") and
+                ln.split() and ln.split()[0] in ("HARD1", "SOFT1", "NEW1")}
+        self.assertEqual(rows["HARD1"][1:], ["HARD", "disabled", "2", "X_5*"])
+        self.assertEqual(rows["SOFT1"][1:], ["SOFT", "rotating", "2", "X_2*,", "X_7"])
+        self.assertEqual(rows["NEW1"][1:], ["SUSPECT", "watching", "1", "-"])
+        i = lines.index("  disabled now (2):")
+        self.assertEqual(lines[i + 1:i + 3], ["    X_2", "    X_5"])
+        self.assertTrue(lines[-1].startswith("  state        : "), lines[-1])
+        self.assertFalse(any("escaped" in ln for ln in lines))   # column only when nonzero
+
+    def test_short_selectors_keep_kinds_apart_only_when_mixed(self):
+        short, header = fc.short_selectors(["syz_IOConnectCallMethod$A_2", "syz_IOConnectCallMethod$B_2"])
+        self.assertEqual(short, {"syz_IOConnectCallMethod$A_2": "A_2", "syz_IOConnectCallMethod$B_2": "B_2"})
+        self.assertEqual(header, "selectors are syz_IOConnectCallMethod$<name>")
+        short, header = fc.short_selectors(["syz_IOConnectCallMethod$A_2", "syz_IOConnectTrap$A_2"])
+        self.assertEqual(short, {"syz_IOConnectCallMethod$A_2": "call$A_2",
+                                 "syz_IOConnectTrap$A_2": "trap$A_2"})
+        self.assertIn("call$ = syz_IOConnectCallMethod$", header)

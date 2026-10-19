@@ -25,6 +25,7 @@ Commands:
   new <name> <config...> [--budget-hours H] [--loop] ...   author a campaign
   run <name>                     the supervision loop (what launchd invokes)
   status <name>                  campaign runtime state
+  quarantine <name> [--all]      what the quarantine has benched, and why
   list                           all campaigns
   halt <name> / resume <name>    manual stop/continue
   install <name> / uninstall <name>   generate + (un)load the launchd plist
@@ -73,6 +74,7 @@ import triage as tri  # noqa: E402  (job outcome constants only; runs as a subpr
 from lib import bootinfo  # noqa: E402
 from lib import cfgutil  # noqa: E402
 from lib import timefmt  # noqa: E402
+from lib.style import style  # noqa: E402
 from lib.tablefmt import render, tabulate  # noqa: E402
 
 # `syz-ring-repro -emit-json` translates a minimized culprit into the list of
@@ -717,6 +719,69 @@ def activity_seconds(s):
     t0 = timefmt.to_epoch(s.get("activity_since"))
     return max(0.0, time.time() - t0) if t0 else 0.0
 
+
+# Which stop a halt was, recognised from the reason the halt path wrote. The
+# kind is what you need first -- "did I do this, did the brake, or did the
+# breaker" -- and it is derived here rather than stored so every halt path,
+# including the ones in other commands, gets it for free.
+HALT_KINDS = (("brake", "brake:"), ("user", "by user"), ("crash-loop", "crash loop"),
+              ("disk", "low disk"), ("startup", "failed to start"),
+              ("triage", "triage"), ("abandoned", "every config was abandoned"))
+
+
+def halt_kind(reason):
+    r = (reason or "").lower()
+    for kind, needle in HALT_KINDS:
+        if needle in r:
+            return kind
+    return "error" if reason else "?"
+
+
+def stop_plan(s, d):
+    """What is left of the current config's budget over the budget, with the
+    clock it is measured on: '17h18m / 24h00m (fuzzing)', '3h00m / 8h00m
+    (total)', or for the real clock the moment itself, 'at 19/10 16:00 (2h00m,
+    real)'. None once the campaign has stopped."""
+    if s.get("status") in ("halted", "done") or not d["items"]:
+        return None
+    item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
+    clock = d.get("budget_clock", "wall")
+    budget = item["budget_seconds"]
+    left = max(0.0, budget - budget_spent(s, d))
+    if clock == "real":
+        # The only clock that names a moment: it runs through halts and reboots.
+        t0 = timefmt.to_epoch(s.get("config_started_at"))
+        if t0:
+            return "at %s (%s, real)" % (timefmt.fmt_epoch(t0 + budget, short=True),
+                                         fmt_hms(budget))
+        return "%s / %s (real)" % (fmt_hms(left), fmt_hms(budget))
+    return "%s / %s (%s)" % (fmt_hms(left), fmt_hms(budget),
+                             "fuzzing" if clock == "fuzz" else "total")
+
+
+def activity_word(s):
+    """'FUZZING', or for a halt the kind of stop too: 'HALTED/BRAKE'."""
+    what = s.get("activity") or ""
+    if what == "halted":
+        return "HALTED/%s" % halt_kind(s.get("halt_reason")).upper()
+    return what.upper()
+
+
+def activity_text(s, colour=False):
+    """'TRIAGING bug 3f2a (job t-0012, MINIMIZE_CALLS, advance 7/40)  for 00:12:04'.
+
+    Only the word is coloured, and only on a tty: the point is reading the phase
+    from across the room in the auto-opened window, not decoration."""
+    what = s.get("activity")
+    if not what:        # a state file from before activity existed
+        return "%s  (no activity recorded yet; phase %s)" % (s.get("status", "?"),
+                                                             s.get("phase", "fuzzing"))
+    word = activity_word(s)
+    if colour:
+        word = style(word, ACTIVITY_COLOUR.get(what, "yellow"), "bold")
+    detail = s.get("activity_detail") or ""
+    return "%s%s  for %s" % (word, " " + detail if detail else "",
+                             fmt_hms(activity_seconds(s)))
 
 
 def notify(name, title, body=""):
@@ -2380,6 +2445,41 @@ def orphaned_session(s, d):
     return {"sid": s["session_id"], "stale_for": stale, "pid": info.get("pid")}
 
 
+def triage_lines(s, d, row):
+    """The triage block of status: the job's stage, how many boots it has had,
+    and what its checkpoint says -- one fact per row, from tri.progress()."""
+    lines = []
+    tst = triage_state(s["triage_job"]) or {}
+    p = tri.progress(tst)
+    # Boots are the stop condition (triage_max_boots), so they go in the header;
+    # the rows are only the stage and how far its search has got. The in-flight
+    # subset and the panic tally are detail for `triage.py status`.
+    lines.append("  triage (job %s, boot %d / %d):"
+                 % (s["triage_job"], s.get("triage_boots", 0), d["triage_max_boots"]))
+
+    def r(label, value, extra=""):
+        lines.append("  %-14s: %s%s" % ("  " + label, value, extra))
+    r("stage", p.get("stage") or "starting")
+    if p.get("unit"):
+        prog = "%d subsets tested for %s %ss, %d crashing" % (
+            p["tested"], p.get("units") or "?", p["unit"], p["hits"])
+        if p.get("untestable"):
+            prog += "  (%d over the 64-call limit)" % p["untestable"]
+        r("progress", prog)
+    elif "replay_pass" in p:
+        r("progress", "%s pass%s of %s slots" % (
+            p["replay_pass"], " at slot %s" % p["slot"] if p.get("slot") else "",
+            p.get("slots") or "?"))
+    # The panics the target caused are the "crashed" count above; only panics
+    # from OTHER bugs add anything, so that is the only row.
+    if p.get("other_panics"):
+        r("other bugs", "%d panic(s): %s" % (p["other_panics"],
+                                             ", ".join(p["other_bugs"]) or "?"))
+    if p.get("hangs"):
+        r("hangs", "%d" % p["hangs"])
+    return lines
+
+
 def status_lines(name, prev=None):
     """The status block as a list of lines, plus a sample dict for the next call.
 
@@ -2392,15 +2492,32 @@ def status_lines(name, prev=None):
     out = []
 
     def row(label, value, extra=""):
-        out.append("  %-12s: %s%s" % (label, value, extra))
+        out.append("  %-14s: %s%s" % (label, value, extra))
 
-    out.append("campaign %s : %s" % (name, s["status"]))
-    if s.get("halt_reason"):
-        row("halt reason", s["halt_reason"])
+    # The headline IS the activity: "halted"/"done" are activity words and any
+    # other word means running, so a separate status line would only repeat it.
+    # This is the one line you read between two panics.
+    out.append("campaign %s : %s" % (name, activity_text(s, colour=True)))
+    # When the driver last wrote the state: everything below is read from that
+    # file, so this is how fresh the screen is. A FUZZING headline over a stale
+    # stamp means the driver is dead (the NO SUPERVISOR warning spells it out).
+    # Colour only marks anomalies: a stamp older than the orphan threshold goes
+    # red, and the same for the four other "look here" strings in this view.
+    t_upd = timefmt.to_epoch(s.get("updated_at"))
+    age = ""
+    if t_upd:
+        age = "  (%s ago)" % fmt_hms(time.time() - t_upd)
+        if s.get("status") == "running" and \
+                time.time() - t_upd >= max(2.5 * d["poll_seconds"], 120):
+            age = style(age, "red", "bold")
+    row("updated", "%s%s" % (timefmt.fmt(s.get("updated_at")), age))
+    if s.get("halt_reason") and s["halt_reason"] != s.get("activity_detail"):
+        row("halt reason", s["halt_reason"])    # the headline already has it otherwise
     orphan = orphaned_session(s, d)
     if orphan:
-        out.append("  !! NO SUPERVISOR: the state has not been written for %s "
-                   "(poll is %ds)." % (fmt_hms(orphan["stale_for"]), d["poll_seconds"]))
+        out.append("  %s the state has not been written for %s (poll is %ds)."
+                   % (style("!! NO SUPERVISOR:", "red", "bold"),
+                      fmt_hms(orphan["stale_for"]), d["poll_seconds"]))
         out.append("     The manager is still fuzzing, unwatched: no budget is "
                    "enforced, no crash")
         out.append("     is filed, and it holds /dev/pishi against the next "
@@ -2408,28 +2525,70 @@ def status_lines(name, prev=None):
         out.append("       fuzz-session.py stop %s" % orphan["sid"])
     held = brake_held(name)
     if held:
-        row("BRAKE", "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
-    row("configs", "%d (loop=%s)" % (len(d["items"]), d["loop"]))
-    row("cursor", "%d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])))
+        row(style("BRAKE", "red", "bold"), "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
+
+    live = inspect(s["session_id"]) if s.get("session_id") else {}
+
+    out.append("")
+    # The campaign's own start is the session's for a single-config campaign
+    # (stamped a few seconds apart); it earns a block of its own only once the
+    # campaign has moved on from its first config.
+    if s.get("phase") == "triaging" and s.get("triage_job"):
+        out.extend(triage_lines(s, d, row))
+        out.append("")
+
+    t_camp, t_cfg = (timefmt.to_epoch(s.get("started_at")),
+                     timefmt.to_epoch(s.get("config_started_at")))
+    if t_camp is None or t_cfg is None or abs(t_camp - t_cfg) > 60:
+        out.append("  campaign:")
+        row("  started", timefmt.fmt(s.get("started_at")))
+        out.append("")
 
     cfg = s.get("current_config")
     if cfg:
         item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-        row("current", config_id(cfg))
-        row("budget", "%.2f / %.2f h used (%s clock, this config)"
-            % (budget_spent(s, d) / 3600, item["budget_seconds"] / 3600,
-               d.get("budget_clock", "wall")))
+        out.append("  session (%d/%d - %s):"
+                   % (min(s["cursor"] + 1, len(d["items"])), len(d["items"]),
+                      "loops" if d["loop"] else "no loop"))
+        row("  config", config_id(cfg))
+        # What is left of THIS config's budget, on its clock -- not the
+        # campaign's end: the header says whether more configs or a loop follow.
+        # A fuzz-clock budget does not move while triaging, so it can read the
+        # same across a whole minimization.
+        left = stop_plan(s, d)
+        if left:
+            row("  stop", left)
+        # The manager's UI: coverage browser, corpus, crash list. Only meaningful
+        # while the manager is actually serving, so it is shown with that caveat
+        # rather than as a link that may quietly not answer.
+        if live.get("http"):
+            url = live["http"]
+            if not url.startswith("http"):
+                url = "http://%s" % url
+            if live.get("pid_alive"):
+                row("  web ui", url)
+            else:
+                # Expected while triaging or collecting; wrong under FUZZING.
+                down = "  (manager down)"
+                if s.get("activity") == "fuzzing":
+                    down = style(down, "red", "bold")
+                row("  web ui", url + down)
         if s.get("config_started_at"):
-            row("config start", timefmt.fmt(s["config_started_at"]))
+            row("  started", timefmt.fmt(s["config_started_at"]))
         # A config is a workdir. Say plainly whether this run inherited a corpus.
         cf_facts = corpus_facts(cfg)
         if cf_facts:
-            row("corpus", "%s  (%.0f KB, last grew %s)"
+            row("  corpus", "%s  (%.0f KB, last grew %s)"
                 % (Path(cf_facts["workdir"]).name, cf_facts["bytes"] / 1024.0,
                    timefmt.fmt_epoch(cf_facts["mtime"], short=True)),
                 _delta(cf_facts["bytes"], prev.get("corpus_bytes"), "%+d B"))
         else:
-            row("corpus", "none yet -- this config starts from scratch")
+            row("  corpus", "none yet -- this config starts from scratch")
+        # What the quarantine has benched: it narrows the search space while you
+        # are not looking, so a run's coverage is only comparable knowing this.
+        total = benchable_syscalls(cfg)
+        row("  quarantine", quarantine_summary(load_qstate(cfg),
+                                               len(total) if total is not None else None))
 
     # Four clocks, campaign-lifetime (never reset by a config advance). Reported
     # separately because "24h of fuzzing" and "24h of campaign" are different
@@ -2438,80 +2597,98 @@ def status_lines(name, prev=None):
     # (snapshot, grammar compile, executor handshake) is its own line. It still
     # includes the manager re-triaging its corpus and waiting on RPC; for pure
     # execution time `runstats.py show` reads syz-manager's own counter.
-    out.append("  time, whole campaign:")
-    row("  preparing", fmt_hms(lifetime(s, "prep_seconds")),
-        "  (snapshot, grammar compile, until the first exec)")
-    row("  fuzzing", fmt_hms(lifetime(s, "active_seconds")),
-        "  (first exec -> end of run; see runstats.py for execution time)")
-    row("  minimizing", fmt_hms(lifetime(s, "triage_seconds")), "  (triage)")
-    row("  rebooting", fmt_hms(lifetime(s, "overhead_seconds")),
-        "  (panic -> back up, and dead time)")
-    row("  wall", fmt_hms(lifetime_wall(s)), "  (sum of the four)")
+    out.append("")
+    out.append("  time breakdown (whole campaign):")
+    # One-word hints only; the long form is in fuzz-run-setup.md "Reading the
+    # clocks". These repaint every 10s in the watch window.
+    for label, key, hint in (("preparing", "prep_seconds", "until first exec"),
+                             ("fuzzing", "active_seconds", "first exec -> end of run"),
+                             ("minimizing", "triage_seconds", "triage"),
+                             ("rebooting", "overhead_seconds", "panic -> back up")):
+        row("  " + label, fmt_hms(lifetime(s, key)), "  (%s)" % hint)
+    row("  total", fmt_hms(lifetime_wall(s)))
 
     # What the box actually did, not just how long it was up: on this target a
     # campaign can burn an hour of wall clock and execute very little.
-    live = inspect(s["session_id"]) if s.get("session_id") else {}
+    out.append("")
     execs = live.get("exec_total") if live.get("exec_total") is not None \
         else s.get("last_exec_total")
     cov = live.get("coverage")
-    # The manager's UI: coverage browser, corpus, crash list. Only meaningful
-    # while the manager is actually serving, so it is shown with that caveat
-    # rather than as a link that may quietly not answer.
-    if live.get("http"):
-        url = live["http"]
-        if not url.startswith("http"):
-            url = "http://%s" % url
-        row("web ui", url if live.get("pid_alive") else "%s  (manager down)" % url)
-    row("executed", "%s program(s)%s"
+    out.append("  stats:")
+    row("  executed", "%s program(s)%s"
         % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
            "  (%s/sec)" % live.get("rate") if live.get("rate") else ""),
         _delta(execs, prev.get("execs"), "%+,d".replace(",", "")))
+    # Basic blocks come from the cover logs (readable with the manager dead),
+    # never from the manager's `coverage` stat, which is its signal count and
+    # was once printed under this name.
+    covered = s.get("bb_covered") or {}
+    sid = s.get("session_id")
+    bb = live.get("bb_all")
+    if bb is None and sid:
+        bb = covered.get(sid)
+    if bb is not None:
+        # current = this run's log; total = distinct PCs over this run and every
+        # archived run of this config (one set, so a block hit again after a
+        # crash-restart is counted once).
+        this_run = live.get("bb_run")
+        row("  basic blocks", "%s (total: %s)"
+            % ("{:,}".format(int(this_run)) if this_run is not None else "-",
+               "{:,}".format(int(bb))),
+            _delta(_int(bb), prev.get("bb")))
+    others = {k: v for k, v in covered.items() if k != sid}
+    if others:
+        row("    earlier cfgs", "  ".join("%s %s" % (k, "{:,}".format(int(v)))
+                                       for k, v in sorted(others.items())))
     if cov not in (None, ""):
-        row("coverage", "%s basic block(s)" % cov, _delta(_int(cov), prev.get("cov")))
-    row("incidents", "%d crash / %d hang  (this config: %d of max_crashes %d)"
-        % (s["crashes"], s["hangs"], s.get("config_incidents", 0), d["max_crashes"]),
-        _delta(s["crashes"], prev.get("crashes")))
+        row("  signal", "%s  (syz-manager's coverage stat, not blocks)" % cov,
+            _delta(_int(cov), prev.get("cov")))
+    row("  disk free", "%.1f GB" % free_gb())
+
+    out.append("")
+    # config_incidents counts crashes AND hangs; max_crashes is the per-config
+    # limit on that sum (the option predates hang detection).
+    out.append("  incidents (this config: %d / %d):"
+               % (s.get("config_incidents", 0), d["max_crashes"]))
+    row("  crashes", "%d" % s["crashes"], _delta(s["crashes"], prev.get("crashes")))
+    row("  hangs", "%d" % s["hangs"], _delta(s["hangs"], prev.get("hangs")))
+    row("  benched", "%d%s" % (len(s.get("suppressed_sigs") or []),
+                                   "  (%s)" % ", ".join(s["suppressed_sigs"][-3:])
+                                   if s.get("suppressed_sigs") else ""))
     if s.get("startup_failures"):
-        row("startup", "%d failed start(s) in a row (halts at %d): %s"
+        row("  startup", "%d failed start(s) in a row (halts at %d): %s"
             % (s["startup_failures"], d.get("startup_fail_limit",
                                             DEFAULTS["startup_fail_limit"]),
                s.get("last_startup_error") or "?"))
     for a in s.get("abandoned", []):
-        row("abandoned", "%s  (%s, %s)" % (config_id(a["config"]), a.get("reason"),
-                                           timefmt.fmt(a.get("at"), short=True)))
-    row("phase", s.get("phase", "fuzzing"))
-    if s.get("phase") == "triaging":
-        row("triaging", "job %s, bug %s (advance %d/%d)"
-            % (s.get("triage_job"), s.get("triage_bug_sig"),
-               s.get("triage_boots", 0), d["triage_max_boots"]))
-        tst = triage_state(s.get("triage_job")) if s.get("triage_job") else None
-        if tst:
-            row("  progress", tri.progress_line(tri.progress(tst)))
+        row("  abandoned", "%s  (%s, %s)" % (config_id(a["config"]), a.get("reason"),
+                                             timefmt.fmt(a.get("at"), short=True)))
     if s.get("triage_queue"):
-        row("triage queue", "%d second bug(s) waiting: %s"
+        row("  triage queue", "%d second bug(s) waiting: %s"
             % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
     if s.get("exhausted_sigs"):
         why = s.get("exhausted_why") or {}
-        row("exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
+        row("  exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
             % (len(s["exhausted_sigs"]),
                ", ".join("%s %s" % (g, why.get(g, "no-repro"))
                          for g in s["exhausted_sigs"][-3:])))
-    if s.get("suppressed_sigs"):
-        row("benched sigs", "%d (%s)"
-            % (len(s["suppressed_sigs"]), ", ".join(s["suppressed_sigs"][-3:])))
-    row("disk free", "%.1f GB" % free_gb())
-    row("updated", timefmt.fmt(s.get("updated_at")))
-    row("started", timefmt.fmt(s.get("started_at")))
-    for inc in s["incidents"][-5:]:
-        out.append("    - " + incident_line(inc))
 
-    sample = {"execs": execs, "cov": _int(cov), "crashes": s["crashes"],
+    if s["incidents"]:
+        out.append("")
+        out.append("  last %d incident(s):" % min(5, len(s["incidents"])))
+        for inc in s["incidents"][-5:]:
+            out.append("    - " + incident_line(inc, colour=True))
+
+    sample = {"execs": execs, "cov": _int(cov), "bb": _int(bb), "crashes": s["crashes"],
+              "hangs": s["hangs"],
               "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
     return out, sample
 
 
-def incident_line(inc):
-    """One incident for status: when, what, where, and what it turned out to be."""
+def incident_line(inc, colour=False):
+    """One incident for status: when, what, where, and what it turned out to be.
+    colour marks the kext mismatch; off by default because the same line is a
+    notification body."""
     line = "%s  %-7s %s  ran %ss" % (timefmt.fmt(inc["at"]), inc["kind"],
                                      config_id(inc["config"]), inc.get("ran_seconds"))
     if inc.get("signature"):
@@ -2521,7 +2698,8 @@ def incident_line(inc):
     if inc.get("crashing_kext"):
         line += "  in %s" % inc["crashing_kext"]
         if inc.get("kext_match") is False:
-            line += " (NOT the fuzzed %s)" % (inc.get("fuzzed_kext") or "kext")
+            note = " (NOT the fuzzed %s)" % (inc.get("fuzzed_kext") or "kext")
+            line += style(note, "yellow", "bold") if colour else note
     if inc.get("decision"):
         line += "  -> %s" % inc["decision"]
         if inc.get("triage_job"):
@@ -2866,15 +3044,19 @@ def cmd_list():
         name = dp.stem
         d = load_def(name)
         s = load_state(name)
-        status = s["status"]
+        # The activity word with its duration is the status (see status_lines).
+        # Plain, not coloured: escape codes would throw the column widths off.
+        status = ("%s %s" % (activity_word(s), fmt_hms(activity_seconds(s)))
+                  if s.get("activity") else s["status"])
         if brake_held(name):
             status += " (brake)"
         rows.append((name, status,
                      "%d/%d" % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])),
+                     stop_plan(s, d) or "-",
                      "%d/%d" % (s["crashes"], s["hangs"]),
                      fmt_hms(lifetime(s, "active_seconds")),
                      fmt_hms(lifetime_wall(s))))
-    tabulate(rows, ("CAMPAIGN", "STATUS", "CONFIG", "CRASH/HANG", "FUZZED", "WALL"))
+    tabulate(rows, ("CAMPAIGN", "STATUS", "CONFIG", "STOP", "CRASH/HANG", "FUZZED", "TOTAL"))
 
 
 def _set_status(name, status, reason=None):
@@ -3550,6 +3732,163 @@ def save_qstate(cfg, qs):
     qm.save_state(str(qstate_path(cfg)), qs)
 
 
+# The syscall kinds the quarantine can bench. IOServiceOpen/Close are what the
+# others need to run at all, so disabling one would not isolate a crash -- it
+# would turn the whole user client off.
+BENCHABLE_KINDS = ("syz_IOConnectCallMethod", "syz_IOConnectTrap")
+
+
+def benchable_syscalls(cfg):
+    """The config's enabled syscalls the quarantine could bench, resolved
+    against sys/<os>/*.txt the way syz-manager resolves enable_syscalls (exact
+    names and globs). None when the descriptions are not in this tree."""
+    try:
+        conf = cfgutil.load(cfg)
+    except (OSError, ValueError):
+        return None
+    os_name = (conf.get("target") or "darwin/arm64").split("/")[0]
+    desc_dir = REPO_ROOT / "sys" / os_name
+    if not desc_dir.is_dir():
+        return None
+    defined = set()
+    for path in desc_dir.glob("*.txt"):
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if not line or line[0].isspace():        # column-0 declarations only
+                    continue
+                paren = line.find("(")
+                if paren > 0 and not any(c in line[:paren] for c in " \t"):
+                    defined.add(line[:paren])
+        except OSError:
+            continue
+    enabled = set()
+    for pat in conf.get("enable_syscalls") or []:
+        if any(ch in pat for ch in "*?["):
+            enabled.update(n for n in defined if fnmatch.fnmatchcase(n, pat))
+        elif pat in defined:
+            enabled.add(pat)
+    return sorted(n for n in enabled if n.split("$", 1)[0] in BENCHABLE_KINDS)
+
+
+def quarantine_summary(qs, total=None):
+    """One line: what the quarantine has taken out of the search space right
+    now, out of how much, and why -- the thing status would otherwise not say
+    about a config. `total` is len(benchable_syscalls(cfg)) when known."""
+    disabled = qm.disabled_set(qs)
+    of = " / %d" % total if total is not None else ""
+    if not disabled and not qs.get("catalog"):
+        return "0%s disabled" % of if of else "none"
+    # "2 disabled (1 hard, 1 soft), 1 suspect": counts of syscalls benched,
+    # of HARD calls and SOFT groups behind them, then signatures still watched.
+    parts = ["%d hard" % len(qs.get("hard") or [])]
+    if qs.get("soft_groups"):
+        parts.append("%d soft" % len(qs["soft_groups"]))
+    byd = {}
+    for rec in (qs.get("catalog") or {}).values():
+        byd[rec.get("disposition")] = byd.get(rec.get("disposition"), 0) + 1
+    tail = ", ".join("%d %s" % (byd[k], k) for k in (qm.TOLERATED, qm.SUSPECTED) if byd.get(k))
+    return "%d%s disabled (%s)%s" % (len(disabled), of, ", ".join(parts),
+                                    ", " + tail if tail else "")
+
+
+SELECTOR_KINDS = {"syz_IOConnectCallMethod": "call", "syz_IOConnectTrap": "trap"}
+
+
+def short_selectors(names):
+    """Map each selector to a short form, plus the header that expands it.
+
+    The part before '$' is the syscall kind, identical for most of a config's
+    selectors, so it is dropped: 'AppleJPEGDriverUserClient_2'. The selector
+    number alone would NOT do -- two user clients can share a number. When a
+    state mixes kinds (methods and traps), a tag keeps them apart:
+    'call$AppleJPEGDriverUserClient_2' / 'trap$AppleJPEGDriverUserClient_1'.
+    """
+    kinds = {n.split("$", 1)[0] for n in names if "$" in n}
+    if len(kinds) == 1:
+        kind = kinds.pop()
+        return ({n: n.split("$", 1)[1] if "$" in n else n for n in names},
+                "selectors are %s$<name>" % kind)
+    short = {}
+    for n in names:
+        if "$" in n:
+            kind, rest = n.split("$", 1)
+            short[n] = "%s$%s" % (SELECTOR_KINDS.get(kind, kind), rest)
+        else:
+            short[n] = n
+    return short, ("selectors: %s" % ", ".join("%s$ = %s$" % (v, k) for k, v in SELECTOR_KINDS.items()
+                                                if k in kinds) if kinds else "")
+
+
+def quarantine_lines(cfg, qs):
+    """The quarantine for one config as lines: one row per catalogued crash,
+    with what is benched now marked, and the state path last."""
+    cat = qs.get("catalog") or {}
+    disabled = set(qm.disabled_set(qs))
+    names = set(disabled) | set(qs.get("hard") or [])
+    for g in qs.get("soft_groups") or []:
+        names |= set(g["members"])
+    for rec in cat.values():
+        names |= set(rec.get("culprit_selectors") or [])
+    short, header = short_selectors(sorted(names))
+
+    def sel(n):
+        return short.get(n, n) + ("*" if n in disabled else "")
+    total = benchable_syscalls(cfg)
+    out = ["quarantine for %s : %s" % (config_id(cfg), quarantine_summary(
+        qs, len(total) if total is not None else None))]
+    if header:
+        out.append("  " + header)
+    if cat:
+        budget = (qs.get("params") or {}).get("tolerate_budget")
+        escapes = any(rec.get("escaped_count") for rec in cat.values())
+        rows = []
+        for sig, rec in cat.items():
+            disp = rec.get("disposition")
+            now = {qm.DISABLED: "disabled", qm.ROTATING: "rotating",
+                   qm.SUSPECTED: "watching"}.get(disp, disp or "-")
+            if disp == qm.TOLERATED:
+                now = "tolerated %d/%s" % (rec.get("repetition_count", 0), budget or "?")
+            row = [sig, rec.get("category") or "-", now, str(rec.get("occurrence_count", 0)),
+                   ", ".join(sel(n) for n in rec.get("culprit_selectors") or []) or "-"]
+            if escapes:
+                row.insert(4, str(rec.get("escaped_count", 0)))
+            rows.append(row)
+        headers = ["crash", "kind", "now", "seen", "selectors"]
+        if escapes:
+            headers.insert(4, "escaped")
+        out.append("")
+        out.extend("  " + ln for ln in render(rows, headers))
+        if disabled:
+            out.append("  (* benched now)")
+    out.append("")
+    out.append("  disabled now (%d):" % len(disabled))
+    out.extend("    %s" % short.get(n, n) for n in sorted(disabled))
+    try:
+        state = str(qstate_path(cfg).relative_to(REPO_ROOT))
+    except ValueError:
+        state = str(qstate_path(cfg))
+    out.append("  state        : %s" % state)
+    return out
+
+
+def cmd_quarantine(name, all_=False):
+    """The quarantine in full for the campaign's current config (every config
+    with --all). The state file is named so you can hand it to quarantine.py."""
+    d = load_def(name)
+    s = load_state(name)
+    cfgs = [it["config"] for it in d["items"]] if all_ else \
+        [s.get("current_config") or d["items"][0]["config"]]
+    seen = []
+    for cfg in cfgs:
+        if cfg in seen:
+            continue
+        seen.append(cfg)
+        print("\n".join(quarantine_lines(cfg, load_qstate(cfg))))
+        if len(cfgs) > 1:
+            print()
+    return 0
+
+
 def apply_disabled(cfg, qs):
     """Write disable_syscalls = the quarantine's full disabled set into cfg.
 
@@ -4011,6 +4350,12 @@ def main():
     sp.add_argument("name")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("quarantine",
+                        help="what the quarantine has benched for the current config, and why")
+    sp.add_argument("name")
+    sp.add_argument("--all", dest="all_", action="store_true",
+                    help="every config of the campaign, not just the current one")
+
     sp = sub.add_parser("exclude",
                         help="bench a culprit's syscall (remove it from the config) so fuzzing can resume")
     sp.add_argument("name")
@@ -4056,6 +4401,8 @@ def main():
         cmd_list()
     elif args.cmd == "replay":
         sys.exit(cmd_replay(args.name, args.json))
+    elif args.cmd == "quarantine":
+        sys.exit(cmd_quarantine(args.name, args.all_))
     elif args.cmd == "halt":
         cmd_halt(args.name)
     elif args.cmd == "resume":

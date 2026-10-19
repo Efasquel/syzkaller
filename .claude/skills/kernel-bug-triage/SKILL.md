@@ -64,8 +64,12 @@ as the current job ends.
 fuzzed kext) and, while it runs, its progress read from the checkpoint.
 
 Stages: `MERGE` → `MINIMIZE_CONN` → `MINIMIZE_CALLS` → `DONE`, or terminal
-`STUCK`. Each crashing subset panics the box, so the job advances one boot at a
-time and resumes from its own checkpoint. When no connection subset reproduces,
+`STUCK`. Each crashing subset panics the box, so the job advances one **boot**
+at a time and resumes from its own checkpoint: a boot is one `triage.py run`
+between two reboots, in which every non-crashing subset lets the next one run
+and the first crashing subset ends it. The campaign shows this as
+`boot N / M` in the `triage` block of `status`; M is `triage_max_boots` (40),
+past which the campaign halts with `triage stuck`. When no connection subset reproduces,
 the job takes `REPLAY_RING` instead of the call stage: the ring is replayed
 exactly as fuzzed, slot by slot, and the job stops. Subsets over the executor's
 64-call limit are skipped, never counted as "no crash".

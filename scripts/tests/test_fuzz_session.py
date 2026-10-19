@@ -381,3 +381,73 @@ class RunTimelineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
+
+class StatusHeadlineTest(unittest.TestCase):
+    """The first two lines say whether the manager is alive and whether it is
+    doing anything; the rest is grouped under short headers."""
+
+    def _lines(self, state, alive, rate=78):
+        metrics = {k: "" for k in fs.BENCH_KEYS}
+        metrics["uptime"] = 3723
+        with mock.patch.object(fs, "refresh_status", lambda sid: state), \
+             mock.patch.object(fs, "latest_bench", lambda wd: None), \
+             mock.patch.object(fs, "bench_metrics", lambda b: metrics), \
+             mock.patch.object(fs, "run_log_stats",
+                               lambda wd: {"exec total": 100, "rate": rate,
+                                           "coverage": "", "corpus": ""}), \
+             mock.patch.object(fs, "session_exec_lifetime", lambda wd: 1000), \
+             mock.patch.object(fs, "crash_events", lambda st: {}), \
+             mock.patch.object(fs, "live_executors", lambda st: [{"pid": 1}]), \
+             mock.patch.object(fs, "state_pid_alive", lambda st: alive), \
+             mock.patch.object(fs, "cover_log_path", lambda st: Path("/nonexistent/cover")), \
+             mock.patch.object(fs, "cover_log_archives", lambda wd: []), \
+             mock.patch.object(fs, "load_config", lambda p: {}), \
+             mock.patch.object(fs, "style", type(fs.style)(False)):
+            return fs.status_lines("sid")
+
+    def _state(self, status):
+        return {"status": status, "pid": 4120, "workdir": "/w", "config": "/c.cfg",
+                "run_count": 3, "started_at": "s", "stopped_at": "2026-10-19T10:00:00",
+                "stdout": "/log", "http": "127.0.0.1:1"}
+
+    def test_running_headline_has_pid_executors_uptime_and_rate(self):
+        lines = self._lines(self._state("running"), alive=True)
+        self.assertEqual(lines[0], "session   : sid")
+        self.assertEqual(lines[1],
+                         "status    : RUNNING (pid 4120, 1 executor, up 1h 02m 03s, 78 exec/s)")
+
+    def test_stopped_headline_says_since_when(self):
+        lines = self._lines(self._state("stopped"), alive=False)
+        self.assertEqual(lines[1], "status    : STOPPED (since 2026-10-19T10:00:00)")
+
+    def test_rows_are_grouped_under_headers(self):
+        lines = self._lines(self._state("running"), alive=True)
+        for header in ("-- process --", "-- incidents --"):
+            self.assertIn(header, lines)
+            self.assertEqual(lines[lines.index(header) - 1], "")   # blank line before each
+        self.assertTrue(any(ln.startswith("-- metrics") for ln in lines))
+
+
+class InspectBasicBlocksTest(unittest.TestCase):
+    def test_inspect_counts_blocks_from_this_run_and_all_archived_runs(self):
+        import io as _io, json as _json, contextlib as _ctx
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp) / "wd"
+            (wd / "results").mkdir(parents=True)
+            (wd / "cover.log").write_text("0x1\n0x2\n0x3\n")
+            (wd / "results/cover-1.log").write_text("0x2\n0x3\n0x4\n0x5\n")
+            state = {"id": "s", "status": "stopped", "workdir": str(wd), "config": None}
+            buf = _io.StringIO()
+            with mock.patch.object(fs, "resolve_id", lambda t: "s"), \
+                 mock.patch.object(fs, "refresh_status", lambda sid: state), \
+                 mock.patch.object(fs, "run_start_epoch", lambda wd: None), \
+                 mock.patch.object(fs, "run_log_stats", lambda wd: {"exec total": "", "coverage": "", "rate": "", "corpus": ""}), \
+                 mock.patch.object(fs, "state_pid_alive", lambda st: False), \
+                 mock.patch.object(fs, "crash_events", lambda st: {}), \
+                 mock.patch.object(fs, "uncollected_run", lambda st: None), \
+                 _ctx.redirect_stdout(buf):
+                fs.cmd_inspect("s")
+        out = _json.loads(buf.getvalue())
+        self.assertEqual((out["bb_run"], out["bb_all"]), (3, 5))
+        self.assertEqual(out["cover_log"], str(wd / "cover.log"))

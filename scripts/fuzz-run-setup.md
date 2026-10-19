@@ -253,9 +253,10 @@ tail -f /Users/Shared/fuzz-run/campaigns/.state/jpeg.launchd.log
 cd /Users/Shared/fuzz-run && /usr/bin/python3 scripts/fuzz-campaign.py status jpeg
 /usr/bin/python3 scripts/fuzz-campaign.py list
 
-# what the quarantine has decided
-/usr/bin/python3 scripts/quarantine.py \
-    --state campaigns/.state/quarantine_<config-id>.json status
+# what the quarantine has benched for the current config, and why (the
+# disabled set, HARD calls, SOFT rotation groups, the catalog); --all for every
+# config of the campaign. `status` carries a one-line summary of the same.
+/usr/bin/python3 scripts/fuzz-campaign.py quarantine jpeg
 
 # the reportable bug inventory
 cat campaigns/bugs/INDEX.md
@@ -356,8 +357,8 @@ experiment then silently inherits the old corpus and its coverage baseline.
 scrolled past hours ago:
 
 ```
-corpus      : 260831_cov_gram_no7_test  (26 KB, last grew 01/09 14:55:31)
-corpus      : none yet -- this config starts from scratch
+    corpus      : 260831_cov_gram_no7_test  (26 KB, last grew 01/09 14:55:31)
+    corpus      : none yet -- this config starts from scratch
 ```
 
 ### Watching a campaign
@@ -367,18 +368,123 @@ corpus      : none yet -- this config starts from scratch
 /usr/bin/python3 scripts/fuzz-campaign.py status jpeg -w --interval 30
 ```
 
+A full `status`, here mid-minimization (the figures are from a demo state):
+
+```
+campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h22m
+  updated       : 19/10/2026 14:47:22  (0h10m ago)
+
+  triage (job demo_triaging_t1, boot 7 / 40):
+    stage       : MINIMIZE_CALLS
+    progress    : 12 subsets tested for 40 calls, 3 crashing
+
+  session (1/1 - no loop):
+    config      : AppleSMC_demo_cov
+    stop        : 17h18m / 24h00m (fuzzing)
+    web ui      : http://127.0.0.1:56741  (manager down)
+    started     : 19/10/2026 06:06:22
+    corpus      : workdir  (412 KB, last grew 19/10 14:47:22)
+    quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
+
+  time breakdown (whole campaign):
+    preparing   : 0h12m  (until first exec)
+    fuzzing     : 6h41m  (first exec -> end of run)
+    minimizing  : 1h03m  (triage)
+    rebooting   : 0h44m  (panic -> back up)
+    total       : 8h41m
+
+  stats:
+    executed    : 11,214,880 program(s)
+    basic blocks: 317 (total: 1,304)
+    disk free   : 574.9 GB
+
+  incidents (this config: 2 / 20):
+    crashes     : 4
+    hangs       : 0
+    benched     : 2  (77ab10c3, 3f2a9c01)
+    triage queue: 1 second bug(s) waiting: 9c1e55d2
+
+  last 4 incident(s):
+    - 19/10/2026 09:47:22  crash   AppleSMC_demo_cov  ran 84s  sig 77ab10c3 BUG-0004  in AppleSMC  -> suspect
+    - 19/10/2026 11:37:22  crash   AppleSMC_demo_cov  ran 84s  sig 77ab10c3 BUG-0004  in AppleSMC  -> triage demo_triaging_t0
+    - 19/10/2026 13:12:22  crash   AppleSMC_demo_cov  ran 84s  sig 1c2e8800 BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
+    - 19/10/2026 14:33:22  crash   AppleSMC_demo_cov  ran 84s  sig 3f2a9c01 BUG-0007  in AppleSMC  -> triage demo_triaging_t1
+```
+
+Top to bottom: what the box is doing and for how long; how fresh this screen
+is; the triage job while one runs; the session (which config, how much of its
+budget is left on which clock, where the manager's UI is, what the quarantine
+has benched); the campaign's time split four ways; the numbers; the incidents.
+
 Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 
 ```
-executed    : 11,214,880 program(s)  (78/sec)   +4,213
-coverage    : 317 basic block(s)                    +2
-incidents   : 4 crash / 0 hang                      +1
+stats:
+  executed    : 11,214,880 program(s)  (78/sec)   +4,213
+  basic blocks: 317 (total: 1,204)                    +2
+incidents (this config: 2 / 20):
+  crashes     : 4   +1
+  hangs       : 0
+  benched     : 2  (77ab10c3, 3f2a9c01)
 corpus      : 260831_cov_gram_no7_test  ...     +1408 B
 ```
 
 The deltas are the point. An absolute counter looks identical one refresh later
 whether the box is fuzzing hard or wedged; a blank delta column means nothing
 moved, which is exactly the signal you are watching for.
+
+#### Between two crashes: what the box is doing, without typing
+
+The headline of `status` is the **activity** — finer than the phase, with how
+long it has been going. It is also the campaign's status: `HALTED`/`DONE` are
+activity words, and any other word means running, so nothing else repeats it:
+
+```
+campaign jpeg : TRIAGING bug 3f2a  for 0h12m
+campaign fde  : HALTED/CRASH-LOOP crash loop (15 crashes in a row before 50 programs executed)  for 2h03m
+```
+
+| activity | meaning |
+|---|---|
+| `BOOTING` | driver just relaunched, reconciling what the last boot left |
+| `PREPARING` | manager starting: snapshot, grammar compile, corpus re-triage — nothing executed yet |
+| `FUZZING` | first program executed; the box is fuzzing |
+| `COLLECTING` | a crash/hang is being recorded and bundled |
+| `TRIAGING` | a bug is being minimized; the `triage` block has the job and its boot count in the header, then the stage and how far its search has got |
+| `WAITING` | `resume` was issued; nothing runs until the agent relaunches the driver |
+| `HALTED/<kind>` / `DONE` | the driver exited; the kind says who stopped it — `BRAKE`, `USER`, `CRASH-LOOP`, `DISK`, `STARTUP` (the breaker's three), `TRIAGE` (stuck or unrebootable hang), `ABANDONED` (every config gave up), `ERROR` — and the reason follows |
+
+The word is green for fuzzing, red for halted, yellow for everything in between,
+and only on a tty. The `STATUS` column of `list` is the same word with its
+duration.
+
+The `stop` row in the session block is what is left of the current config's
+budget -- not the campaign's end; the session header says whether more configs
+or a loop follow -- shown
+as left / budget with its clock: `17h18m / 24h00m (fuzzing)`, `3h00m / 8h00m
+(total)`, or `at 19/10 16:00 (2h00m, real)` (the real clock is the only one
+that names a moment). `list` has the same in its
+`STOP` column. A fuzz-clock budget does not move while triaging, so that row
+can read the same for the whole of a minimization; that is the budget working
+as designed, not a stuck counter.
+
+Two things bring it to you with no command typed, because on this box there is
+often no time for one between two panics:
+
+- **A Terminal window running `status -w`**, opened by the driver at every start
+  — i.e. after every panic-reboot, the moment auto-login lands — and also when
+  the driver is about to exit on a brake or a halt, which is exactly the status
+  you want to see. A launchd relaunch with a watch already on screen does not
+  stack a second one. Author with `new ... --no-watch-window` to turn it off.
+- **A macOS notification** when fuzzing starts, on each triage advance, on every
+  crash once the coordinator has decided what it was (signature, BUG id, kext,
+  decision), and on halt/done. Booting and preparing stay quiet: they happen on
+  every reboot. The first notification may make macOS ask, once, whether
+  `osascript` may notify in the fuzz session — allow it.
+
+Both are skipped off macOS and under `FUZZ_NO_GUI=1` (set it when driving a
+campaign from an ssh shell you do not want windows popping out of). Only the
+driver's own `cmd_run` opens the window; `status` run by hand never does.
 
 Each recent incident says what the crash turned out to be: its signature, its
 BUG id in the registry, the kext the backtrace blames, and what the coordinator
@@ -391,7 +497,7 @@ the config opens:
     - 16/10 13:02:40  crash   AppleSMC_261016_cov_handfixed  ran 95s  sig 1c2e... BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
 ```
 
-While triaging, a `progress` row reads the job's checkpoint: subsets tested and
+While triaging, the `triage` block reads the job's checkpoint: subsets tested and
 crashed, the subset under test, panics from other bugs, hangs — or, during the
 ring replay, the pass and slot.
 
@@ -416,13 +522,17 @@ reinterpreted — it simply now *displays* as the hour it actually happened.
 `status` reports four disjoint clocks plus their sum, for the whole campaign:
 
 ```
-  time, whole campaign:
-    preparing   : 0h06m  (snapshot, grammar compile, until the first exec)
-    fuzzing     : 4h12m  (first exec -> end of run; see runstats.py for execution time)
+  time breakdown (whole campaign):
+    preparing   : 0h06m  (until first exec)
+    fuzzing     : 4h12m  (first exec -> end of run)
     minimizing  : 0h51m  (triage)
-    rebooting   : 0h23m  (panic -> back up, and dead time)
-    wall        : 5h32m  (sum of the four)
+    rebooting   : 0h23m  (panic -> back up)
+    total       : 5h32m
 ```
+
+`total` is what `--budget-clock wall` measures; `fuzzing` is what the `fuzz`
+clock measures, and is still not pure execution time — `runstats.py show` reads
+syz-manager's own counter for that.
 
 A run's **preparing** stretch is everything from the coordinator opening it
 (snapshot, results commit, manager launch, grammar compile, executor handshake)

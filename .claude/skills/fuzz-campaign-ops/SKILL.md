@@ -74,11 +74,25 @@ how the brake works.
 tail -f campaigns/.state/<name>.coordinator.log   # decisions only — use this
 tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 /usr/bin/python3 scripts/fuzz-campaign.py status <name> -w
+/usr/bin/python3 scripts/fuzz-campaign.py quarantine <name> [--all]   # what is benched, and why
 ```
 
 `status -w` annotates what moved since the last refresh. A blank delta column
 means nothing moved, which is the signal you are watching for — an absolute
 counter looks identical whether the box is fuzzing hard or wedged.
+
+The headline of `status` (and the STATUS column of `list`) is the **activity**,
+finer than the phase and stamped with its duration — `HALTED`/`DONE` are
+activity words, any other word means running: `BOOTING` → `PREPARING` →
+`FUZZING` → `COLLECTING` → `TRIAGING bug …` (job, stage, advance N/M and progress in the `triage` block) →
+`HALTED/<kind>` (`BRAKE`, `USER`, `CRASH-LOOP`, `DISK`, `STARTUP`, `TRIAGE`,
+`ABANDONED`, `ERROR`) or `DONE`, plus `WAITING` after a `resume` until the
+agent relaunches. It
+is what tells "fuzzing restarted" from "still minimizing" between two panics.
+The driver opens a Terminal running `status -w` at every start (so it is on
+screen right after a panic-reboot; `new --no-watch-window` disables it) and
+posts a macOS notification on fuzzing start, each triage advance, each decided
+crash, and halt. `FUZZ_NO_GUI=1` silences both, e.g. from an ssh shell.
 
 Four clocks are reported separately: **preparing** (snapshot, grammar compile,
 until the first exec), **fuzzing** (first exec to the run's last sign of life),
