@@ -2500,7 +2500,9 @@ def status_lines(name, prev=None):
     # The status IS the activity: "halted"/"done" are activity words and any
     # other word means running, so a separate state line would only repeat it.
     # This is the line you read between two panics.
-    out.append("  campaign:")
+    out.append("  campaign (config %d/%d - %s):"
+               % (min(s["cursor"] + 1, len(d["items"])), len(d["items"]),
+                  "loops" if d["loop"] else "no loop"))
     row("  name", name)
     row("  status", activity_text(s, colour=True))
     # When the driver last wrote the state: everything below is read from that
@@ -2550,9 +2552,7 @@ def status_lines(name, prev=None):
     cfg = s.get("current_config")
     if cfg:
         item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-        out.append("  config (%d/%d - %s):"
-                   % (min(s["cursor"] + 1, len(d["items"])), len(d["items"]),
-                      "loops" if d["loop"] else "no loop"))
+        out.append("  config:")
         row("  name", config_id(cfg))
         # What is left of THIS config's budget, on its clock -- not the
         # campaign's end: the header says whether more configs or a loop follow.

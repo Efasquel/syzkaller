@@ -2105,7 +2105,7 @@ class ActivityTest(unittest.TestCase):
                                  - timedelta(minutes=12)).isoformat())
         lines = self._status(s, cfg)
         # The status IS the activity; there is no separate "running" line.
-        self.assertEqual(lines[0], "campaign:")
+        self.assertEqual(lines[0], "campaign (config 1/1 - no loop):")
         self.assertEqual(lines[1], "  name        : camp")
         self.assertTrue(lines[2].startswith("  status      : TRIAGING bug S"), lines[2])
         self.assertIn("for %s" % fc.fmt_hms(12 * 60 + 4), lines[2])
@@ -2349,7 +2349,7 @@ class StopPlanTest(unittest.TestCase):
         # Under the config header: it is this config's budget, not the campaign's end.
         self.assertIn("  stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)),
                       lines)
-        self.assertLess(lines.index("config (1/1 - no loop):"),
+        self.assertLess(lines.index("config:"),
                         lines.index("  stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600))))
         self.assertIn("  fuzzed      : %s  (prep %s, triage %s, reboots %s)" % ((fc.fmt_hms(0),) * 4),
                       lines)

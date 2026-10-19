@@ -371,16 +371,16 @@ scrolled past hours ago:
 A full `status`, here mid-minimization (the figures are from a demo state):
 
 ```
-campaign:
+campaign (config 1/1 - no loop):
   name        : demo_triaging
-  status      : TRIAGING bug 3f2a9c01  for 0h12m
-  updated     : 19/10/2026 15:15:36  (0h00m ago)
+  status      : TRIAGING bug 3f2a9c01  for 0h14m
+  updated     : 19/10/2026 15:15:36  (0h02m ago)
 
 triage (job demo_triaging_t1, boot 7 / 40):
   stage       : MINIMIZE_CALLS
   progress    : 12 subsets tested for 40 calls, 3 crashing
 
-config (1/1 - no loop):
+config:
   name        : AppleSMC_demo_cov
   stop        : 17h18m / 24h00m (fuzzing)
   fuzzed      : 6h41m  (prep 0h12m, triage 1h03m, reboots 0h44m)
@@ -446,7 +446,7 @@ long it has been going. It is also the campaign's state: `HALTED`/`DONE` are
 activity words, and any other word means running, so nothing else repeats it:
 
 ```
-campaign:
+campaign (config 1/1 - no loop):
   name        : jpeg
   status      : TRIAGING bug 3f2a  for 0h12m
 
@@ -468,8 +468,8 @@ and only on a tty. The `STATUS` column of `list` is the same word with its
 duration.
 
 The `stop` row in the config block is what is left of the current config's
-budget -- not the campaign's end; the config header says whether more configs
-or a loop follow -- shown
+budget -- not the campaign's end; the campaign header says whether more
+configs or a loop follow -- shown
 as left / budget with its clock: `17h18m / 24h00m (fuzzing)`, `3h00m / 8h00m
 (total)`, or `at 19/10 16:00 (2h00m, real)` (the real clock is the only one
 that names a moment). `list` has the same in its
