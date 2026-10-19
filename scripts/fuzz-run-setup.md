@@ -371,8 +371,8 @@ scrolled past hours ago:
 A full `status`, here mid-minimization (the figures are from a demo state):
 
 ```
-campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h22m
-  updated       : 19/10/2026 14:47:22  (0h10m ago)
+campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h31m
+  updated       : 19/10/2026 14:47:22  (0h19m ago)
 
   triage (job demo_triaging_t1, boot 7 / 40):
     stage       : MINIMIZE_CALLS
@@ -405,10 +405,11 @@ campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h22m
     triage queue: 1 second bug(s) waiting: 9c1e55d2
 
   last 4 incident(s):
-    - 19/10/2026 09:47:22  crash   AppleSMC_demo_cov  ran 84s  sig 77ab10c3 BUG-0004  in AppleSMC  -> suspect
-    - 19/10/2026 11:37:22  crash   AppleSMC_demo_cov  ran 84s  sig 77ab10c3 BUG-0004  in AppleSMC  -> triage demo_triaging_t0
-    - 19/10/2026 13:12:22  crash   AppleSMC_demo_cov  ran 84s  sig 1c2e8800 BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
-    - 19/10/2026 14:33:22  crash   AppleSMC_demo_cov  ran 84s  sig 3f2a9c01 BUG-0007  in AppleSMC  -> triage demo_triaging_t1
+    when            kind   ran  sig       bug       kext                    decision
+    19/10 09:47:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
+    19/10 11:37:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
+    19/10 13:12:22  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
+    19/10 14:33:22  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
 ```
 
 Top to bottom: what the box is doing and for how long; how fresh this screen
@@ -493,8 +494,12 @@ names no kext, so "fuzzed" means the workdir's kext directory and the services
 the config opens:
 
 ```
-    - 16/10 12:24:02  crash   AppleSMC_261016_cov_handfixed  ran 312s  sig 5fe467b592862b54 BUG-0004  in AppleSMC  -> triage AppleSMC_261016_1h_handfixed_t2
-    - 16/10 13:02:40  crash   AppleSMC_261016_cov_handfixed  ran 95s  sig 1c2e... BUG-0009  in IOSurface (NOT the fuzzed AppleSMC)  -> suspect
+  last 4 incident(s):
+    when            kind   ran  sig       bug       kext                    decision
+    19/10 09:47:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
+    19/10 11:37:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
+    19/10 13:12:22  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
+    19/10 14:33:22  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
 ```
 
 While triaging, the `triage` block reads the job's checkpoint: subsets tested and

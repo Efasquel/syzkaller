@@ -2595,3 +2595,41 @@ class BenchableMemoTest(unittest.TestCase):
                 os.utime(desc, (time.time() + 5, time.time() + 5))  # mtime moves
                 self.assertEqual(len(fc.benchable_syscalls(str(cfg))), 2)
                 self.assertEqual(len(reads), 2)
+
+
+class IncidentTableTest(unittest.TestCase):
+    def _inc(self, cfg="/c/a.cfg", **kw):
+        inc = {"at": "2026-10-19T10:00:00+00:00", "kind": "crash", "config": cfg,
+               "ran_seconds": 84, "panic_evidence": True, "signature": "3f2a9c01",
+               "bug_ids": ["BUG-0007"], "crashing_kext": "AppleSMC", "kext_match": True,
+               "decision": "triage", "triage_job": "camp_t1"}
+        inc.update(kw)
+        return inc
+
+    def test_one_row_per_incident_with_the_mismatch_marked(self):
+        lines = fc.incident_table([self._inc(),
+                                   self._inc(crashing_kext="IOSurface", kext_match=False,
+                                             decision="suspect", triage_job=None)])
+        self.assertEqual(lines[0].split(), ["when", "kind", "ran", "sig", "bug", "kext", "decision"])
+        self.assertEqual(lines[1].split()[2:], ["crash", "84s", "3f2a9c01", "BUG-0007", "AppleSMC",
+                                                "triage", "camp_t1"])
+        self.assertIn("IOSurface (NOT fuzzed)  suspect", lines[2])
+        with mock.patch.object(fc, "style", type(fc.style)(True)):
+            coloured = fc.incident_table([self._inc(kext_match=False)], colour=True)
+        self.assertIn("\033[33;1m (NOT fuzzed)\033[0m", coloured[1])
+
+    def test_config_column_only_for_a_sweep(self):
+        one = fc.incident_table([self._inc(), self._inc()])
+        self.assertNotIn("config", one[0])
+        two = fc.incident_table([self._inc(), self._inc(cfg="/c/b.cfg")])
+        self.assertEqual(two[0].split()[2], "config")
+        self.assertIn("  b  ", two[2])
+
+    def test_startup_and_no_report_fall_back_to_what_is_known(self):
+        lines = fc.incident_table([
+            self._inc(kind="startup", signature=None, bug_ids=None, crashing_kext=None,
+                      decision=None, triage_job=None, panic_evidence=False,
+                      log_tail="SYZFAIL: shmem open failed"),
+            self._inc(decision=None, triage_job=None, panic_evidence=False)])
+        self.assertIn("SYZFAIL: shmem open failed", lines[1])
+        self.assertIn("(no panic report)", lines[2])

@@ -2682,13 +2682,47 @@ def status_lines(name, prev=None):
     if s["incidents"]:
         out.append("")
         out.append("  last %d incident(s):" % min(5, len(s["incidents"])))
-        for inc in s["incidents"][-5:]:
-            out.append("    - " + incident_line(inc, colour=True))
+        out.extend("    " + ln for ln in incident_table(s["incidents"][-5:], colour=True))
 
     sample = {"execs": execs, "cov": _int(cov), "bb": _int(bb), "crashes": s["crashes"],
               "hangs": s["hangs"],
               "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
     return out, sample
+
+
+def incident_table(incs, colour=False):
+    """The recent incidents as a table: one row each, the config column only
+    when they span more than one config. `incident_line` stays the one-line
+    form for notifications and logs."""
+    NOT = " (NOT fuzzed)"
+    multi = len({inc["config"] for inc in incs}) > 1
+    rows = []
+    for inc in incs:
+        what = inc.get("decision") or ""
+        if what and inc.get("triage_job"):
+            what += " " + inc["triage_job"]
+        if not what and inc["kind"] == "crash" and not inc.get("panic_evidence"):
+            what = "(no panic report)"
+        if not what and inc.get("log_tail"):
+            what = inc["log_tail"][:60]
+        kext = inc.get("crashing_kext") or "-"
+        if inc.get("kext_match") is False:
+            kext += NOT
+        row = [timefmt.fmt(inc["at"], short=True), inc["kind"],
+               "%ss" % inc.get("ran_seconds") if inc.get("ran_seconds") is not None else "-",
+               inc.get("signature") or "-", ",".join(inc.get("bug_ids") or []) or "-",
+               kext, what or "-"]
+        if multi:
+            row.insert(2, config_id(inc["config"]))
+        rows.append(row)
+    headers = ["when", "kind", "ran", "sig", "bug", "kext", "decision"]
+    if multi:
+        headers.insert(2, "config")
+    lines = render(rows, headers)
+    if colour:
+        # After padding, so the escape codes do not shift the columns.
+        lines = [ln.replace(NOT, style(NOT, "yellow", "bold")) for ln in lines]
+    return lines
 
 
 def incident_line(inc, colour=False):
