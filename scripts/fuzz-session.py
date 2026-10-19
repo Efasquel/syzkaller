@@ -2012,10 +2012,10 @@ def status_lines(sid, rawcover=False):
     row("  workdir", workdir)
     row("  corpus", "%s program(s)" % (rl["corpus"] or m["corpus"] or "-"))
     this_run = rl["exec total"] or m["exec total"]
-    row("  executed", "%s (total: %s)" % (
+    row("  exec total", "%s (total: %s)" % (
         "{:,}".format(int(this_run)) if this_run not in ("", None) else "-",
         "{:,}".format(int(lifetime)) if lifetime not in ("", None) else "-"))
-    row("  speed", "%s/s now" % rl["rate"] if rl["rate"] != "" else "-")
+    row("  exec rate", "%s/s now" % rl["rate"] if rl["rate"] != "" else "-")
     row("  basic blocks", bb)
     row("  signal", "%s  (syz-manager's coverage stat, not blocks)"
         % (rl["coverage"] or m["coverage"] or "-"))

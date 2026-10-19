@@ -397,8 +397,8 @@ time breakdown (whole campaign):
   total       : 8h41m
 
 stats:
-  executed    : 214,880 (total: 1,878,396)
-  speed       : 78/s average
+  exec total  : 214,880 (total: 1,878,396)
+  exec rate   : 78/s average
   basic blocks: 317 (total: 1,304)
   disk free   : 574.6 GB
 
@@ -428,8 +428,8 @@ Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 
 ```
 stats:
-  executed    : 214,880 (total: 1,878,396)   +4,213
-  speed       : 78/s now, 78/s average
+  exec total  : 214,880 (total: 1,878,396)   +4,213
+  exec rate   : 78/s now, 78/s average
   basic blocks: 317 (total: 1,204)                    +2
 incidents (this config: 2 / 20):
   crashes     : 4   +1
@@ -516,8 +516,8 @@ time breakdown (whole campaign):
   total       : 8h41m
 
 stats:
-  executed    : 214,880 (total: 1,878,396)
-  speed       : 78/s average
+  exec total  : 214,880 (total: 1,878,396)
+  exec rate   : 78/s average
   basic blocks: 317 (total: 1,304)
   disk free   : 574.6 GB
 

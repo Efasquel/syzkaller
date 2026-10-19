@@ -2659,7 +2659,7 @@ def status_lines(name, prev=None):
         # a config can burn an hour of wall clock and execute very little. This
         # run's count (exec_total restarts with every manager) and the config's
         # total over all its runs, like the basic blocks row.
-        row("  executed", "%s (total: %s)"
+        row("  exec total", "%s (total: %s)"
             % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
                "{:,}".format(int(exec_all)) if exec_all is not None else "-"),
             _delta(_int(exec_all) if exec_all is not None else execs,
@@ -2671,7 +2671,7 @@ def status_lines(name, prev=None):
             speed.append("%s/s now" % live["rate"])
         if exec_all is not None and (s.get("active_seconds") or 0) > 0:
             speed.append("%d/s average" % round(int(exec_all) / s["active_seconds"]))
-        row("  speed", ", ".join(speed) if speed else "-")
+        row("  exec rate", ", ".join(speed) if speed else "-")
         # Basic blocks come from the cover logs (readable with the manager
         # dead), never from the manager's `coverage` stat, which is its signal
         # count and was once printed under this name. current = this run's log;

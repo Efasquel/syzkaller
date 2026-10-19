@@ -2397,8 +2397,8 @@ class BasicBlocksTest(unittest.TestCase):
                                           "exec_lifetime": 48117004, "rate": 78})
             rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
             self.assertIn("317 (total: 1,204)", rows["basic blocks"])
-            self.assertIn("1,214,880 (total: 48,117,004)", rows["executed"])
-            self.assertIn("78/s now, 62/s average", rows["speed"])
+            self.assertIn("1,214,880 (total: 48,117,004)", rows["exec total"])
+            self.assertIn("78/s now, 62/s average", rows["exec rate"])
             self.assertIn("b 40", rows["earlier cfgs"])
             self.assertIn("9412  (syz-manager's coverage stat, not blocks)", rows["signal"])
             self.assertNotIn("coverage", rows)
@@ -2407,7 +2407,7 @@ class BasicBlocksTest(unittest.TestCase):
             lines = self._status(s, cfg, {"found": False})
             rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
             self.assertIn("- (total: 900)", rows["basic blocks"])
-            self.assertIn("1,214,880 (total: 40,000,000)", rows["executed"])
+            self.assertIn("1,214,880 (total: 40,000,000)", rows["exec total"])
 
 
 class TriageBlockTest(unittest.TestCase):

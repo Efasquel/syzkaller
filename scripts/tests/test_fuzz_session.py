@@ -418,8 +418,8 @@ class StatusLayoutTest(unittest.TestCase):
         rows = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines if ": " in ln}
         self.assertEqual(rows["manager"], "pid 4120, 1 executor(s) live (pids 1)")
         self.assertEqual(rows["web ui"], "http://127.0.0.1:1")
-        self.assertEqual(rows["executed"], "1,214,880 (total: 48,117,004)")
-        self.assertEqual(rows["speed"], "78/s now")
+        self.assertEqual(rows["exec total"], "1,214,880 (total: 48,117,004)")
+        self.assertEqual(rows["exec rate"], "78/s now")
         self.assertEqual(rows["crashes"], "4")
         self.assertEqual(rows["hangs"], "0")
 
@@ -438,7 +438,7 @@ class StatusLayoutTest(unittest.TestCase):
         # the session's own rows (process, incidents) come before the config block
         self.assertLess(lines.index("  crashes     : 4"), cfg)
         # the target and its numbers after it
-        self.assertGreater(lines.index("  executed    : 1,214,880 (total: 48,117,004)"), cfg)
+        self.assertGreater(lines.index("  exec total  : 1,214,880 (total: 48,117,004)"), cfg)
         self.assertGreater(lines.index("  corpus      : 8114 program(s)"), cfg)
 
 
