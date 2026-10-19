@@ -2469,10 +2469,11 @@ class AnomalyColourTest(unittest.TestCase):
                 calm, _ = fc.status_lines("camp")
         rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
         self.assertIn("\033[31;1m", rows["updated"])
-        self.assertIn("\033[31;1m  (manager down)\033[0m", rows["web ui"])
+        self.assertIn("\033[31;1mdown\033[0m", rows["manager"])
+        self.assertNotIn("web ui", rows)                     # nothing is serving
         rows = {ln.split(":")[0].strip(): ln for ln in calm if ":" in ln}
         self.assertNotIn("\033[", rows["updated"])
-        self.assertNotIn("\033[", rows["web ui"])          # expected while triaging
+        self.assertNotIn("\033[", rows["manager"])         # expected while triaging
 
 
 class QuarantineViewTest(unittest.TestCase):
@@ -2544,3 +2545,24 @@ class QuarantineViewTest(unittest.TestCase):
         self.assertEqual(short, {"syz_IOConnectCallMethod$A_2": "call$A_2",
                                  "syz_IOConnectTrap$A_2": "trap$A_2"})
         self.assertIn("call$ = syz_IOConnectCallMethod$", header)
+
+
+class ManagerRowTest(unittest.TestCase):
+    def test_a_live_manager_shows_its_pid_and_executors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
+            s = fc.init_state("camp")
+            s.update(session_id="a", current_config=str(cfg), activity="fuzzing",
+                     activity_since=fc.now_iso())
+            live = {"found": True, "pid_alive": True, "pid": 4120, "executors": 2,
+                    "http": "127.0.0.1:56741"}
+            with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
+                 mock.patch.object(fc, "load_state", lambda n: s), \
+                 mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 mock.patch.object(fc, "inspect", lambda sid: live), \
+                 mock.patch.object(fc, "free_gb", lambda: 100.0), \
+                 mock.patch.object(fc, "style", type(fc.style)(False)):
+                lines, _ = fc.status_lines("camp")
+        self.assertIn("    manager     : pid 4120, 2 executor(s) live", lines)
+        self.assertIn("    web ui      : http://127.0.0.1:56741", lines)

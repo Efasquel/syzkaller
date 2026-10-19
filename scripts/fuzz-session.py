@@ -768,6 +768,7 @@ def cmd_inspect(target):
         "id": sid, "found": True,
         "status": state.get("status"),
         "pid": state.get("pid"), "pid_alive": state_pid_alive(state),
+        "executors": len(live_executors(state)),
         "config": state.get("config"), "workdir": workdir,
         # The manager's web UI. Recorded per session because the port is taken
         # from the config, so a driver supervising several configs cannot guess

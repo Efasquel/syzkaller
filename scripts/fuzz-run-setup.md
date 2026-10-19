@@ -381,7 +381,7 @@ campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h22m
   session (1/1 - no loop):
     config      : AppleSMC_demo_cov
     stop        : 17h18m / 24h00m (fuzzing)
-    web ui      : http://127.0.0.1:56741  (manager down)
+    manager     : down
     started     : 19/10/2026 06:06:22
     corpus      : workdir  (412 KB, last grew 19/10 14:47:22)
     quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect

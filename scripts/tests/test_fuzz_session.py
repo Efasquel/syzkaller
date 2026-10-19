@@ -450,4 +450,5 @@ class InspectBasicBlocksTest(unittest.TestCase):
                 fs.cmd_inspect("s")
         out = _json.loads(buf.getvalue())
         self.assertEqual((out["bb_run"], out["bb_all"]), (3, 5))
+        self.assertEqual(out["executors"], 0)
         self.assertEqual(out["cover_log"], str(wd / "cover.log"))

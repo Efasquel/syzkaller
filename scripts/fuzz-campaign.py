@@ -2561,18 +2561,24 @@ def status_lines(name, prev=None):
         # The manager's UI: coverage browser, corpus, crash list. Only meaningful
         # while the manager is actually serving, so it is shown with that caveat
         # rather than as a link that may quietly not answer.
-        if live.get("http"):
-            url = live["http"]
-            if not url.startswith("http"):
-                url = "http://%s" % url
+        # The manager process and its executors, from the session record. A
+        # dead manager is expected while triaging or collecting; under a
+        # FUZZING headline it is the anomaly, so that one is red.
+        if live.get("found"):
             if live.get("pid_alive"):
-                row("  web ui", url)
+                n = live.get("executors")
+                row("  manager", "pid %s, %s" % (
+                    live.get("pid"),
+                    "%d executor(s) live" % n if n is not None else "executors ?"))
             else:
-                # Expected while triaging or collecting; wrong under FUZZING.
-                down = "  (manager down)"
+                down = "down"
                 if s.get("activity") == "fuzzing":
                     down = style(down, "red", "bold")
-                row("  web ui", url + down)
+                row("  manager", down)
+        # Its web UI (coverage browser, corpus, crash list): only while it serves.
+        if live.get("http") and live.get("pid_alive"):
+            url = live["http"]
+            row("  web ui", url if url.startswith("http") else "http://%s" % url)
         if s.get("config_started_at"):
             row("  started", timefmt.fmt(s["config_started_at"]))
         # A config is a workdir. Say plainly whether this run inherited a corpus.
