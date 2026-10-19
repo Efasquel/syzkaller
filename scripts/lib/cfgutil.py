@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reading a syzkaller manager config the way syz-manager itself reads it.
+r"""Reading a syzkaller manager config the way syz-manager itself reads it.
 
 syz-manager strips whole-line '#' comments and nothing else, in
 pkg/config/config.go (LoadData):

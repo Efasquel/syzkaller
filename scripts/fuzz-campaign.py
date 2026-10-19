@@ -328,26 +328,6 @@ def real_seconds(s):
     return max(0.0, time.time() - t0)
 
 
-def real_seconds(s):
-    """Elapsed time since the current config started, by the wall clock on the
-    wall -- not the campaign's occupancy of the rig.
-
-    Unlike wall_seconds this keeps running while the campaign does not: through a
-    halt, a panic-reboot, a crashloop pause, the box being powered off. That is
-    the point. It is the only clock that can express a window ("2pm to 4pm"),
-    because a window elapses whether or not anything is fuzzing.
-
-    Reads config_started_at, which is stamped once when a config starts and NOT
-    re-taken when the coordinator relaunches. That matters here more than
-    anywhere: this rig reboots on every panic, so a stamp refreshed on relaunch
-    would restart the window at each crash and the budget would never expire.
-    """
-    t0 = timefmt.to_epoch(s.get("config_started_at"))
-    if not t0:
-        return 0.0
-    return max(0.0, time.time() - t0)
-
-
 def budget_spent(s, d):
     """The clock --budget is measured against (see DEFAULTS["budget_clock"])."""
     clock = d.get("budget_clock")
@@ -1753,82 +1733,6 @@ def wait_for_stop(s, d, seconds):
             return "brake"
 
 
-def _etime_seconds(text):
-    """ps ELAPSED ([[dd-]hh:]mm:ss) -> seconds."""
-    text = (text or "").strip()
-    if not text:
-        return None
-    days = 0
-    if "-" in text:
-        d_, text = text.split("-", 1)
-        try:
-            days = int(d_)
-        except ValueError:
-            return None
-    parts = text.split(":")
-    try:
-        parts = [int(x) for x in parts]
-    except ValueError:
-        return None
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
-
-
-def stuck_executor_seconds(d):
-    """Age of the longest-running `syz-executor exec`, if it exceeds the limit.
-
-    syz-executor forks one short-lived `exec` process per program, so a normal one
-    lives milliseconds. One alive for minutes means a syscall that never returned:
-    the box is wedged, whatever the manager's counters say.
-    """
-    limit = d.get("exec_stuck_seconds", DEFAULTS["exec_stuck_seconds"])
-    if not limit:
-        return None
-    try:
-        out = subprocess.run(["/bin/ps", "-Ao", "etime,command"],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    worst = 0
-    for line in (out or "").splitlines()[1:]:
-        line = line.strip()
-        if "syz-executor exec" not in line:
-            continue
-        secs = _etime_seconds(line.split(None, 1)[0])
-        if secs and secs > worst:
-            worst = secs
-    return worst if worst >= limit else None
-
-
-def wait_for_stop(s, d, seconds):
-    """Sleep up to `seconds`, returning early if a stop is requested.
-
-    Returns "halted", "brake", or None if the full interval elapsed quietly.
-    The brake is checked here as well as at startup: it is the stop you reach
-    for when the box is misbehaving, and having to wait out a poll interval for
-    it defeats the purpose.
-    """
-    step = d.get("stop_check_seconds", DEFAULTS["stop_check_seconds"])
-    deadline = time.time() + seconds
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return None
-        time.sleep(min(step, remaining))
-        if load_state(s["name"]).get("status") == "halted":
-            return "halted"
-        held = brake_held(s["name"])
-        if held:
-            path, why = held
-            log("BRAKE while running: %s%s" % (path, " -- %s" % why if why else ""))
-            s["status"] = "halted"
-            s["halt_reason"] = "brake: %s" % (why or path)
-            save_state(s)
-            return "brake"
-
-
 def supervise(s, d, sid, budget):
     """Poll until an incident, budget exhaustion, or manager death.
 
@@ -1860,9 +1764,6 @@ def supervise(s, d, sid, budget):
         stop = wait_for_stop(s, d, min(step, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
             s["halt_reason"] = s.get("halt_reason") or "halted by user"
-            session("stop", sid)
-            return "halted"
-        if stop == "brake":
             session("stop", sid)
             return "halted"
         if stop == "brake":
