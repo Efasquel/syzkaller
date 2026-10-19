@@ -637,21 +637,55 @@ def cover_log_archives(workdir):
     return sorted((Path(workdir) / "results").glob("cover-*.log"))
 
 
+def _read_pcs(path, into):
+    try:
+        for line in Path(path).read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                into.add(line)
+    except OSError:
+        pass
+
+
 def bb_unique(paths):
     """Count distinct coverage PCs across one or more cover-log files."""
     seen = set()
     for p in paths:
-        p = Path(p)
-        if not p.exists():
-            continue
-        try:
-            for line in p.read_text(errors="replace").splitlines():
-                line = line.strip()
-                if line:
-                    seen.add(line)
-        except OSError:
-            pass
+        _read_pcs(p, seen)
     return len(seen)
+
+
+def archive_pcs(workdir):
+    """The union of the archived cover logs, cached: an archive never changes
+    once written, and a day of 60-second runs leaves hundreds of them, which
+    `inspect` -- called every 10s by `status -w` -- would otherwise re-read in
+    full each time. The cache is keyed on the archive list (name + size) and
+    rebuilt when it differs; the live log is never cached."""
+    archives = cover_log_archives(workdir)
+    key = [[a.name, a.stat().st_size] for a in archives if a.exists()]
+    cache = Path(workdir) / "results" / ".cover-union.json"
+    try:
+        c = json.loads(cache.read_text())
+        if c.get("archives") == key:
+            return set(c.get("pcs") or [])
+    except (OSError, ValueError):
+        pass
+    pcs = set()
+    for a in archives:
+        _read_pcs(a, pcs)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"archives": key, "pcs": sorted(pcs)}))
+    except OSError:
+        pass
+    return pcs
+
+
+def bb_all_runs(state):
+    """Distinct PCs over this run's log and every archived run of the workdir."""
+    pcs = set(archive_pcs(state["workdir"]))
+    _read_pcs(cover_log_path(state), pcs)
+    return len(pcs)
 
 
 def rawcover_text(http, timeout=3):
@@ -791,7 +825,7 @@ def cmd_inspect(target):
         # workdir's corpus has ever reached.
         "cover_log": str(cover_log_path(state)),
         "bb_run": bb_unique([cover_log_path(state)]),
-        "bb_all": bb_unique([cover_log_path(state)] + cover_log_archives(workdir)),
+        "bb_all": bb_all_runs(state),
         "rate": stats.get("rate") if stats.get("rate") != "" else None,
         "reports": [str(p) for p in reports],
         "panic_evidence": bool(panics),
@@ -1956,7 +1990,7 @@ def status_lines(sid, rawcover=False):
                            ).get("cover_log")) if state.get("config") else False
         if cl.exists() or archives:
             bb = "%s (this run) / %s (all runs, cover_log)" % (
-                bb_unique([cl]), bb_unique([cl] + archives))
+                bb_unique([cl]), bb_all_runs(state))
         elif configured:
             bb = "- (cover_log configured, no data yet -- run to populate)"
         else:

@@ -3744,10 +3744,17 @@ def save_qstate(cfg, qs):
 BENCHABLE_KINDS = ("syz_IOConnectCallMethod", "syz_IOConnectTrap")
 
 
+_BENCHABLE_MEMO = {}
+
+
 def benchable_syscalls(cfg):
     """The config's enabled syscalls the quarantine could bench, resolved
     against sys/<os>/*.txt the way syz-manager resolves enable_syscalls (exact
-    names and globs). None when the descriptions are not in this tree."""
+    names and globs). None when the descriptions are not in this tree.
+
+    Memoised on the mtimes of the config and of every description file: the
+    watch loop asks every 10s, and the full description set is a few hundred
+    files, so re-parsing them each refresh would be a visible CPU blip."""
     try:
         conf = cfgutil.load(cfg)
     except (OSError, ValueError):
@@ -3756,6 +3763,14 @@ def benchable_syscalls(cfg):
     desc_dir = REPO_ROOT / "sys" / os_name
     if not desc_dir.is_dir():
         return None
+    try:
+        key = (Path(cfg).stat().st_mtime,
+               tuple(sorted((p.name, p.stat().st_mtime) for p in desc_dir.glob("*.txt"))))
+    except OSError:
+        key = None
+    memo = _BENCHABLE_MEMO.get(str(cfg))
+    if key is not None and memo and memo[0] == key:
+        return list(memo[1])
     defined = set()
     for path in desc_dir.glob("*.txt"):
         try:
@@ -3773,7 +3788,10 @@ def benchable_syscalls(cfg):
             enabled.update(n for n in defined if fnmatch.fnmatchcase(n, pat))
         elif pat in defined:
             enabled.add(pat)
-    return sorted(n for n in enabled if n.split("$", 1)[0] in BENCHABLE_KINDS)
+    result = sorted(n for n in enabled if n.split("$", 1)[0] in BENCHABLE_KINDS)
+    if key is not None:
+        _BENCHABLE_MEMO[str(cfg)] = (key, tuple(result))
+    return result
 
 
 def quarantine_summary(qs, total=None):

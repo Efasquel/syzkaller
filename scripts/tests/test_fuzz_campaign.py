@@ -2566,3 +2566,32 @@ class ManagerRowTest(unittest.TestCase):
                 lines, _ = fc.status_lines("camp")
         self.assertIn("    manager     : pid 4120, 2 executor(s) live", lines)
         self.assertIn("    web ui      : http://127.0.0.1:56741", lines)
+
+
+class BenchableMemoTest(unittest.TestCase):
+    def test_descriptions_are_parsed_once_until_something_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sys/darwin").mkdir(parents=True)
+            desc = root / "sys/darwin/iokit_X.txt"
+            desc.write_text("syz_IOConnectCallMethod$X_0(c connection)\n")
+            cfg = write_cfg(root, {"target": "darwin/arm64",
+                                   "enable_syscalls": ["syz_IOConnectCallMethod$X_*"]})
+            reads = []
+            real = Path.read_text
+
+            def counting(self, *a, **k):
+                if self.name == "iokit_X.txt":
+                    reads.append(self.name)
+                return real(self, *a, **k)
+            with mock.patch.object(fc, "REPO_ROOT", root), \
+                 mock.patch.object(fc, "_BENCHABLE_MEMO", {}), \
+                 mock.patch.object(Path, "read_text", counting):
+                self.assertEqual(len(fc.benchable_syscalls(str(cfg))), 1)
+                self.assertEqual(len(fc.benchable_syscalls(str(cfg))), 1)
+                self.assertEqual(len(reads), 1)                 # second call: memo
+                desc.write_text("syz_IOConnectCallMethod$X_0(c connection)\n"
+                                "syz_IOConnectCallMethod$X_1(c connection)\n")
+                os.utime(desc, (time.time() + 5, time.time() + 5))  # mtime moves
+                self.assertEqual(len(fc.benchable_syscalls(str(cfg))), 2)
+                self.assertEqual(len(reads), 2)

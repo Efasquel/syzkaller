@@ -452,3 +452,26 @@ class InspectBasicBlocksTest(unittest.TestCase):
         self.assertEqual((out["bb_run"], out["bb_all"]), (3, 5))
         self.assertEqual(out["executors"], 0)
         self.assertEqual(out["cover_log"], str(wd / "cover.log"))
+
+
+class ArchiveUnionCacheTest(unittest.TestCase):
+    """Archived cover logs are immutable, so their union is cached and only
+    rebuilt when the archive list changes."""
+
+    def test_union_is_cached_and_invalidated_by_a_new_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            (wd / "results").mkdir()
+            (wd / "results/cover-1.log").write_text("0x1\n0x2\n")
+            (wd / "cover.log").write_text("0x2\n0x3\n")
+            state = {"workdir": str(wd), "config": None}
+            self.assertEqual(fs.bb_all_runs(state), 3)
+            cache = wd / "results/.cover-union.json"
+            self.assertTrue(cache.exists())
+            # A cached union is served even if the archive's content is edited
+            # behind its back (same name and size) -- that is the contract.
+            (wd / "results/cover-1.log").write_text("0x8\n0x9\n")
+            self.assertEqual(fs.bb_all_runs(state), 3)
+            # A new archive changes the key and rebuilds it.
+            (wd / "results/cover-2.log").write_text("0x4\n")
+            self.assertEqual(fs.bb_all_runs(state), 5)     # 0x8 0x9 0x4 0x2 0x3
