@@ -383,9 +383,9 @@ if __name__ == "__main__":
     unittest.main(verbosity=1)
 
 
-class StatusHeadlineTest(unittest.TestCase):
-    """The first two lines say whether the manager is alive and whether it is
-    doing anything; the rest is grouped under short headers."""
+class StatusLayoutTest(unittest.TestCase):
+    """The session view is laid out like the campaign's: session / config /
+    stats / incidents blocks, run-vs-total figures, 14-wide labels."""
 
     def _lines(self, state, alive, rate=78):
         metrics = {k: "" for k in fs.BENCH_KEYS}
@@ -394,10 +394,10 @@ class StatusHeadlineTest(unittest.TestCase):
              mock.patch.object(fs, "latest_bench", lambda wd: None), \
              mock.patch.object(fs, "bench_metrics", lambda b: metrics), \
              mock.patch.object(fs, "run_log_stats",
-                               lambda wd: {"exec total": 100, "rate": rate,
-                                           "coverage": "", "corpus": ""}), \
-             mock.patch.object(fs, "session_exec_lifetime", lambda wd: 1000), \
-             mock.patch.object(fs, "crash_events", lambda st: {}), \
+                               lambda wd: {"exec total": 1214880, "rate": rate,
+                                           "coverage": 9412, "corpus": 8114}), \
+             mock.patch.object(fs, "session_exec_lifetime", lambda wd: 48117004), \
+             mock.patch.object(fs, "crash_events", lambda st: {"crash": 4}), \
              mock.patch.object(fs, "live_executors", lambda st: [{"pid": 1}]), \
              mock.patch.object(fs, "state_pid_alive", lambda st: alive), \
              mock.patch.object(fs, "cover_log_path", lambda st: Path("/nonexistent/cover")), \
@@ -411,22 +411,32 @@ class StatusHeadlineTest(unittest.TestCase):
                 "run_count": 3, "started_at": "s", "stopped_at": "2026-10-19T10:00:00",
                 "stdout": "/log", "http": "127.0.0.1:1"}
 
-    def test_running_headline_has_pid_executors_uptime_and_rate(self):
+    def test_running_session(self):
         lines = self._lines(self._state("running"), alive=True)
-        self.assertEqual(lines[0], "session   : sid")
-        self.assertEqual(lines[1],
-                         "status    : RUNNING (pid 4120, 1 executor, up 1h 02m 03s, 78 exec/s)")
+        self.assertEqual(lines[:3], ["session:", "  name        : sid",
+                                     "  status      : RUNNING  for 1h 02m 03s"])
+        rows = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines if ": " in ln}
+        self.assertEqual(rows["manager"], "pid 4120, 1 executor(s) live (pids 1)")
+        self.assertEqual(rows["web ui"], "http://127.0.0.1:1")
+        self.assertEqual(rows["executed"], "1,214,880 (total: 48,117,004)")
+        self.assertEqual(rows["speed"], "78/s now")
+        self.assertEqual(rows["crashes"], "4")
+        self.assertEqual(rows["hangs"], "0")
 
-    def test_stopped_headline_says_since_when(self):
+    def test_stopped_session(self):
         lines = self._lines(self._state("stopped"), alive=False)
-        self.assertEqual(lines[1], "status    : STOPPED (since 2026-10-19T10:00:00)")
+        self.assertEqual(lines[2], "  status      : STOPPED  since %s"
+                         % fs.timefmt.fmt("2026-10-19T10:00:00"))
+        rows = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines if ": " in ln}
+        self.assertEqual(rows["manager"], "down")
+        self.assertNotIn("web ui", rows)
 
-    def test_rows_are_grouped_under_headers(self):
+    def test_blocks_are_separated(self):
         lines = self._lines(self._state("running"), alive=True)
-        for header in ("-- process --", "-- incidents --"):
+        for header in ("config:", "incidents:"):
             self.assertIn(header, lines)
-            self.assertEqual(lines[lines.index(header) - 1], "")   # blank line before each
-        self.assertTrue(any(ln.startswith("-- metrics") for ln in lines))
+            self.assertEqual(lines[lines.index(header) - 1], "")
+        self.assertTrue(any(ln.startswith("stats (") for ln in lines))
 
 
 class InspectBasicBlocksTest(unittest.TestCase):
@@ -451,6 +461,7 @@ class InspectBasicBlocksTest(unittest.TestCase):
         out = _json.loads(buf.getvalue())
         self.assertEqual((out["bb_run"], out["bb_all"]), (3, 5))
         self.assertEqual(out["executors"], 0)
+        self.assertIsNone(out["exec_lifetime"])          # no run log carries a stat line
         self.assertEqual(out["cover_log"], str(wd / "cover.log"))
 
 

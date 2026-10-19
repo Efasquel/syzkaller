@@ -81,7 +81,7 @@ tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 means nothing moved, which is the signal you are watching for — an absolute
 counter looks identical whether the box is fuzzing hard or wedged.
 
-The headline of `status` (and the STATUS column of `list`) is the **activity**,
+The `status` row of `status` (and the STATUS column of `list`) is the **activity**,
 finer than the phase and stamped with its duration — `HALTED`/`DONE` are
 activity words, any other word means running: `BOOTING` → `PREPARING` →
 `FUZZING` → `COLLECTING` → `TRIAGING bug …` (job, stage, advance N/M and progress in the `triage` block) →

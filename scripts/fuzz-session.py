@@ -818,6 +818,9 @@ def cmd_inspect(target):
                                                        cover_log_path(state)),
         "boot_epoch": boot_epoch(),
         "exec_total": et if et != "" else None,
+        # Sum of every run's final count: exec_total restarts at 0 with each
+        # manager, so this is the config's effort across crash-restarts.
+        "exec_lifetime": session_exec_lifetime(workdir) or None,
         "coverage": int(stats["coverage"]) if stats.get("coverage") not in ("", None) else None,
         # Basic blocks from the on-disk cover logs, not the manager's stats:
         # readable after a crash, after a stop, and from another account. bb_all
@@ -1927,11 +1930,13 @@ def cmd_list():
 def status_lines(sid, rawcover=False):
     """Build the status dashboard for one session as a list of lines.
 
-    Shared by 'status' (print once) and 'watch' (redraw on an interval).
-    Headline live metrics (coverage/corpus/exec total/rate) come from the run
-    log (~10s fresh); the rest come from the latest bench record. Basic blocks
-    come from the cheap on-disk cover_log unless rawcover=True, which queries the
-    live /rawcover (authoritative but triggers manager-side coverage init).
+    Shared by 'status' (print once) and 'watch' (redraw on an interval), and
+    laid out like fuzz-campaign status: session / config / stats / incidents
+    blocks, run-vs-total figures. Headline live metrics (coverage/corpus/exec
+    total/rate) come from the run log (~10s fresh); the rest from the latest
+    bench record. Basic blocks come from the cheap on-disk cover_log unless
+    rawcover=True, which queries the live /rawcover (authoritative but
+    triggers manager-side coverage init).
     """
     state = refresh_status(sid)
     if not state:
@@ -1944,42 +1949,46 @@ def status_lines(sid, rawcover=False):
     ev = crash_events(state)
     http = state.get("http", "")
     execs = live_executors(state)
-    # Headline: alive or not, with the two numbers that say whether it is doing
-    # anything. The word is coloured on a tty so it reads from across the room.
+    L = []
+
+    def row(label, value):
+        L.append("  %-14s: %s" % (label, value))
+
     status = state.get("status") or "?"
     alive = status == "running" and state_pid_alive(state)
+    L.append("  session:")
+    row("  name", sid)
     if alive:
-        head = "%s (pid %s, %d executor%s, up %s, %s exec/s)" % (
-            style(status.upper(), "green", "bold"), state.get("pid"), len(execs),
-            "" if len(execs) == 1 else "s", fmt_uptime(m["uptime"]), rl["rate"] or "-")
+        row("  status", "%s  for %s" % (style(status.upper(), "green", "bold"),
+                                        fmt_uptime(m["uptime"])))
     else:
-        head = "%s (since %s)" % (
+        row("  status", "%s  since %s" % (
             style(status.upper(), "red" if status == "crashed" else "yellow", "bold"),
-            state.get("stopped_at") or "?")
-    L = [
-        "session   : %s" % sid,
-        "status    : %s" % head,
-        "",
-        "-- process --",
-        "config    : %s" % state.get("config"),
-        "workdir   : %s" % workdir,
-        "http      : %s" % (("http://%s" % http) if http else "-"),
-        "pid       : %s" % state.get("pid"),
-        "runs      : %s" % state.get("run_count"),
-        "started   : %s" % state.get("started_at"),
-        "stopped   : %s" % state.get("stopped_at"),
-        "log       : %s" % state.get("stdout"),
-    ]
-    if state.get("rpc_port"):
-        L.append("rpc port  : %s" % state.get("rpc_port"))
-    L.append("executors : %d live%s" % (
-        len(execs),
-        (" (pids " + ", ".join(str(e["pid"]) for e in execs) + ")") if execs else ""))
+            timefmt.fmt(state.get("stopped_at"), default="?")))
+    row("  runs", "%s" % state.get("run_count"))
+    row("  started", timefmt.fmt(state.get("started_at")))
+
+    L.append("")
+    L.append("  config:")
+    row("  name", state.get("config") or "-")
+    row("  workdir", workdir)
+    if alive:
+        row("  manager", "pid %s, %d executor(s) live%s" % (
+            state.get("pid"), len(execs),
+            (" (pids " + ", ".join(str(e["pid"]) for e in execs) + ")") if execs else ""))
+        if http:
+            row("  web ui", "http://%s" % http)
+        if state.get("rpc_port"):
+            row("  rpc port", state["rpc_port"])
+    else:
+        row("  manager", "down")
+    row("  log", state.get("stdout") or "-")
+
     # Basic blocks: default to the cheap on-disk cover_log (no manager
     # interaction). Only query the live /rawcover when explicitly asked, since
     # its first hit triggers manager-side coverage init (logs + symbolization).
     bb = None
-    if rawcover and state.get("status") == "running" and state_pid_alive(state):
+    if rawcover and alive:
         n = rawcover_count(state.get("http"))
         if n is not None:
             bb = "%s (rawcover, live -- triggered manager cover init)" % n
@@ -1989,31 +1998,31 @@ def status_lines(sid, rawcover=False):
         configured = bool((load_config(state["config"]).get("kext_coverage") or {}
                            ).get("cover_log")) if state.get("config") else False
         if cl.exists() or archives:
-            bb = "%s (this run) / %s (all runs, cover_log)" % (
-                bb_unique([cl]), bb_all_runs(state))
+            bb = "{:,} (total: {:,})".format(bb_unique([cl]), bb_all_runs(state))
         elif configured:
             bb = "- (cover_log configured, no data yet -- run to populate)"
         else:
             bb = "- (cover_log not set; add kext_coverage.cover_log, or --rawcover)"
-    L += [
-        "",
-        "-- metrics (run log = live ~10s; bench = ~60s) --",
-        "coverage   : %s (syz signal)" % (rl["coverage"] or m["coverage"] or "-"),
-        "basic blks : %s" % bb,
-        "corpus     : %s" % (rl["corpus"] or m["corpus"] or "-"),
-        "exec total : %s (this run) / %s (all runs)" % (
-            rl["exec total"] or m["exec total"] or "-", lifetime or "-"),
-        "exec rate  : %s/sec" % (rl["rate"] or "-"),
-        "",
-        "-- incidents --",
-        "incidents  : %s crash / %s hang (+%s snapshot) collected" % (
-            ev.get("crash", 0), ev.get("hang", 0), ev.get("snapshot", 0)),
-        "crash types: %s" % (m["crash types"] or "-"),
-        "uptime     : %s%s" % (
-            fmt_uptime(m["uptime"]),
-            " (%s sec)" % m["uptime"] if m["uptime"] else ""),
-    ]
-    return L
+    L.append("")
+    L.append("  stats (run log = live ~10s; bench = ~60s):")
+    this_run = rl["exec total"] or m["exec total"]
+    row("  executed", "%s (total: %s)" % (
+        "{:,}".format(int(this_run)) if this_run not in ("", None) else "-",
+        "{:,}".format(int(lifetime)) if lifetime not in ("", None) else "-"))
+    row("  speed", "%s/s now" % rl["rate"] if rl["rate"] != "" else "-")
+    row("  basic blocks", bb)
+    row("  signal", "%s  (syz-manager's coverage stat, not blocks)"
+        % (rl["coverage"] or m["coverage"] or "-"))
+    row("  corpus", "%s program(s)" % (rl["corpus"] or m["corpus"] or "-"))
+
+    L.append("")
+    L.append("  incidents:")
+    row("  crashes", "%s" % ev.get("crash", 0))
+    row("  hangs", "%s" % ev.get("hang", 0))
+    row("  snapshots", "%s" % ev.get("snapshot", 0))
+    row("  crash types", "%s" % (m["crash types"] or "-"))
+    # Blocks were built with a two-space margin; headers sit at column 0.
+    return [ln[2:] if ln.startswith("  ") else ln for ln in L]
 
 
 def _status_block(sid, tail, rawcover=False):

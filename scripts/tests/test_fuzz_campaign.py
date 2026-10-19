@@ -1739,7 +1739,7 @@ class StatusWatchTest(unittest.TestCase):
              mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
              mock.patch.object(fc, "free_gb", lambda: 100.0):
             lines, sample = fc.status_lines("camp")
-        self.assertTrue(any("campaign camp" in ln for ln in lines))
+        self.assertIn("  name        : camp", lines)
         self.assertIn("crashes", sample)
 
     def test_status_says_when_a_config_starts_from_scratch(self):
@@ -2104,11 +2104,12 @@ class ActivityTest(unittest.TestCase):
                  activity_since=(datetime.now(timezone.utc)
                                  - timedelta(minutes=12)).isoformat())
         lines = self._status(s, cfg)
-        # The headline IS the activity; there is no separate "running" line.
-        self.assertTrue(lines[0].startswith("campaign camp : TRIAGING"), lines[0])
-        self.assertIn("TRIAGING bug S", lines[0])
-        self.assertIn("for %s" % fc.fmt_hms(12 * 60 + 4), lines[0])
-        self.assertNotIn("running", lines[0])
+        # The status IS the activity; there is no separate "running" line.
+        self.assertEqual(lines[0], "campaign:")
+        self.assertEqual(lines[1], "  name        : camp")
+        self.assertTrue(lines[2].startswith("  status      : TRIAGING bug S"), lines[2])
+        self.assertIn("for %s" % fc.fmt_hms(12 * 60 + 4), lines[2])
+        self.assertNotIn("running", lines[2])
         # The old phase row is folded into it, and the block is grouped.
         self.assertFalse(any(ln.strip().startswith("phase") for ln in lines))
         self.assertIn("", lines)
@@ -2117,8 +2118,8 @@ class ActivityTest(unittest.TestCase):
         cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
         s = fc.init_state("camp")
         fc.set_activity(s, "fuzzing", "cfg")
-        plain = self._status(s, cfg, colour=False)[0]
-        coloured = self._status(s, cfg, colour=True)[0]
+        plain = self._status(s, cfg, colour=False)[2]
+        coloured = self._status(s, cfg, colour=True)[2]
         self.assertNotIn("\033[", plain)
         self.assertIn("\033[32;1mFUZZING\033[0m cfg", coloured)   # green, word only
 
@@ -2126,7 +2127,7 @@ class ActivityTest(unittest.TestCase):
         cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
         s = fc.init_state("camp")
         s.pop("activity")        # a state file written before activity existed
-        head = self._status(s, cfg)[0]
+        head = self._status(s, cfg)[2]
         self.assertIn("running", head)             # the status still says something here
         self.assertIn("phase fuzzing", head)
 
@@ -2269,8 +2270,8 @@ class HaltedHeadlineTest(unittest.TestCase):
                  mock.patch.object(fc, "style", type(fc.style)(False)):
                 fc.save_state(s)                      # the hook sets activity=halted
                 lines, _ = fc.status_lines("camp")
-        self.assertTrue(lines[0].startswith(
-            "campaign camp : HALTED/CRASH-LOOP crash loop (15 crashes)"), lines[0])
+        self.assertTrue(lines[2].startswith(
+            "  status      : HALTED/CRASH-LOOP crash loop (15 crashes)"), lines[2])
         self.assertEqual(sum("crash loop (15" in ln for ln in lines), 1)
 
     def test_the_kind_of_stop_is_read_from_the_reason(self):
@@ -2344,12 +2345,14 @@ class StopPlanTest(unittest.TestCase):
                  contextlib.redirect_stdout(buf):
                 lines, _ = fc.status_lines("camp")
                 fc.cmd_list()
-        self.assertTrue(lines[1].startswith("  updated       : "), lines[1])
-        # Under the session header: it is this config's budget, not the campaign's end.
-        self.assertIn("    stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)),
+        self.assertTrue(lines[3].startswith("  updated     : "), lines[3])
+        # Under the config header: it is this config's budget, not the campaign's end.
+        self.assertIn("  stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)),
                       lines)
-        self.assertLess(lines.index("  session (1/1 - no loop):"),
-                        lines.index("    stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600))))
+        self.assertLess(lines.index("config (1/1 - no loop):"),
+                        lines.index("  stop        : %s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600))))
+        self.assertIn("  fuzzed      : %s  (prep %s, triage %s, reboots %s)" % ((fc.fmt_hms(0),) * 4),
+                      lines)
         self.assertIn("STOP ", buf.getvalue())
         self.assertNotIn("THEN", buf.getvalue())
         self.assertIn("%s / %s (fuzzing)" % (fc.fmt_hms(3600), fc.fmt_hms(3600)), buf.getvalue())
@@ -2366,6 +2369,9 @@ class BasicBlocksTest(unittest.TestCase):
         fc.note_coverage(s, "b", {"bb_all": 40})
         fc.note_coverage(s, "b", {})                     # no cover log: nothing to say
         self.assertEqual(s["bb_covered"], {"a": 300, "b": 40})
+        fc.note_coverage(s, "a", {"exec_lifetime": 5000})
+        fc.note_coverage(s, "a", {"exec_lifetime": 4000})
+        self.assertEqual(s["exec_by_config"], {"a": 5000})
 
     def _status(self, s, cfg, live):
         with mock.patch.object(fc, "STATE_DIR", cfg.parent / "state"), \
@@ -2382,17 +2388,24 @@ class BasicBlocksTest(unittest.TestCase):
             cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
             s = fc.init_state("camp")
             s.update(session_id="a", current_config=str(cfg), bb_covered={"a": 900, "b": 40})
+            s["exec_by_config"] = {"a": 40000000}
+            s["active_seconds"] = 48117004 / 62.0
             lines = self._status(s, cfg, {"found": True, "bb_all": 1204, "bb_run": 317,
-                                          "coverage": 9412})
+                                          "coverage": 9412, "exec_total": 1214880,
+                                          "exec_lifetime": 48117004, "rate": 78})
             rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
             self.assertIn("317 (total: 1,204)", rows["basic blocks"])
+            self.assertIn("1,214,880 (total: 48,117,004)", rows["executed"])
+            self.assertIn("78/s now, 62/s average", rows["speed"])
             self.assertIn("b 40", rows["earlier cfgs"])
             self.assertIn("9412  (syz-manager's coverage stat, not blocks)", rows["signal"])
             self.assertNotIn("coverage", rows)
             # Manager gone (post-crash, or a halted campaign): the recorded max stands.
+            s["last_exec_total"] = 1214880
             lines = self._status(s, cfg, {"found": False})
             rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
             self.assertIn("- (total: 900)", rows["basic blocks"])
+            self.assertIn("1,214,880 (total: 40,000,000)", rows["executed"])
 
 
 class TriageBlockTest(unittest.TestCase):
@@ -2564,8 +2577,8 @@ class ManagerRowTest(unittest.TestCase):
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(False)):
                 lines, _ = fc.status_lines("camp")
-        self.assertIn("    manager     : pid 4120, 2 executor(s) live", lines)
-        self.assertIn("    web ui      : http://127.0.0.1:56741", lines)
+        self.assertIn("  manager     : pid 4120, 2 executor(s) live", lines)
+        self.assertIn("  web ui      : http://127.0.0.1:56741", lines)
 
 
 class BenchableMemoTest(unittest.TestCase):

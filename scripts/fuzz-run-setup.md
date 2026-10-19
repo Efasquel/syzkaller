@@ -357,8 +357,8 @@ experiment then silently inherits the old corpus and its coverage baseline.
 scrolled past hours ago:
 
 ```
-    corpus      : 260831_cov_gram_no7_test  (26 KB, last grew 01/09 14:55:31)
-    corpus      : none yet -- this config starts from scratch
+  corpus      : 260831_cov_gram_no7_test  (26 KB, last grew 01/09 14:55:31)
+  corpus      : none yet -- this config starts from scratch
 ```
 
 ### Watching a campaign
@@ -371,57 +371,62 @@ scrolled past hours ago:
 A full `status`, here mid-minimization (the figures are from a demo state):
 
 ```
-campaign demo_triaging : TRIAGING bug 3f2a9c01  for 0h31m
-  updated       : 19/10/2026 14:47:22  (0h19m ago)
+campaign:
+  name        : demo_triaging
+  status      : TRIAGING bug 3f2a9c01  for 0h12m
+  updated     : 19/10/2026 15:15:36  (0h00m ago)
 
-  triage (job demo_triaging_t1, boot 7 / 40):
-    stage       : MINIMIZE_CALLS
-    progress    : 12 subsets tested for 40 calls, 3 crashing
+triage (job demo_triaging_t1, boot 7 / 40):
+  stage       : MINIMIZE_CALLS
+  progress    : 12 subsets tested for 40 calls, 3 crashing
 
-  session (1/1 - no loop):
-    config      : AppleSMC_demo_cov
-    stop        : 17h18m / 24h00m (fuzzing)
-    manager     : down
-    started     : 19/10/2026 06:06:22
-    corpus      : workdir  (412 KB, last grew 19/10 14:47:22)
-    quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
+config (1/1 - no loop):
+  name        : AppleSMC_demo_cov
+  stop        : 17h18m / 24h00m (fuzzing)
+  fuzzed      : 6h41m  (prep 0h12m, triage 1h03m, reboots 0h44m)
+  manager     : down
+  started     : 19/10/2026 06:34:36
+  corpus      : workdir  (412 KB, last grew 19/10 15:15:36)
+  quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
 
-  time breakdown (whole campaign):
-    preparing   : 0h12m  (until first exec)
-    fuzzing     : 6h41m  (first exec -> end of run)
-    minimizing  : 1h03m  (triage)
-    rebooting   : 0h44m  (panic -> back up)
-    total       : 8h41m
+time breakdown (whole campaign):
+  preparing   : 0h12m  (until first exec)
+  fuzzing     : 6h41m  (first exec -> end of run)
+  minimizing  : 1h03m  (triage)
+  rebooting   : 0h44m  (panic -> back up)
+  total       : 8h41m
 
-  stats:
-    executed    : 11,214,880 program(s)
-    basic blocks: 317 (total: 1,304)
-    disk free   : 574.9 GB
+stats:
+  executed    : 214,880 (total: 1,878,396)
+  speed       : 78/s average
+  basic blocks: 317 (total: 1,304)
+  disk free   : 574.6 GB
 
-  incidents (this config: 2 / 20):
-    crashes     : 4
-    hangs       : 0
-    benched     : 2  (77ab10c3, 3f2a9c01)
-    triage queue: 1 second bug(s) waiting: 9c1e55d2
+incidents (this config: 2 / 20):
+  crashes     : 4
+  hangs       : 0
+  benched     : 2  (77ab10c3, 3f2a9c01)
+  triage queue: 1 second bug(s) waiting: 9c1e55d2
 
-  last 4 incident(s):
-    when            kind   ran  sig       bug       kext                    decision
-    19/10 09:47:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
-    19/10 11:37:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
-    19/10 13:12:22  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
-    19/10 14:33:22  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
+last 4 incident(s):
+  when            kind   ran  sig       bug       kext                    decision
+  19/10 10:15:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
+  19/10 12:05:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
+  19/10 13:40:36  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
+  19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
 ```
 
 Top to bottom: what the box is doing and for how long; how fresh this screen
-is; the triage job while one runs; the session (which config, how much of its
-budget is left on which clock, where the manager's UI is, what the quarantine
+is; the triage job while one runs; the config (which one, how much of its
+budget is left on which clock, its own clocks, the manager, what the quarantine
 has benched); the campaign's time split four ways; the numbers; the incidents.
 
 Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 
 ```
 stats:
-  executed    : 11,214,880 program(s)  (78/sec)   +4,213
+  executed    : 214,880 (total: 1,878,396)   +4,213
+  speed       : 78/s now, 78/s average
   basic blocks: 317 (total: 1,204)                    +2
 incidents (this config: 2 / 20):
   crashes     : 4   +1
@@ -436,13 +441,16 @@ moved, which is exactly the signal you are watching for.
 
 #### Between two crashes: what the box is doing, without typing
 
-The headline of `status` is the **activity** — finer than the phase, with how
-long it has been going. It is also the campaign's status: `HALTED`/`DONE` are
+The `status` row of `status` is the **activity** — finer than the phase, with how
+long it has been going. It is also the campaign's state: `HALTED`/`DONE` are
 activity words, and any other word means running, so nothing else repeats it:
 
 ```
-campaign jpeg : TRIAGING bug 3f2a  for 0h12m
-campaign fde  : HALTED/CRASH-LOOP crash loop (15 crashes in a row before 50 programs executed)  for 2h03m
+campaign:
+  name        : jpeg
+  status      : TRIAGING bug 3f2a  for 0h12m
+
+  status      : HALTED/CRASH-LOOP crash loop (15 crashes in a row before 50 programs executed)  for 2h03m
 ```
 
 | activity | meaning |
@@ -459,8 +467,8 @@ The word is green for fuzzing, red for halted, yellow for everything in between,
 and only on a tty. The `STATUS` column of `list` is the same word with its
 duration.
 
-The `stop` row in the session block is what is left of the current config's
-budget -- not the campaign's end; the session header says whether more configs
+The `stop` row in the config block is what is left of the current config's
+budget -- not the campaign's end; the config header says whether more configs
 or a loop follow -- shown
 as left / budget with its clock: `17h18m / 24h00m (fuzzing)`, `3h00m / 8h00m
 (total)`, or `at 19/10 16:00 (2h00m, real)` (the real clock is the only one
@@ -494,12 +502,34 @@ names no kext, so "fuzzed" means the workdir's kext directory and the services
 the config opens:
 
 ```
-  last 4 incident(s):
-    when            kind   ran  sig       bug       kext                    decision
-    19/10 09:47:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
-    19/10 11:37:22  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
-    19/10 13:12:22  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
-    19/10 14:33:22  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
+last grew 19/10 15:15:36)
+  quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
+
+time breakdown (whole campaign):
+  preparing   : 0h12m  (until first exec)
+  fuzzing     : 6h41m  (first exec -> end of run)
+  minimizing  : 1h03m  (triage)
+  rebooting   : 0h44m  (panic -> back up)
+  total       : 8h41m
+
+stats:
+  executed    : 214,880 (total: 1,878,396)
+  speed       : 78/s average
+  basic blocks: 317 (total: 1,304)
+  disk free   : 574.6 GB
+
+incidents (this config: 2 / 20):
+  crashes     : 4
+  hangs       : 0
+  benched     : 2  (77ab10c3, 3f2a9c01)
+  triage queue: 1 second bug(s) waiting: 9c1e55d2
+
+last 4 incident(s):
+  when            kind   ran  sig       bug       kext                    decision
+  19/10 10:15:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
+  19/10 12:05:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
+  19/10 13:40:36  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
+  19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
 ```
 
 While triaging, the `triage` block reads the job's checkpoint: subsets tested and

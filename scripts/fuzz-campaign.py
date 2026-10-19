@@ -562,8 +562,9 @@ def init_state(name):
         "panic_sig_watermark": _newest_report_mtime(),
         # What the box is doing right now (see set_activity), finer than phase.
         "activity": None, "activity_detail": "", "activity_since": None,
-        # Most basic blocks each config's cover logs ever showed (see note_coverage).
-        "bb_covered": {},
+        # Most basic blocks each config's cover logs ever showed, and most programs
+        # its run logs ever summed to (see note_coverage).
+        "bb_covered": {}, "exec_by_config": {},
     }
 
 
@@ -649,23 +650,25 @@ COORDINATOR_DEFAULTS = {
     "config_incidents": 0, "startup_failures": 0, "abandoned": [],
     "triage_queue": [], "triage_seen": {},
     "activity": None, "activity_detail": "", "activity_since": None,
-    "bb_covered": {},
+    "bb_covered": {}, "exec_by_config": {},
 }
 
 
 def note_coverage(s, sid, info):
-    """Keep the most basic blocks a config's cover logs have shown.
+    """Keep the most basic blocks a config's cover logs have shown, and the
+    most programs its run logs have summed to.
 
     inspect reads the logs of the CURRENT session only, so a sweep would lose
-    each config's figure the moment the campaign moved on, and a halted campaign
-    would have nothing to show once its workdir is gone. Max, not last: an
-    archived log that is pruned by hand would otherwise read as lost coverage.
+    each config's figures the moment the campaign moved on, and a halted
+    campaign would have nothing to show once its workdir is gone. Max, not
+    last: a log pruned by hand would otherwise read as lost progress.
     """
-    bb = info.get("bb_all")
-    if bb is None:
-        return
-    covered = s.setdefault("bb_covered", {})
-    covered[sid] = max(int(bb), int(covered.get(sid) or 0))
+    for key, store in (("bb_all", "bb_covered"), ("exec_lifetime", "exec_by_config")):
+        v = info.get(key)
+        if v is None:
+            continue
+        d = s.setdefault(store, {})
+        d[sid] = max(int(v), int(d.get(sid) or 0))
 
 
 def load_state(name):
@@ -2494,10 +2497,12 @@ def status_lines(name, prev=None):
     def row(label, value, extra=""):
         out.append("  %-14s: %s%s" % (label, value, extra))
 
-    # The headline IS the activity: "halted"/"done" are activity words and any
-    # other word means running, so a separate status line would only repeat it.
-    # This is the one line you read between two panics.
-    out.append("campaign %s : %s" % (name, activity_text(s, colour=True)))
+    # The status IS the activity: "halted"/"done" are activity words and any
+    # other word means running, so a separate state line would only repeat it.
+    # This is the line you read between two panics.
+    out.append("  campaign:")
+    row("  name", name)
+    row("  status", activity_text(s, colour=True))
     # When the driver last wrote the state: everything below is read from that
     # file, so this is how fresh the screen is. A FUZZING headline over a stale
     # stamp means the driver is dead (the NO SUPERVISOR warning spells it out).
@@ -2510,12 +2515,12 @@ def status_lines(name, prev=None):
         if s.get("status") == "running" and \
                 time.time() - t_upd >= max(2.5 * d["poll_seconds"], 120):
             age = style(age, "red", "bold")
-    row("updated", "%s%s" % (timefmt.fmt(s.get("updated_at")), age))
+    row("  updated", "%s%s" % (timefmt.fmt(s.get("updated_at")), age))
     if s.get("halt_reason") and s["halt_reason"] != s.get("activity_detail"):
-        row("halt reason", s["halt_reason"])    # the headline already has it otherwise
+        row("  halt reason", s["halt_reason"])    # the status row has it otherwise
     orphan = orphaned_session(s, d)
     if orphan:
-        out.append("  %s the state has not been written for %s (poll is %ds)."
+        out.append("    %s the state has not been written for %s (poll is %ds)."
                    % (style("!! NO SUPERVISOR:", "red", "bold"),
                       fmt_hms(orphan["stale_for"]), d["poll_seconds"]))
         out.append("     The manager is still fuzzing, unwatched: no budget is "
@@ -2525,32 +2530,30 @@ def status_lines(name, prev=None):
         out.append("       fuzz-session.py stop %s" % orphan["sid"])
     held = brake_held(name)
     if held:
-        row(style("BRAKE", "red", "bold"), "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
+        row("  " + style("BRAKE", "red", "bold"),
+            "%s%s" % (held[0], " -- %s" % held[1] if held[1] else ""))
+    # The campaign's own start is the config's for a single-config campaign
+    # (stamped a few seconds apart); worth a row only once the campaign has
+    # moved on from its first config.
+    t_camp, t_cfg = (timefmt.to_epoch(s.get("started_at")),
+                     timefmt.to_epoch(s.get("config_started_at")))
+    if t_camp is None or t_cfg is None or abs(t_camp - t_cfg) > 60:
+        row("  started", timefmt.fmt(s.get("started_at")))
 
     live = inspect(s["session_id"]) if s.get("session_id") else {}
 
     out.append("")
-    # The campaign's own start is the session's for a single-config campaign
-    # (stamped a few seconds apart); it earns a block of its own only once the
-    # campaign has moved on from its first config.
     if s.get("phase") == "triaging" and s.get("triage_job"):
         out.extend(triage_lines(s, d, row))
-        out.append("")
-
-    t_camp, t_cfg = (timefmt.to_epoch(s.get("started_at")),
-                     timefmt.to_epoch(s.get("config_started_at")))
-    if t_camp is None or t_cfg is None or abs(t_camp - t_cfg) > 60:
-        out.append("  campaign:")
-        row("  started", timefmt.fmt(s.get("started_at")))
         out.append("")
 
     cfg = s.get("current_config")
     if cfg:
         item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-        out.append("  session (%d/%d - %s):"
+        out.append("  config (%d/%d - %s):"
                    % (min(s["cursor"] + 1, len(d["items"])), len(d["items"]),
                       "loops" if d["loop"] else "no loop"))
-        row("  config", config_id(cfg))
+        row("  name", config_id(cfg))
         # What is left of THIS config's budget, on its clock -- not the
         # campaign's end: the header says whether more configs or a loop follow.
         # A fuzz-clock budget does not move while triaging, so it can read the
@@ -2558,6 +2561,11 @@ def status_lines(name, prev=None):
         left = stop_plan(s, d)
         if left:
             row("  stop", left)
+        # This config's clocks (reset at each config advance); the breakdown
+        # below is the whole campaign's.
+        row("  fuzzed", "%s  (prep %s, triage %s, reboots %s)"
+            % (fmt_hms(s.get("active_seconds")), fmt_hms(s.get("prep_seconds")),
+               fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
         # The manager's UI: coverage browser, corpus, crash list. Only meaningful
         # while the manager is actually serving, so it is shown with that caveat
         # rather than as a link that may quietly not answer.
@@ -2621,10 +2629,24 @@ def status_lines(name, prev=None):
         else s.get("last_exec_total")
     cov = live.get("coverage")
     out.append("  stats:")
-    row("  executed", "%s program(s)%s"
+    # This run's count (exec_total restarts with every manager) and the
+    # config's total over all its runs, like the basic blocks row.
+    exec_all = live.get("exec_lifetime")
+    if exec_all is None and s.get("session_id"):
+        exec_all = (s.get("exec_by_config") or {}).get(s["session_id"])
+    row("  executed", "%s (total: %s)"
         % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
-           "  (%s/sec)" % live.get("rate") if live.get("rate") else ""),
-        _delta(execs, prev.get("execs"), "%+,d".replace(",", "")))
+           "{:,}".format(int(exec_all)) if exec_all is not None else "-"),
+        _delta(_int(exec_all) if exec_all is not None else execs,
+               prev.get("execs"), "%+d"))
+    # Now = the manager's own rate from its last stat line; average = this
+    # config's programs over its fuzzing time, which smooths the restarts.
+    speed = []
+    if live.get("rate"):
+        speed.append("%s/s now" % live["rate"])
+    if exec_all is not None and (s.get("active_seconds") or 0) > 0:
+        speed.append("%d/s average" % round(int(exec_all) / s["active_seconds"]))
+    row("  speed", ", ".join(speed) if speed else "-")
     # Basic blocks come from the cover logs (readable with the manager dead),
     # never from the manager's `coverage` stat, which is its signal count and
     # was once printed under this name.
@@ -2684,7 +2706,10 @@ def status_lines(name, prev=None):
         out.append("  last %d incident(s):" % min(5, len(s["incidents"])))
         out.extend("    " + ln for ln in incident_table(s["incidents"][-5:], colour=True))
 
-    sample = {"execs": execs, "cov": _int(cov), "bb": _int(bb), "crashes": s["crashes"],
+    # Blocks were built with a two-space margin; headers sit at column 0.
+    out = [ln[2:] if ln.startswith("  ") else ln for ln in out]
+    sample = {"execs": _int(exec_all) if exec_all is not None else execs,
+              "cov": _int(cov), "bb": _int(bb), "crashes": s["crashes"],
               "hangs": s["hangs"],
               "corpus_bytes": (corpus_facts(cfg) or {}).get("bytes") if cfg else None}
     return out, sample
