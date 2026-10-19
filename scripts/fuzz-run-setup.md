@@ -357,7 +357,7 @@ experiment then silently inherits the old corpus and its coverage baseline.
 scrolled past hours ago:
 
 ```
-  corpus      : 260831_cov_gram_no7_test  (26 KB, last grew 01/09 14:55:31)
+  corpus      : 26 KB, last grew 01/09 14:55:31
   corpus      : none yet -- this config starts from scratch
 ```
 
@@ -416,10 +416,13 @@ last 4 incident(s):
   19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
 ```
 
-Top to bottom: what the box is doing and for how long; how fresh this screen
-is; the triage job while one runs; the config (which one, how much of its
-budget is left on which clock, its own clocks, the manager, what the quarantine
-has benched); the campaign's time split four ways; the numbers; the incidents.
+Two blocks, one scope each. `campaign`: what the box is doing and for how long,
+how fresh this screen is, the campaign's incident counters, disk, and its time
+split four ways. `config`: the one being fuzzed -- how much of its budget is
+left on which clock, its own clocks, the manager, its corpus, what the
+quarantine has benched, what it executed and covered, its incident count
+against the per-config limit. `triage` appears while a job runs; the recent
+incidents close the screen.
 
 Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 

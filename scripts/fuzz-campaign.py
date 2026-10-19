@@ -2486,7 +2486,10 @@ def triage_lines(s, d, row):
 def status_lines(name, prev=None):
     """The status block as a list of lines, plus a sample dict for the next call.
 
-    prev is the previous call's sample; when given, changed counters are annotated
+    Two blocks, each of one scope: `campaign` (its state, its incidents, its
+    clocks) and `config` (the one being fuzzed: its budget, its manager, its
+    numbers), plus `triage` while a job runs and the recent incidents. prev is
+    the previous call's sample; when given, changed counters are annotated
     with their delta.
     """
     d = load_def(name)
@@ -2497,6 +2500,7 @@ def status_lines(name, prev=None):
     def row(label, value, extra=""):
         out.append("  %-14s: %s%s" % (label, value, extra))
 
+    # --- campaign -------------------------------------------------------------
     # The status IS the activity: "halted"/"done" are activity words and any
     # other word means running, so a separate state line would only repeat it.
     # This is the line you read between two panics.
@@ -2506,7 +2510,7 @@ def status_lines(name, prev=None):
     row("  name", name)
     row("  status", activity_text(s, colour=True))
     # When the driver last wrote the state: everything below is read from that
-    # file, so this is how fresh the screen is. A FUZZING headline over a stale
+    # file, so this is how fresh the screen is. A FUZZING status over a stale
     # stamp means the driver is dead (the NO SUPERVISOR warning spells it out).
     # Colour only marks anomalies: a stamp older than the orphan threshold goes
     # red, and the same for the four other "look here" strings in this view.
@@ -2541,6 +2545,45 @@ def status_lines(name, prev=None):
                      timefmt.to_epoch(s.get("config_started_at")))
     if t_camp is None or t_cfg is None or abs(t_camp - t_cfg) > 60:
         row("  started", timefmt.fmt(s.get("started_at")))
+    # Incidents over the whole campaign; the per-config count is in its block.
+    row("  crashes", "%d" % s["crashes"], _delta(s["crashes"], prev.get("crashes")))
+    row("  hangs", "%d" % s["hangs"], _delta(s["hangs"], prev.get("hangs")))
+    row("  benched", "%d%s" % (len(s.get("suppressed_sigs") or []),
+                                   "  (%s)" % ", ".join(s["suppressed_sigs"][-3:])
+                                   if s.get("suppressed_sigs") else ""))
+    if s.get("startup_failures"):
+        row("  startup", "%d failed start(s) in a row (halts at %d): %s"
+            % (s["startup_failures"], d.get("startup_fail_limit",
+                                            DEFAULTS["startup_fail_limit"]),
+               s.get("last_startup_error") or "?"))
+    for a_ in s.get("abandoned", []):
+        row("  abandoned", "%s  (%s, %s)" % (config_id(a_["config"]), a_.get("reason"),
+                                             timefmt.fmt(a_.get("at"), short=True)))
+    if s.get("triage_queue"):
+        row("  triage queue", "%d second bug(s) waiting: %s"
+            % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
+    if s.get("exhausted_sigs"):
+        why = s.get("exhausted_why") or {}
+        row("  exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
+            % (len(s["exhausted_sigs"]),
+               ", ".join("%s %s" % (g, why.get(g, "no-repro"))
+                         for g in s["exhausted_sigs"][-3:])))
+    row("  disk free", "%.1f GB" % free_gb())
+    # Four clocks, campaign-lifetime (never reset by a config advance). Reported
+    # separately because "24h of fuzzing" and "24h of campaign" are different
+    # claims, and a writeup that conflates them overstates the fuzzing.
+    # "fuzzing" starts at the run's first executed program, so the startup
+    # (snapshot, grammar compile, executor handshake) is its own line. It still
+    # includes the manager re-triaging its corpus and waiting on RPC; for pure
+    # execution time `runstats.py show` reads syz-manager's own counter. One-word
+    # hints only; the long form is in fuzz-run-setup.md "Reading the clocks".
+    out.append("    time breakdown:")
+    for label, key, hint in (("preparing", "prep_seconds", "until first exec"),
+                             ("fuzzing", "active_seconds", "first exec -> end of run"),
+                             ("minimizing", "triage_seconds", "triage"),
+                             ("rebooting", "overhead_seconds", "panic -> back up")):
+        row("    " + label, fmt_hms(lifetime(s, key)), "  (%s)" % hint)
+    row("    total", fmt_hms(lifetime_wall(s)))
 
     live = inspect(s["session_id"]) if s.get("session_id") else {}
 
@@ -2549,29 +2592,37 @@ def status_lines(name, prev=None):
         out.extend(triage_lines(s, d, row))
         out.append("")
 
+    # --- config ---------------------------------------------------------------
+    execs = live.get("exec_total") if live.get("exec_total") is not None \
+        else s.get("last_exec_total")
+    cov = live.get("coverage")
+    sid = s.get("session_id")
+    exec_all = live.get("exec_lifetime")
+    if exec_all is None and sid:
+        exec_all = (s.get("exec_by_config") or {}).get(sid)
+    covered = s.get("bb_covered") or {}
+    bb = live.get("bb_all")
+    if bb is None and sid:
+        bb = covered.get(sid)
     cfg = s.get("current_config")
     if cfg:
-        item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
         out.append("  config:")
         row("  name", config_id(cfg))
         # What is left of THIS config's budget, on its clock -- not the
-        # campaign's end: the header says whether more configs or a loop follow.
-        # A fuzz-clock budget does not move while triaging, so it can read the
-        # same across a whole minimization.
+        # campaign's end: the campaign header says whether more configs or a
+        # loop follow. A fuzz-clock budget does not move while triaging, so it
+        # can read the same across a whole minimization.
         left = stop_plan(s, d)
         if left:
             row("  stop", left)
-        # This config's clocks (reset at each config advance); the breakdown
-        # below is the whole campaign's.
+        # This config's clocks (reset at each config advance); the campaign's
+        # time breakdown above is the whole campaign's.
         row("  fuzzed", "%s  (prep %s, triage %s, reboots %s)"
             % (fmt_hms(s.get("active_seconds")), fmt_hms(s.get("prep_seconds")),
                fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
-        # The manager's UI: coverage browser, corpus, crash list. Only meaningful
-        # while the manager is actually serving, so it is shown with that caveat
-        # rather than as a link that may quietly not answer.
         # The manager process and its executors, from the session record. A
         # dead manager is expected while triaging or collecting; under a
-        # FUZZING headline it is the anomaly, so that one is red.
+        # FUZZING status it is the anomaly, so that one is red.
         if live.get("found"):
             if live.get("pid_alive"):
                 n = live.get("executors")
@@ -2589,11 +2640,12 @@ def status_lines(name, prev=None):
             row("  web ui", url if url.startswith("http") else "http://%s" % url)
         if s.get("config_started_at"):
             row("  started", timefmt.fmt(s["config_started_at"]))
-        # A config is a workdir. Say plainly whether this run inherited a corpus.
+        # A config is a workdir: re-running one resumes its corpus. Say plainly
+        # whether this run inherited one, and whether it is still growing.
         cf_facts = corpus_facts(cfg)
         if cf_facts:
-            row("  corpus", "%s  (%.0f KB, last grew %s)"
-                % (Path(cf_facts["workdir"]).name, cf_facts["bytes"] / 1024.0,
+            row("  corpus", "%.0f KB, last grew %s"
+                % (cf_facts["bytes"] / 1024.0,
                    timefmt.fmt_epoch(cf_facts["mtime"], short=True)),
                 _delta(cf_facts["bytes"], prev.get("corpus_bytes"), "%+d B"))
         else:
@@ -2603,103 +2655,44 @@ def status_lines(name, prev=None):
         total = benchable_syscalls(cfg)
         row("  quarantine", quarantine_summary(load_qstate(cfg),
                                                len(total) if total is not None else None))
-
-    # Four clocks, campaign-lifetime (never reset by a config advance). Reported
-    # separately because "24h of fuzzing" and "24h of campaign" are different
-    # claims, and a writeup that conflates them overstates the fuzzing.
-    # "fuzzing" starts at the run's first executed program, so the startup
-    # (snapshot, grammar compile, executor handshake) is its own line. It still
-    # includes the manager re-triaging its corpus and waiting on RPC; for pure
-    # execution time `runstats.py show` reads syz-manager's own counter.
-    out.append("")
-    out.append("  time breakdown (whole campaign):")
-    # One-word hints only; the long form is in fuzz-run-setup.md "Reading the
-    # clocks". These repaint every 10s in the watch window.
-    for label, key, hint in (("preparing", "prep_seconds", "until first exec"),
-                             ("fuzzing", "active_seconds", "first exec -> end of run"),
-                             ("minimizing", "triage_seconds", "triage"),
-                             ("rebooting", "overhead_seconds", "panic -> back up")):
-        row("  " + label, fmt_hms(lifetime(s, key)), "  (%s)" % hint)
-    row("  total", fmt_hms(lifetime_wall(s)))
-
-    # What the box actually did, not just how long it was up: on this target a
-    # campaign can burn an hour of wall clock and execute very little.
-    out.append("")
-    execs = live.get("exec_total") if live.get("exec_total") is not None \
-        else s.get("last_exec_total")
-    cov = live.get("coverage")
-    out.append("  stats:")
-    # This run's count (exec_total restarts with every manager) and the
-    # config's total over all its runs, like the basic blocks row.
-    exec_all = live.get("exec_lifetime")
-    if exec_all is None and s.get("session_id"):
-        exec_all = (s.get("exec_by_config") or {}).get(s["session_id"])
-    row("  executed", "%s (total: %s)"
-        % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
-           "{:,}".format(int(exec_all)) if exec_all is not None else "-"),
-        _delta(_int(exec_all) if exec_all is not None else execs,
-               prev.get("execs"), "%+d"))
-    # Now = the manager's own rate from its last stat line; average = this
-    # config's programs over its fuzzing time, which smooths the restarts.
-    speed = []
-    if live.get("rate"):
-        speed.append("%s/s now" % live["rate"])
-    if exec_all is not None and (s.get("active_seconds") or 0) > 0:
-        speed.append("%d/s average" % round(int(exec_all) / s["active_seconds"]))
-    row("  speed", ", ".join(speed) if speed else "-")
-    # Basic blocks come from the cover logs (readable with the manager dead),
-    # never from the manager's `coverage` stat, which is its signal count and
-    # was once printed under this name.
-    covered = s.get("bb_covered") or {}
-    sid = s.get("session_id")
-    bb = live.get("bb_all")
-    if bb is None and sid:
-        bb = covered.get(sid)
-    if bb is not None:
-        # current = this run's log; total = distinct PCs over this run and every
-        # archived run of this config (one set, so a block hit again after a
-        # crash-restart is counted once).
-        this_run = live.get("bb_run")
-        row("  basic blocks", "%s (total: %s)"
-            % ("{:,}".format(int(this_run)) if this_run is not None else "-",
-               "{:,}".format(int(bb))),
-            _delta(_int(bb), prev.get("bb")))
-    others = {k: v for k, v in covered.items() if k != sid}
-    if others:
-        row("    earlier cfgs", "  ".join("%s %s" % (k, "{:,}".format(int(v)))
-                                       for k, v in sorted(others.items())))
-    if cov not in (None, ""):
-        row("  signal", "%s  (syz-manager's coverage stat, not blocks)" % cov,
-            _delta(_int(cov), prev.get("cov")))
-    row("  disk free", "%.1f GB" % free_gb())
-
-    out.append("")
-    # config_incidents counts crashes AND hangs; max_crashes is the per-config
-    # limit on that sum (the option predates hang detection).
-    out.append("  incidents (this config: %d / %d):"
-               % (s.get("config_incidents", 0), d["max_crashes"]))
-    row("  crashes", "%d" % s["crashes"], _delta(s["crashes"], prev.get("crashes")))
-    row("  hangs", "%d" % s["hangs"], _delta(s["hangs"], prev.get("hangs")))
-    row("  benched", "%d%s" % (len(s.get("suppressed_sigs") or []),
-                                   "  (%s)" % ", ".join(s["suppressed_sigs"][-3:])
-                                   if s.get("suppressed_sigs") else ""))
-    if s.get("startup_failures"):
-        row("  startup", "%d failed start(s) in a row (halts at %d): %s"
-            % (s["startup_failures"], d.get("startup_fail_limit",
-                                            DEFAULTS["startup_fail_limit"]),
-               s.get("last_startup_error") or "?"))
-    for a in s.get("abandoned", []):
-        row("  abandoned", "%s  (%s, %s)" % (config_id(a["config"]), a.get("reason"),
-                                             timefmt.fmt(a.get("at"), short=True)))
-    if s.get("triage_queue"):
-        row("  triage queue", "%d second bug(s) waiting: %s"
-            % (len(s["triage_queue"]), ", ".join(q["sig"] for q in s["triage_queue"])))
-    if s.get("exhausted_sigs"):
-        why = s.get("exhausted_why") or {}
-        row("  exhausted", "%d sig(s) minimization could not reduce, not re-triaged (%s)"
-            % (len(s["exhausted_sigs"]),
-               ", ".join("%s %s" % (g, why.get(g, "no-repro"))
-                         for g in s["exhausted_sigs"][-3:])))
+        # What the box actually did, not just how long it was up: on this target
+        # a config can burn an hour of wall clock and execute very little. This
+        # run's count (exec_total restarts with every manager) and the config's
+        # total over all its runs, like the basic blocks row.
+        row("  executed", "%s (total: %s)"
+            % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
+               "{:,}".format(int(exec_all)) if exec_all is not None else "-"),
+            _delta(_int(exec_all) if exec_all is not None else execs,
+                   prev.get("execs"), "%+d"))
+        # Now = the manager's own rate from its last stat line; average = this
+        # config's programs over its fuzzing time, which smooths the restarts.
+        speed = []
+        if live.get("rate"):
+            speed.append("%s/s now" % live["rate"])
+        if exec_all is not None and (s.get("active_seconds") or 0) > 0:
+            speed.append("%d/s average" % round(int(exec_all) / s["active_seconds"]))
+        row("  speed", ", ".join(speed) if speed else "-")
+        # Basic blocks come from the cover logs (readable with the manager
+        # dead), never from the manager's `coverage` stat, which is its signal
+        # count and was once printed under this name. current = this run's log;
+        # total = distinct PCs over this run and every archived run of this
+        # config (one set, so a block hit again after a crash-restart counts once).
+        if bb is not None:
+            this_run = live.get("bb_run")
+            row("  basic blocks", "%s (total: %s)"
+                % ("{:,}".format(int(this_run)) if this_run is not None else "-",
+                   "{:,}".format(int(bb))),
+                _delta(_int(bb), prev.get("bb")))
+        others = {k: v for k, v in covered.items() if k != sid}
+        if others:
+            row("    earlier cfgs", "  ".join("%s %s" % (k, "{:,}".format(int(v)))
+                                           for k, v in sorted(others.items())))
+        if cov not in (None, ""):
+            row("  signal", "%s  (syz-manager's coverage stat, not blocks)" % cov,
+                _delta(_int(cov), prev.get("cov")))
+        # config_incidents counts crashes AND hangs; max_crashes is the
+        # per-config limit on that sum (the option predates hang detection).
+        row("  incidents", "%d / %d" % (s.get("config_incidents", 0), d["max_crashes"]))
 
     if s["incidents"]:
         out.append("")

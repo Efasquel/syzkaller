@@ -431,12 +431,15 @@ class StatusLayoutTest(unittest.TestCase):
         self.assertEqual(rows["manager"], "down")
         self.assertNotIn("web ui", rows)
 
-    def test_blocks_are_separated(self):
+    def test_two_blocks_one_scope_each(self):
         lines = self._lines(self._state("running"), alive=True)
-        for header in ("config:", "incidents:"):
-            self.assertIn(header, lines)
-            self.assertEqual(lines[lines.index(header) - 1], "")
-        self.assertTrue(any(ln.startswith("stats (") for ln in lines))
+        cfg = next(i for i, ln in enumerate(lines) if ln.startswith("config ("))
+        self.assertEqual(lines[cfg - 1], "")
+        # the session's own rows (process, incidents) come before the config block
+        self.assertLess(lines.index("  crashes     : 4"), cfg)
+        # the target and its numbers after it
+        self.assertGreater(lines.index("  executed    : 1,214,880 (total: 48,117,004)"), cfg)
+        self.assertGreater(lines.index("  corpus      : 8114 program(s)"), cfg)
 
 
 class InspectBasicBlocksTest(unittest.TestCase):

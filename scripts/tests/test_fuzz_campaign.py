@@ -2273,6 +2273,8 @@ class HaltedHeadlineTest(unittest.TestCase):
         self.assertTrue(lines[2].startswith(
             "  status      : HALTED/CRASH-LOOP crash loop (15 crashes)"), lines[2])
         self.assertEqual(sum("crash loop (15" in ln for ln in lines), 1)
+        # one scope per block: campaign-wide counters live under the campaign header
+        self.assertLess(lines.index("  crashes     : 0"), lines.index("  time breakdown:"))
 
     def test_the_kind_of_stop_is_read_from_the_reason(self):
         """Every halt path writes a reason in its own words; the kind is what

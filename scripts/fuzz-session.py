@@ -1956,6 +1956,7 @@ def status_lines(sid, rawcover=False):
 
     status = state.get("status") or "?"
     alive = status == "running" and state_pid_alive(state)
+    # --- session: the thing being driven -- its state, its process, its incidents
     L.append("  session:")
     row("  name", sid)
     if alive:
@@ -1967,11 +1968,6 @@ def status_lines(sid, rawcover=False):
             timefmt.fmt(state.get("stopped_at"), default="?")))
     row("  runs", "%s" % state.get("run_count"))
     row("  started", timefmt.fmt(state.get("started_at")))
-
-    L.append("")
-    L.append("  config:")
-    row("  name", state.get("config") or "-")
-    row("  workdir", workdir)
     if alive:
         row("  manager", "pid %s, %d executor(s) live%s" % (
             state.get("pid"), len(execs),
@@ -1983,7 +1979,14 @@ def status_lines(sid, rawcover=False):
     else:
         row("  manager", "down")
     row("  log", state.get("stdout") or "-")
+    # Incidents are the collect bundles (`collect <id> crash|hang`): syz-manager
+    # cannot witness a bare-metal panic, so workdir/crashes is never written.
+    row("  crashes", "%s" % ev.get("crash", 0))
+    row("  hangs", "%s" % ev.get("hang", 0))
+    row("  snapshots", "%s" % ev.get("snapshot", 0))
+    row("  crash types", "%s" % (m["crash types"] or "-"))
 
+    # --- config: the target, and the numbers measured against it
     # Basic blocks: default to the cheap on-disk cover_log (no manager
     # interaction). Only query the live /rawcover when explicitly asked, since
     # its first hit triggers manager-side coverage init (logs + symbolization).
@@ -2004,7 +2007,10 @@ def status_lines(sid, rawcover=False):
         else:
             bb = "- (cover_log not set; add kext_coverage.cover_log, or --rawcover)"
     L.append("")
-    L.append("  stats (run log = live ~10s; bench = ~60s):")
+    L.append("  config (run log = live ~10s; bench = ~60s):")
+    row("  name", state.get("config") or "-")
+    row("  workdir", workdir)
+    row("  corpus", "%s program(s)" % (rl["corpus"] or m["corpus"] or "-"))
     this_run = rl["exec total"] or m["exec total"]
     row("  executed", "%s (total: %s)" % (
         "{:,}".format(int(this_run)) if this_run not in ("", None) else "-",
@@ -2013,14 +2019,6 @@ def status_lines(sid, rawcover=False):
     row("  basic blocks", bb)
     row("  signal", "%s  (syz-manager's coverage stat, not blocks)"
         % (rl["coverage"] or m["coverage"] or "-"))
-    row("  corpus", "%s program(s)" % (rl["corpus"] or m["corpus"] or "-"))
-
-    L.append("")
-    L.append("  incidents:")
-    row("  crashes", "%s" % ev.get("crash", 0))
-    row("  hangs", "%s" % ev.get("hang", 0))
-    row("  snapshots", "%s" % ev.get("snapshot", 0))
-    row("  crash types", "%s" % (m["crash types"] or "-"))
     # Blocks were built with a two-space margin; headers sit at column 0.
     return [ln[2:] if ln.startswith("  ") else ln for ln in L]
 
