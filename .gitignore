@@ -47,3 +47,6 @@ gha-creds-*.json
 
 # test
 .test/
+
+# python
+__pycache__/
