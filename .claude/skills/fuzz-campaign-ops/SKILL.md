@@ -75,11 +75,14 @@ tail -f campaigns/.state/<name>.coordinator.log   # decisions only — use this
 tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 /usr/bin/python3 scripts/fuzz-campaign.py status <name> -w
 /usr/bin/python3 scripts/fuzz-campaign.py quarantine <name> [--all]   # what is benched, and why
+/usr/bin/python3 scripts/runstats.py curve <Driver>/<variant> --field blocks|exec   # over fuzz-hours
 ```
 
 `status -w` annotates what moved since the last refresh. A blank delta column
 means nothing moved, which is the signal you are watching for — an absolute
-counter looks identical whether the box is fuzzing hard or wedged.
+counter looks identical whether the box is fuzzing hard or wedged. `exec total`
+and `basic blocks` also carry `+N / 1h00m`, the growth over the last hour from
+the progress series the driver samples each poll (`results/progress.jsonl`).
 
 The `status` row of `status` (and the STATUS column of `list`) is the **activity**,
 finer than the phase and stamped with its duration — `HALTED`/`DONE` are

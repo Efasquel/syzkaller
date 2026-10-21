@@ -749,19 +749,53 @@ def cmd_compare(args):
               "measurement." % ", ".join(sorted(thin)))
 
 
+def progress_series(workdir):
+    """The campaign driver's samples (results/progress.jsonl): one per poll,
+    with the config's fuzzing clock, programs and blocks over all runs. The
+    only time axis for blocks, since the cover log carries none."""
+    out = []
+    try:
+        for ln in (Path(workdir) / "results" / "progress.jsonl").read_text().splitlines():
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def curve_rows(workdir, field):
+    """[(fuzz_seconds, value, wall_epoch)] for `field`: 'blocks' and 'exec'
+    from the sampled series; anything else from the bench series, where a
+    resetting counter (exec total...) is accumulated across restarts instead
+    of falling back to zero at each one."""
+    if field in ("blocks", "exec"):
+        return [(x["fuzz_s"], x[field], x["at"]) for x in progress_series(workdir)
+                if x.get(field) is not None]
+    rows, base, prev = [], 0, None
+    for fuzz_ns, wall, sample in merge_bench(workdir)["series"]:
+        v = sample.get(field)
+        if v is None:
+            continue
+        if field in RESETTING:
+            if prev is not None and v < prev:      # a new manager: counter restarted
+                base += prev
+            prev = v
+            v += base
+        rows.append((fuzz_ns / 1e9, v, wall))
+    return rows
+
+
 def cmd_curve(args):
     wd = WORKDIR_ROOT / args.run
     if not wd.is_dir():
         print("no such run: %s" % args.run, file=sys.stderr)
         sys.exit(1)
-    bench = merge_bench(wd)
     field = args.field
     print("fuzz_hours\t%s\twall" % field)
-    for fuzz_ns, wall, sample in bench["series"]:
-        v = sample.get(field)
-        if v is None:
-            continue
-        print("%.4f\t%s\t%s" % (fuzz_ns / 3.6e12, v, timefmt.fmt_epoch(wall)))
+    for fuzz_s, v, wall in curve_rows(wd, field):
+        print("%.4f\t%s\t%s" % (fuzz_s / 3600.0, v, timefmt.fmt_epoch(wall)))
 
 
 CSV_FIELDS = ("run", "driver", "date", "cov", "grammar", "mods", "segments",
@@ -820,8 +854,10 @@ def main():
     p = sub.add_parser("curve", help="a metric against fuzzing hours (TSV)")
     p.add_argument("run")
     p.add_argument("--field", default="coverage",
-                   help="bench field to plot (default coverage; try corpus, "
-                        "exec total, signal)")
+                   help="what to plot: blocks or exec (the driver's sampled series, "
+                        "exact across restarts), or a bench field (default coverage; "
+                        "try corpus, exec total, signal -- resetting counters are "
+                        "accumulated across restarts)")
     p.set_defaults(func=cmd_curve)
 
     p = common(sub.add_parser("export", help="the full table for a notebook"))

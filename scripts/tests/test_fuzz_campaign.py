@@ -2648,3 +2648,63 @@ class IncidentTableTest(unittest.TestCase):
             self._inc(decision=None, triage_job=None, panic_evidence=False)])
         self.assertIn("SYZFAIL: shmem open failed", lines[1])
         self.assertIn("(no panic report)", lines[2])
+
+
+class ProgressSeriesTest(unittest.TestCase):
+    """The sampled progress series: the only time axis for blocks (the cover
+    log carries none) and for programs across manager restarts."""
+
+    def test_a_poll_appends_one_sample_and_skips_when_there_is_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = fc.init_state("camp")
+            s["active_seconds"] = 1234.6
+            info = {"workdir": tmp, "exec_lifetime": 5000, "bb_all": 300}
+            self.assertTrue(fc.record_progress(s, info, now=1000.4))
+            self.assertFalse(fc.record_progress(s, {"workdir": tmp}, now=1010))
+            self.assertFalse(fc.record_progress(s, {"exec_lifetime": 1}, now=1020))  # no workdir
+            self.assertTrue(fc.record_progress(s, dict(info, bb_all=320), now=1600))
+            rows = fc.progress_samples(tmp)
+        self.assertEqual(rows, [{"at": 1000, "fuzz_s": 1235, "exec": 5000, "blocks": 300},
+                                {"at": 1600, "fuzz_s": 1235, "exec": 5000, "blocks": 320}])
+
+    def test_trend_is_the_growth_over_the_window_of_recent_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = fc.init_state("camp")
+            for at, ex, bb in ((0, 100, 10), (600, 700, 12), (3000, 3000, 20), (3600, 3600, 25)):
+                fc.record_progress(s, {"workdir": tmp, "exec_lifetime": ex, "bb_all": bb}, now=at)
+            # window of 1h ending at the newest sample (3600): the sample at 0 is
+            # on the edge and counts; the span shown is the real one
+            self.assertEqual(fc.progress_trend(tmp, "blocks", now=3600),
+                             "  +15 / %s" % fc.fmt_hms(3600))
+            self.assertEqual(fc.progress_trend(tmp, "exec", window=1800, now=3600),
+                             "  +600 / %s" % fc.fmt_hms(600))
+            # samples older than the window: nothing to say rather than a stale number
+            self.assertEqual(fc.progress_trend(tmp, "blocks", now=3600 + 7200), "")
+            # one sample is not a trend
+            with tempfile.TemporaryDirectory() as tmp2:
+                fc.record_progress(s, {"workdir": tmp2, "exec_lifetime": 1, "bb_all": 1}, now=5)
+                self.assertEqual(fc.progress_trend(tmp2, "blocks", now=10), "")
+
+    def test_status_rows_carry_the_trend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
+            s = fc.init_state("camp")
+            s.update(session_id="a", current_config=str(cfg), activity="fuzzing",
+                     activity_since=fc.now_iso())
+            now = time.time()
+            for dt, ex, bb in ((-1800, 1000, 100), (-900, 2000, 110), (-10, 3000, 115)):
+                fc.record_progress(s, {"workdir": tmp, "exec_lifetime": ex, "bb_all": bb},
+                                   now=now + dt)
+            live = {"found": True, "pid_alive": True, "pid": 1, "executors": 1,
+                    "exec_total": 500, "exec_lifetime": 3000, "bb_all": 115, "bb_run": 15}
+            with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
+                 mock.patch.object(fc, "load_state", lambda n: s), \
+                 mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 mock.patch.object(fc, "inspect", lambda sid: live), \
+                 mock.patch.object(fc, "free_gb", lambda: 100.0), \
+                 mock.patch.object(fc, "style", type(fc.style)(False)):
+                lines, _ = fc.status_lines("camp")
+        rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
+        self.assertIn("500 (total: 3,000)  +2000 / %s" % fc.fmt_hms(1790), rows["exec total"])
+        self.assertIn("15 (total: 115)  +15 / %s" % fc.fmt_hms(1790), rows["basic blocks"])

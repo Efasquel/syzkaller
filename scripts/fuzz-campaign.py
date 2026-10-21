@@ -654,6 +654,64 @@ COORDINATOR_DEFAULTS = {
 }
 
 
+def record_progress(s, info, now=None):
+    """Append one sample of the config's progress to results/progress.jsonl in
+    its workdir: when, the config's fuzzing clock, programs over all runs,
+    blocks over all runs. The cover log says which blocks were found but not
+    when, and exec_total restarts with every manager, so without this the
+    curves could not be drawn after the fact. Append-only: a panic mid-write
+    loses one line, never the file."""
+    wd = info.get("workdir")
+    if not wd or (info.get("exec_lifetime") is None and info.get("bb_all") is None):
+        return False
+    sample = {"at": round(time.time() if now is None else now),
+              "fuzz_s": round(s.get("active_seconds") or 0),
+              "exec": info.get("exec_lifetime"), "blocks": info.get("bb_all")}
+    try:
+        path = Path(wd) / "results" / "progress.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(sample) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def progress_samples(workdir, limit=400):
+    """The newest samples of results/progress.jsonl, oldest first."""
+    try:
+        lines = (Path(workdir) / "results" / "progress.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-limit:]:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def progress_trend(workdir, key, window=3600, now=None):
+    """'  +12 / 1h00m': how much `key` grew over the last `window` seconds of
+    samples, or '' when there are not two samples to compare. The span shown
+    is the real one between the two samples, which is shorter than the window
+    right after a start."""
+    now = time.time() if now is None else now
+    samples = [x for x in progress_samples(workdir) if x.get(key) is not None]
+    if len(samples) < 2:
+        return ""
+    newest = samples[-1]
+    inside = [x for x in samples if x["at"] >= newest["at"] - window]
+    if len(inside) < 2 or newest["at"] < now - window:   # nothing recent enough
+        return ""
+    oldest = inside[0]
+    span = newest["at"] - oldest["at"]
+    if span < 60:
+        return ""
+    return "  %+d / %s" % (int(newest[key]) - int(oldest[key]), fmt_hms(span))
+
+
 def note_coverage(s, sid, info):
     """Keep the most basic blocks a config's cover logs have shown, and the
     most programs its run logs have summed to.
@@ -2000,6 +2058,7 @@ def supervise(s, d, sid, budget):
             set_activity(s, "fuzzing", sid)
         account_run(s, info, now)
         note_coverage(s, sid, info)
+        record_progress(s, info, now)
         et = info.get("exec_total")
         if et is not None and et != last_et:
             last_et = et
@@ -2399,6 +2458,14 @@ def _delta(cur, prev, fmt="%+d"):
         return ""
 
 
+def cfgutil_workdir(cfg):
+    """The config's workdir, or None."""
+    try:
+        return cfgutil.load(cfg).get("workdir")
+    except (OSError, ValueError):
+        return None
+
+
 def corpus_facts(cfg):
     """(inputs, bytes, mtime) for the config's corpus.db, or None.
 
@@ -2643,6 +2710,7 @@ def status_lines(name, prev=None):
         # A config is a workdir: re-running one resumes its corpus. Say plainly
         # whether this run inherited one, and whether it is still growing.
         cf_facts = corpus_facts(cfg)
+        workdir = (cf_facts or {}).get("workdir") or (cfgutil_workdir(cfg) or "")
         if cf_facts:
             row("  corpus", "%.0f KB, last grew %s"
                 % (cf_facts["bytes"] / 1024.0,
@@ -2659,9 +2727,12 @@ def status_lines(name, prev=None):
         # a config can burn an hour of wall clock and execute very little. This
         # run's count (exec_total restarts with every manager) and the config's
         # total over all its runs, like the basic blocks row.
-        row("  exec total", "%s (total: %s)"
+        # The trend ("+281,000 / 1h00m") comes from the sampled progress series,
+        # so it reads the same whether or not the manager is up right now.
+        row("  exec total", "%s (total: %s)%s"
             % ("{:,}".format(int(execs)) if execs not in (None, "") else "-",
-               "{:,}".format(int(exec_all)) if exec_all is not None else "-"),
+               "{:,}".format(int(exec_all)) if exec_all is not None else "-",
+               progress_trend(workdir, "exec") if workdir else ""),
             _delta(_int(exec_all) if exec_all is not None else execs,
                    prev.get("execs"), "%+d"))
         # Now = the manager's own rate from its last stat line; average = this
@@ -2679,9 +2750,10 @@ def status_lines(name, prev=None):
         # config (one set, so a block hit again after a crash-restart counts once).
         if bb is not None:
             this_run = live.get("bb_run")
-            row("  basic blocks", "%s (total: %s)"
+            row("  basic blocks", "%s (total: %s)%s"
                 % ("{:,}".format(int(this_run)) if this_run is not None else "-",
-                   "{:,}".format(int(bb))),
+                   "{:,}".format(int(bb)),
+                   progress_trend(workdir, "blocks") if workdir else ""),
                 _delta(_int(bb), prev.get("bb")))
         others = {k: v for k, v in covered.items() if k != sid}
         if others:

@@ -427,16 +427,29 @@ incidents close the screen.
 Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 
 ```
-stats:
-  exec total  : 214,880 (total: 1,878,396)   +4,213
+config:
+  exec total  : 214,880 (total: 1,878,396)  +281,340 / 1h00m   +4,213
   exec rate   : 78/s now, 78/s average
-  basic blocks: 317 (total: 1,204)                    +2
-incidents (this config: 2 / 20):
+  basic blocks: 317 (total: 1,304)  +12 / 1h00m                   +2
+  corpus      : 26 KB, last grew 01/09 14:55:31                +1408 B
+campaign (config 1/1 - no loop):
   crashes     : 4   +1
-  hangs       : 0
-  benched     : 2  (77ab10c3, 3f2a9c01)
-corpus      : 260831_cov_gram_no7_test  ...     +1408 B
 ```
+
+Two kinds of movement are shown. The right-hand `+N` is the change since the
+last redraw (watch mode only). The `+N / 1h00m` after `exec total` and
+`basic blocks` is the growth over the last hour, read from the progress series
+the driver samples at every poll (`results/progress.jsonl` in the config's
+workdir: time, the config's fuzzing clock, programs and blocks over all runs).
+It is there whether or not the manager is up, and it is the only time axis for
+blocks: the cover log says which blocks were found, not when. The same series
+feeds `runstats.py curve <run> --field blocks|exec`; bench fields such as
+`exec total` are accumulated across restarts there instead of sawtoothing.
+
+A manager built from this tree stamps each cover-log line with the time it was
+found (`0x<pc> <unix seconds>`), which makes the blocks curve exact rather than
+sampled every ten minutes. Every reader takes the first field only, so logs
+from before the rebuild still count.
 
 The deltas are the point. An absolute counter looks identical one refresh later
 whether the box is fuzzing hard or wedged; a blank delta column means nothing

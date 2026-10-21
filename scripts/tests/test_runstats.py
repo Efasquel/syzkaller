@@ -291,3 +291,38 @@ class EfficiencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
+
+class CurveTest(unittest.TestCase):
+    """`curve`: blocks and exec from the driver's sampled series; a resetting
+    bench counter accumulated across restarts instead of sawtoothing."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.wd = self.root / "workdir" / "Drv" / "run"
+        (self.wd / "results").mkdir(parents=True)
+        rs.set_root(self.root)
+
+    def test_exec_total_accumulates_across_restarts(self):
+        bench(self.wd / "results" / "bench-20260901-120000.json",
+              [sample(60, 60, 100, 10), sample(120, 120, 200, 20)])
+        bench(self.wd / "results" / "bench-20260901-130000.json",
+              [sample(60, 60, 50, 20), sample(120, 120, 150, 25)])   # counter restarted
+        rows = rs.curve_rows(self.wd, "exec total")
+        self.assertEqual([v for _, v, _ in rows], [100, 200, 250, 350])
+        # a cumulative field is left alone
+        self.assertEqual([v for _, v, _ in rs.curve_rows(self.wd, "coverage")], [10, 20, 20, 25])
+
+    def test_blocks_and_exec_come_from_the_sampled_series(self):
+        with open(self.wd / "results" / "progress.jsonl", "w") as f:
+            f.write(json.dumps({"at": 1000, "fuzz_s": 600, "exec": 5000, "blocks": 300}) + "\n")
+            f.write("not json\n")
+            f.write(json.dumps({"at": 1600, "fuzz_s": 1200, "exec": 9000, "blocks": None}) + "\n")
+        self.assertEqual(rs.curve_rows(self.wd, "blocks"), [(600, 300, 1000)])
+        self.assertEqual(rs.curve_rows(self.wd, "exec"), [(600, 5000, 1000), (1200, 9000, 1600)])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rs.cmd_curve(type("A", (), {"run": "Drv/run", "field": "exec"})())
+        self.assertEqual(buf.getvalue().splitlines()[0], "fuzz_hours\texec\twall")
+        self.assertTrue(buf.getvalue().splitlines()[1].startswith("0.1667\t5000\t"))
+
