@@ -638,11 +638,12 @@ def cover_log_archives(workdir):
 
 
 def _read_pcs(path, into):
+    """Add the PCs of one cover log to `into`. A line is '0x<pc>' or, from a
+    manager that stamps them, '0x<pc> <unix seconds>'; only the PC counts."""
     try:
         for line in Path(path).read_text(errors="replace").splitlines():
-            line = line.strip()
-            if line:
-                into.add(line)
+            if line.strip():
+                into.add(line.split()[0])
     except OSError:
         pass
 

@@ -1071,10 +1071,13 @@ func (mgr *Manager) corpusInputHandler(updates <-chan corpus.NewItemEvent) {
 			}
 			mgr.statCoverFiltered.Add(filtered)
 		}
-		// Log newly discovered PCs to the cover log file, if enabled
+		// Log newly discovered PCs to the cover log file, if enabled. Each line
+		// carries the time it was found, so coverage-over-time can be rebuilt
+		// from the file after the fact; readers take the first field only.
 		if mgr.coverLog != nil && len(update.NewCover) != 0 {
+			now := time.Now().Unix()
 			for _, pc := range update.NewCover {
-				fmt.Fprintf(mgr.coverLog, "0x%x\n", pc);
+				fmt.Fprintf(mgr.coverLog, "0x%x %d\n", pc, now)
 			}
 			mgr.coverLog.Sync()
 		}

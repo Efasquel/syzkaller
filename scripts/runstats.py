@@ -270,7 +270,7 @@ def cover_blocks(workdir):
                 for line in f:
                     line = line.strip()
                     if line.startswith("0x"):
-                        pcs.add(line)
+                        pcs.add(line.split()[0])   # '0x<pc>' or '0x<pc> <unix>'
         except OSError:
             continue
     return len(pcs)

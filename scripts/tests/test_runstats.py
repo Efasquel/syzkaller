@@ -326,3 +326,7 @@ class CurveTest(unittest.TestCase):
         self.assertEqual(buf.getvalue().splitlines()[0], "fuzz_hours\texec\twall")
         self.assertTrue(buf.getvalue().splitlines()[1].startswith("0.1667\t5000\t"))
 
+    def test_cover_log_lines_may_carry_a_timestamp(self):
+        (self.wd / "cover.log").write_text("0x1 1761030412\n0x2 1761030412\n0x2\n")
+        (self.wd / "results" / "cover-1.log").write_text("0x3\n")
+        self.assertEqual(rs.cover_blocks(self.wd), 3)

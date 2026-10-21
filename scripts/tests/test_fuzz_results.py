@@ -215,3 +215,12 @@ class ChunkLinesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoverLogTimestampTest(unittest.TestCase):
+    def test_bb_coverage_reads_the_pc_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "results").mkdir()
+            Path(tmp, "cover.log").write_text("0x1 1761030412\n0x2\n")
+            Path(tmp, "results", "cover-1.log").write_text("0x2 1761030000\n0x3\n")
+            self.assertEqual(fr.bb_coverage(tmp), 3)

@@ -489,3 +489,10 @@ class ArchiveUnionCacheTest(unittest.TestCase):
             # A new archive changes the key and rebuilds it.
             (wd / "results/cover-2.log").write_text("0x4\n")
             self.assertEqual(fs.bb_all_runs(state), 5)     # 0x8 0x9 0x4 0x2 0x3
+
+
+class CoverLogTimestampTest(unittest.TestCase):
+    def test_pc_is_the_first_field_whatever_follows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "cover.log").write_text("0x1 1761030412\n0x2 1761030412\n0x2\n\n")
+            self.assertEqual(fs.bb_unique([Path(tmp, "cover.log")]), 2)

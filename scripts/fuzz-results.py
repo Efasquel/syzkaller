@@ -285,7 +285,8 @@ def bb_coverage(workdir):
     seen = set()
     for p in [Path(workdir) / "cover.log"] + sorted((Path(workdir) / "results").glob("cover-*.log")):
         try:
-            seen.update(ln.strip() for ln in p.read_text(errors="replace").splitlines() if ln.strip())
+            seen.update(ln.split()[0] for ln in p.read_text(errors="replace").splitlines()
+                        if ln.strip())          # '0x<pc>' or '0x<pc> <unix>'
         except OSError:
             pass
     return len(seen)
