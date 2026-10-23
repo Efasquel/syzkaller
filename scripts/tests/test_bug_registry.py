@@ -280,5 +280,70 @@ class HardlinkTest(unittest.TestCase):
         self.assertEqual(fsutil.link_count(os.path.join(self.dir, "absent")), 0)
 
 
+class ItemProvenanceTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.reg = {"counter": 0, "bugs": {}}
+
+    def test_route_item_lands_in_record(self):
+        br.route_one(self.reg, self.dir, analyzed("a.panic"),
+                     campaign="camp", config="cfg", item="item-2")
+        c = self.reg["bugs"]["Drv:m:READ"]["crashes"][0]
+        self.assertEqual(c["item"], "item-2")
+        self.assertEqual(c["campaign"], "camp")
+        self.assertEqual(c["config"], "cfg")
+
+    def test_item_defaults_to_none(self):
+        br.route_one(self.reg, self.dir, analyzed("a.panic"))
+        self.assertIsNone(self.reg["bugs"]["Drv:m:READ"]["crashes"][0]["item"])
+
+
+class KnownCulpritTest(unittest.TestCase):
+    """known_culprit() joins a crash signature to a ledger-verified culprit -- the
+    lookup the opt-in reuse_known_culprits path reads."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.reg = {"counter": 0, "bugs": {}}
+        # BUG-0001: a verified reproducer, proved against sig "v1".
+        br.route_one(self.reg, self.dir, analyzed("a.panic", key="Drv:m:READ", sig="v1"))
+        self.reg["bugs"]["Drv:m:READ"]["reproducer"] = {
+            "selectors": ["sel_5"], "verified": True, "job": "t3", "signature": "v1"}
+        # BUG-0002: an UNVERIFIED reproducer, for sig "u1".
+        br.route_one(self.reg, self.dir,
+                     analyzed("b.panic", key="Drv:m:WRITE", sig="u1", fault="WRITE"))
+        self.reg["bugs"]["Drv:m:WRITE"]["reproducer"] = {
+            "selectors": ["sel_9"], "verified": False, "job": "t4", "signature": "u1"}
+
+    def test_returns_verified_culprit(self):
+        self.assertEqual(
+            br.known_culprit(self.reg, "v1"),
+            {"bug_id": "BUG-0001", "selectors": ["sel_5"], "job": "t3", "verified": True})
+
+    def test_unverified_reproducer_returns_none(self):
+        self.assertIsNone(br.known_culprit(self.reg, "u1"))
+
+    def test_unknown_sig_returns_none(self):
+        self.assertIsNone(br.known_culprit(self.reg, "nope"))
+
+    def test_matches_a_crash_sig_filed_under_the_bug(self):
+        rec = self.reg["bugs"]["Drv:m:READ"]
+        rec["crashes"].append(dict(rec["crashes"][0], signature="v1b", report="a2.panic"))
+        self.assertEqual(br.known_culprit(self.reg, "v1b")["bug_id"], "BUG-0001")
+
+    def test_prefers_the_bug_whose_reproducer_proves_the_sig(self):
+        reg = {"counter": 0, "bugs": {}}
+        d = tempfile.mkdtemp()
+        # BUG-0001 merely files "shared"; its reproducer proves a different sig.
+        br.route_one(reg, d, analyzed("a.panic", key="K:a:READ", sig="shared"))
+        reg["bugs"]["K:a:READ"]["reproducer"] = {
+            "selectors": ["a"], "verified": True, "job": "ta", "signature": "other"}
+        # BUG-0002's reproducer proves "shared" itself -- it must win.
+        br.route_one(reg, d, analyzed("b.panic", key="K:b:READ", sig="shared"))
+        reg["bugs"]["K:b:READ"]["reproducer"] = {
+            "selectors": ["b"], "verified": True, "job": "tb", "signature": "shared"}
+        self.assertEqual(br.known_culprit(reg, "shared")["bug_id"], "BUG-0002")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

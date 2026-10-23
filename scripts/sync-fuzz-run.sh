@@ -44,6 +44,7 @@ fi
 step()  { printf '%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
 # Something was done. The count belongs here: "9 scripts" is verifiable, "ok" is not.
 ok()    { printf '    %s%s%s %s\n' "$C_GREEN" "OK" "$C_RESET" "$*"; }
+warn()  { printf '    %s%s%s %s\n' "$C_YELLOW" "WARN" "$C_RESET" "$*"; }
 # Something was deliberately not done, and you may need to care.
 skip()  { printf '    %s%s%s %s\n' "$C_YELLOW" "SKIP" "$C_RESET" "$*"; }
 # A decision the sync made on your behalf that changes what will run.
@@ -213,7 +214,30 @@ for j in "$SRC"/campaigns/*.json; do
   cp_atomic "$j" "$DST/campaigns/$(basename "$j")"
   camp_n=$((camp_n + 1))
 done
-ok "$camp_n definition(s); .state left alone (it is fuzz-owned runtime)"
+ok "$camp_n legacy definition(s); campaigns/<name>/ and .state left alone (fuzz-owned runtime)"
+
+# --- plans: the inputs of the new layout (plans reference configs by repo-relative
+# path, which resolves against the fuzz tree's own root -- no rewriting) --------
+step "plans"
+mkdir -p "$DST/plans"
+plan_n=0
+for j in "$SRC"/plans/*.json; do
+  [ -e "$j" ] || break
+  cp_atomic "$j" "$DST/plans/$(basename "$j")"
+  plan_n=$((plan_n + 1))
+done
+ok "$plan_n plan(s)"
+# config/box.json is THIS machine's: created on the box once, never overwritten
+# (sync only says when the repo's copy differs, so a drift is a decision, not an
+# accident).
+if [ -f "$SRC/config/box.json" ]; then
+  if [ ! -f "$DST/config/box.json" ]; then
+    cp_atomic "$SRC/config/box.json" "$DST/config/box.json"
+    ok "config/box.json seeded from the repo -- edit the box's copy for its own paths"
+  elif ! cmp -s "$SRC/config/box.json" "$DST/config/box.json"; then
+    warn "config/box.json differs between repo and box; the box's copy is kept"
+  fi
+fi
 
 step "permissions"
 # --- permissions: read-only artifacts group-readable; state group-writable ---

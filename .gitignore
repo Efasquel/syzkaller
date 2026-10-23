@@ -33,11 +33,18 @@ executor/syscalls.h
 .gemini/
 gha-creds-*.json
 
+# the experiments: hand-written manager configs, tracked (the global *.cfg
+# rule above is syzkaller's own)
+!/config/*.cfg
+
 # fuzz-session.py registry
 /sessions/
 
-# fuzz-campaign.py runtime state + launchd logs (defs under campaigns/ are kept)
+# fuzz-campaign.py runs (plans live in plans/, tracked)
 /campaigns/
+/bugs/
+/run/
+/STOP
 
 # triage.py runtime state
 /triage/
@@ -50,3 +57,5 @@ gha-creds-*.json
 
 # python
 __pycache__/
+# campaign-redesign simulator output
+/playground/tree/

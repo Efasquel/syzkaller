@@ -32,6 +32,16 @@ crashing until you rebuild, which you don't do mid-campaign):
   - A crash that fires while we believed it suppressed is an ESCAPE: a new trigger
     path for the same signature -> classify and fold it in (a sig may own several
     groups). No pinning.
+
+Opt-in path (reuse_known_culprits, campaign-planning.md §3): when the global bug
+ledger already proves a signature -- it maps to a bug with a VERIFIED reproducer
+-- there is nothing to learn from re-minimizing it in this sample. bench_known()
+benches that bug's culprit selectors at the FIRST sighting, with no SUSPECT gate
+and no triage, writing the record as a confirmed HARD/DISABLED crash stamped with
+the bug it came from (`known_from`). From then on the signature is just another
+disabled one: a further on_crash on it is an ESCAPE like any other. Off by
+default; a strict time-to-reproducer evaluation leaves it off so every sample
+pays its own minimization.
 """
 
 import argparse
@@ -323,6 +333,57 @@ def bench_lead(state, sig, seq, source, now=None):
         {"selectors": distinct, "source": str(source), "at": now, "verified": False})
     rec["exhausted_count"] = 0
     return {"decision": "lead", "category": rec["category"],
+            "disposition": rec["disposition"], "disabled": disabled_set(state)}
+
+
+def bench_known(state, sig, selectors, bug_id=None, now=None):
+    """Bench a signature the global bug ledger already proves, at FIRST sighting.
+
+    The opt-in reuse_known_culprits path (see the module docstring): `sig` maps to
+    a ledger bug whose reproducer is VERIFIED, with culprit `selectors`, so we skip
+    both the SUSPECT gate and any triage and disable those selectors outright. The
+    record is written as a confirmed HARD/DISABLED crash -- culprit_selectors and
+    minimized_sequence are the selectors (one call each) -- and stamped with
+    `known_from` = bug_id, so status and replay can say it was benched from the
+    ledger rather than minimized in this sample. The signature then behaves like
+    any other disabled one: a later on_crash on it is an ESCAPE. Returns on_crash's
+    summary shape with decision "bench-known".
+    """
+    now = now or now_iso()
+    selectors = list(selectors)
+    # Capture what was disabled BEFORE this bench, so discovery_context reads the
+    # same as on_crash's (the surface the crash was seen against, not including
+    # the selectors we are about to add for it).
+    context = disabled_set(state)
+    _add_hard(state, selectors)
+    rec = state["catalog"].get(sig)
+    if rec is None:
+        rec = {
+            "crash_id": sig,
+            "culprit_selectors": selectors,
+            "minimized_sequence": list(selectors),
+            "category": HARD,
+            "disposition": DISABLED,
+            "occurrence_count": 0,
+            "repetition_count": max_repeat(selectors),
+            "escaped_count": 0,
+            "first_seen": now,
+            "last_seen": now,
+            "discovery_context": context,
+            "known_from": bug_id,
+        }
+        state["catalog"][sig] = rec
+    else:
+        # An existing record (e.g. a prior SUSPECT sighting) is promoted to the
+        # benched culprit the ledger hands us.
+        rec["culprit_selectors"] = selectors
+        rec["minimized_sequence"] = list(selectors)
+        rec["category"] = HARD
+        rec["disposition"] = DISABLED
+        rec["known_from"] = bug_id
+    rec["occurrence_count"] += 1
+    rec["last_seen"] = now
+    return {"decision": "bench-known", "category": rec["category"],
             "disposition": rec["disposition"], "disabled": disabled_set(state)}
 
 

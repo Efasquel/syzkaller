@@ -1849,66 +1849,234 @@ class ExhaustedSignatureTest(unittest.TestCase):
                     self.assertEqual(s["exhausted_sigs"], [])
 
 
-class NewSeedsDeviceSettingsFromConfig(unittest.TestCase):
-    """`new` should take device settings from the config, not from your typing.
-
-    Each driver has its own Pishi kext id (AppleJPEGDriver=1 ... AppleFDEKeyStore
-    =256). A campaign carrying the wrong one triages a crash against the wrong
-    kext, and the only thing that stopped that was remembering to pass --kext-id
-    correctly every time.
-    """
+class NewPlanTest(unittest.TestCase):
+    """`new` writes a plan that references hand-written configs; `plan check`
+    renders it; `install` freezes it. Device flags for triage are gone: the
+    effective config carries them."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
+        (self.dir / "plans").mkdir()
         (self.dir / "campaigns").mkdir()
-        self._patch = mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns")
-        self._patch.start()
+        self._patches = [mock.patch.object(fc, "PLANS_DIR", self.dir / "plans"),
+                         mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"),
+                         mock.patch.object(fc, "STATE_DIR", self.dir / "state"),
+                         mock.patch.object(fc, "BOX_PATH", self.dir / "box.json"),
+                         mock.patch.object(fc, "log", lambda m: None)]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
-        self._patch.stop()
+        for p in self._patches:
+            p.stop()
         self._tmp.cleanup()
 
-    def _cfg(self, stem, kext=None, workdir="w", name=None, syscalls=()):
-        body = {"workdir": "/tmp/%s" % workdir, "enable_syscalls": list(syscalls)}
-        if kext is not None:
-            body["kext_coverage"] = {"kext_id": kext, "kcov_device": "/dev/pishi"}
-        if name:
-            body["executor_name"] = name
+    def _cfg(self, stem, **extra):
+        body = dict({"enable_syscalls": ["syz_IOServiceOpen$X_C", "syz_IOConnectCallMethod$X_C_0"],
+                     "kext_coverage": {"kext_id": 2}, "executor_name": "x"}, **extra)
         p = self.dir / ("%s.cfg" % stem)
         p.write_text(json.dumps(body))
         return str(p)
 
-    def _new(self, configs, **over):
-        kw = dict(budget_hours=1.0, loop=False, poll_seconds=1,
-                  hang_after_seconds=1, max_crashes=1, min_free_gb=1.0,
-                  keep_cores=1, force=True)
-        kw.update(over)
-        fc.cmd_new("c", configs, **kw)
-        return json.loads((self.dir / "campaigns" / "c.json").read_text())
+    def test_new_writes_a_plan_with_repeats_and_no_triage_block(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.5, repeat=2, max_crashes=7)
+        plan = json.loads((self.dir / "plans" / "c.json").read_text())
+        self.assertEqual([it["config"] for it in plan["items"]], [cfg, cfg])
+        self.assertEqual(plan["defaults"]["max_hours"], 1.5)
+        self.assertEqual(plan["limits"], {"max_crashes": 7})     # only what was given
+        self.assertNotIn("triage", plan)
+        self.assertFalse(plan["defaults"]["reuse_known_culprits"])
 
-    def test_kext_id_and_device_come_from_the_config(self):
-        d = self._new([self._cfg("fde", kext=256)])
-        self.assertEqual(d["triage"]["kext_id"], 256)
-        self.assertEqual(d["triage"]["kcov_device"], "/dev/pishi")
+    def test_plan_check_shows_drift_and_strict_fails_on_it(self):
+        (self.dir / "box.json").write_text(json.dumps({"procs": 1, "target": "darwin/arm64"}))
+        cfg = self._cfg("AppleX_gram", procs=2)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fc.cmd_new("c", [cfg], 1.0)
+        self.assertIn("procs", buf.getvalue())
+        self.assertIn("AppleX_gram-1", buf.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            fc.cmd_plan_check("c", strict=True)
 
-    def test_explicit_flag_still_wins(self):
-        d = self._new([self._cfg("fde", kext=256)],
-                      triage_opts={"kext_id": 4, "kcov_device": None})
-        self.assertEqual(d["triage"]["kext_id"], 4)
-        # the unset one is still seeded from the config
-        self.assertEqual(d["triage"]["kcov_device"], "/dev/pishi")
+    def test_install_freezes_the_plan_once_and_refuses_legacy(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.0)
+        self.assertTrue(fc.freeze_plan("c"))
+        self.assertTrue((self.dir / "campaigns" / "c" / "plan.json").exists())
+        self.assertTrue((self.dir / "campaigns" / "c" / "state.json").exists())
+        self.assertFalse(fc.freeze_plan("c"))              # already a campaign
+        self.assertEqual(fc.load_def("c")["layout"], "plan")
+        self.assertEqual([it["id"] for it in fc.load_def("c")["items"]], ["AppleX_gram-1"])
+        (self.dir / "campaigns" / "old.json").write_text(json.dumps({"configs": [cfg]}))
+        with self.assertRaises(SystemExit):
+            fc.freeze_plan("old")
+        self.assertEqual(fc.load_def("old")["layout"], "legacy")
 
-    def test_config_without_kext_coverage_seeds_nothing(self):
-        d = self._new([self._cfg("bare")])
-        self.assertNotIn("kext_id", d.get("triage", {}))
 
-    def test_executor_name_is_not_seeded_into_the_campaign(self):
-        # It is per-config and read at triage time by config_triage_flags; copying
-        # the first config's name onto a whole sweep would be wrong the moment the
-        # sweep spans drivers.
-        d = self._new([self._cfg("bt", kext=32, name="bluetoothd")])
-        self.assertNotIn("executor_name", d.get("triage", {}))
+class PlanLayoutTest(unittest.TestCase):
+    """A plan-layout campaign: the manager runs on a rendered effective config
+    under campaigns/<name>/<config-id>/<item-id>/, and everything an item
+    produces lives there."""
+
+    BOX = {"target": "darwin/arm64", "syzkaller": "/tree", "http": "127.0.0.1:1", "procs": 1,
+           "type": "none", "sandbox": "none", "reproduce": False,
+           "kext_coverage": {"kcov_device": "/dev/pishi"}}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "config").mkdir()
+        (self.root / "campaigns").mkdir()
+        (self.root / "config" / "box.json").write_text(json.dumps(self.BOX))
+        self.cfg = self.root / "config" / "AppleSMC_gram.cfg"
+        self.cfg.write_text("# the authored exclusion must survive rendering\n" + json.dumps({
+            "workdir": "/should/be/ignored", "procs": 1,
+            "kext_coverage": {"kext_id": 2, "cover_log": "x.log"},
+            "enable_syscalls": ["syz_IOServiceOpen$AppleSMC_C", "syz_IOConnectCallMethod$C_0",
+                                "syz_IOConnectCallMethod$C_1"],
+            "disable_syscalls": ["syz_IOConnectCallMethod$C_1"], "executor_name": "smc"}))
+        self._patches = [mock.patch.object(fc, "REPO_ROOT", self.root),
+                         mock.patch.object(fc, "CAMPAIGN_DIR", self.root / "campaigns"),
+                         mock.patch.object(fc, "STATE_DIR", self.root / "state"),
+                         mock.patch.object(fc, "BOX_PATH", self.root / "config" / "box.json"),
+                         mock.patch.object(fc, "log", lambda m: None)]
+        for p in self._patches:
+            p.start()
+        (self.root / "state").mkdir()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def _def(self):
+        return dict(fc.DEFAULTS, layout="plan", name="camp",
+                    items=[{"id": "AppleSMC_gram-1", "config": str(self.cfg), "budget_seconds": 3600},
+                           {"id": "AppleSMC_gram-2", "config": str(self.cfg), "budget_seconds": 3600}])
+
+    def _item(self, n=1):
+        return {"id": "AppleSMC_gram-%d" % n, "config": str(self.cfg)}
+
+    def test_the_manager_runs_on_the_rendered_effective_config(self):
+        s = fc.init_state("camp")
+        started = []
+
+        def fake_ensure(st, cfg, dd=None):
+            started.append(cfg)
+            st["status"] = "halted"
+            raise RuntimeError("stop here")
+        with mock.patch.object(fc, "load_def", lambda n: self._def()), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "ensure_running", fake_ensure):
+            fc.cmd_run("camp")
+        idir = self.root / "campaigns" / "camp" / "AppleSMC_gram" / "AppleSMC_gram-1"
+        self.assertEqual(started, [str(idir / "camp.AppleSMC_gram-1.cfg")])
+        eff = json.loads((idir / "camp.AppleSMC_gram-1.cfg").read_text())
+        self.assertEqual(eff["workdir"], str(idir / "workdir"))          # runtime: rendered per item
+        self.assertEqual(eff["kext_coverage"], {"kcov_device": "/dev/pishi", "kext_id": 2,
+                                                "cover_log": "cover.log"})
+        self.assertEqual(eff["procs"], 1)                                 # box key
+        self.assertEqual(eff["disable_syscalls"], ["syz_IOConnectCallMethod$C_1"])   # authored kept
+        meta = json.loads((idir / "item.json").read_text())
+        self.assertEqual((meta["campaign"], meta["item"], meta["config"]),
+                         ("camp", "AppleSMC_gram-1", str(self.cfg)))
+        self.assertEqual(s["current_item"], "AppleSMC_gram-1")
+        # the per-item keys everything else hangs off
+        s["current_config"] = started[0]
+        self.assertEqual(fc.qstate_path(started[0]), idir / "quarantine.json")
+        self.assertEqual(fc.authored_config(s), str(self.cfg))
+        self.assertEqual(fc.target_of(s)["kext"], "AppleSMC")        # from the config's name
+        self.assertEqual(fc.evidence_root(s), idir)
+        self.assertEqual(fc.config_id(started[0]), "camp.AppleSMC_gram-1")   # the session id
+
+    def test_the_quarantine_is_unioned_into_the_authored_exclusions(self):
+        eff, _ = fc.render_item("camp", self._item())
+        qs = fc.qm.init_state()
+        fc.qm._add_hard(qs, ["syz_IOConnectCallMethod$C_0"])
+        self.assertTrue(fc.apply_disabled(eff, qs))
+        self.assertEqual(json.loads(Path(eff).read_text())["disable_syscalls"],
+                         ["syz_IOConnectCallMethod$C_0", "syz_IOConnectCallMethod$C_1"])
+        self.assertFalse(fc.apply_disabled(eff, qs))                  # nothing changed
+
+    def test_a_known_culprit_is_benched_at_first_sighting_when_opted_in(self):
+        eff, _ = fc.render_item("camp", self._item())
+        s = fc.init_state("camp")
+        s.update(current_config=str(eff), current_item="AppleSMC_gram-1",
+                 incidents=[{"kind": "crash", "config": str(eff)}])
+        d = dict(self._def(), reuse_known_culprits=True)
+        with mock.patch.object(fc, "route_bug_registry", lambda *a, **k: ["BUG-0001"]), \
+             mock.patch.object(fc, "latest_panic_signature", lambda st: "S1"), \
+             mock.patch.object(fc, "known_culprit", lambda sig: {"bug_id": "BUG-0001", "job": "j",
+                                                                 "selectors": ["syz_IOConnectCallMethod$C_0"]}):
+            self.assertFalse(fc.handle_crash(s, d, {"panics": ["/p.panic"]}))
+        self.assertEqual(s["incidents"][-1]["decision"], "benched (known BUG-0001)")
+        self.assertIn("syz_IOConnectCallMethod$C_0", json.loads(Path(eff).read_text())["disable_syscalls"])
+        q = json.loads((Path(eff).parent / "quarantine.json").read_text())
+        self.assertEqual(q["catalog"]["S1"]["known_from"], "BUG-0001")
+        # off by default: the same crash goes through the SUSPECT gate instead
+        s2 = fc.init_state("camp")
+        s2.update(current_config=str(eff), current_item="AppleSMC_gram-1",
+                  incidents=[{"kind": "crash", "config": str(eff)}])
+        with mock.patch.object(fc, "route_bug_registry", lambda *a, **k: []), \
+             mock.patch.object(fc, "latest_panic_signature", lambda st: "S2"), \
+             mock.patch.object(fc, "known_culprit", lambda sig: {"bug_id": "B", "selectors": ["x"]}):
+            fc.handle_crash(s2, self._def(), {"panics": []})
+        self.assertEqual(s2["incidents"][-1]["decision"], "suspect")
+
+    def test_triage_jobs_live_under_the_item_and_are_addressed_by_path(self):
+        eff, _ = fc.render_item("camp", self._item())
+        s = fc.init_state("camp")
+        s.update(current_config=str(eff), current_item="AppleSMC_gram-1", session_id="camp.AppleSMC_gram-1")
+        ring = Path(eff).parent / "workdir" / "ring_buffer"
+        ring.mkdir(parents=True)
+        calls = []
+        with mock.patch.object(fc, "triage", lambda *a, **k: calls.append(a) or (0, "")):
+            self.assertTrue(fc.begin_triage(s, self._def(), "S1", ring=ring))
+        args = calls[0]
+        jdir = Path(eff).parent / "triage" / "t1"
+        self.assertEqual(args[:2], ("new", "t1"))
+        self.assertEqual(args[args.index("--dir") + 1], str(jdir))
+        self.assertEqual(args[args.index("--config") + 1], "AppleSMC_gram")
+        self.assertEqual(args[args.index("--fuzzed-kext") + 1], "AppleSMC")
+        self.assertEqual(args[args.index("--kcov-device") + 1], "/dev/pishi")   # from box.json
+        self.assertEqual(s["triage_job"], str(jdir))
+        jdir.mkdir(parents=True)
+        (jdir / "job.json").write_text(json.dumps({"stage": "MERGE"}))
+        self.assertEqual(fc.triage_state(s["triage_job"])["stage"], "MERGE")
+        self.assertEqual(fc.job_label(s["triage_job"]), "t1")
+
+    def test_results_are_committed_per_item(self):
+        eff, _ = fc.render_item("camp", self._item())
+        s = fc.init_state("camp")
+        s["current_config"] = str(eff)
+        d = dict(self._def(), results_repo="/r")
+        cmds = []
+        with mock.patch.object(fc.subprocess, "run", lambda cmd, **k: cmds.append(cmd) or mock.Mock(returncode=0)):
+            fc.results_commit(s, d, "start")
+        cmd = cmds[0]
+        self.assertEqual(cmd[cmd.index("--unit") + 1], "camp/AppleSMC_gram/AppleSMC_gram-1")
+        self.assertEqual(cmd[cmd.index("--kext") + 1], "AppleSMC")
+        self.assertEqual(cmd[cmd.index("--tag-prefix") + 1], "camp/AppleSMC_gram-1")
+
+    def test_a_legacy_campaign_does_not_run(self):
+        s = fc.init_state("camp")
+        started = []
+        with mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, layout="legacy", name="camp",
+                                                                 items=[{"config": str(self.cfg), "budget_seconds": 1}])), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "ensure_running", lambda *a, **k: started.append(a)):
+            fc.cmd_run("camp")
+        self.assertEqual(started, [])
 
 
 class BoxBusyPrecision(unittest.TestCase):

@@ -890,6 +890,16 @@ def exec_scratch(sid, index):
     return EXEC_SCRATCH_BASE / ("syz-exec-%s-%d" % (sid, index))
 
 
+def scratch_sid(name):
+    """The session id encoded in an exec scratch dir name 'syz-exec-<sid>-<n>'.
+
+    rsplit on the LAST '-' only, so a campaign session id carrying a dot and its
+    own '-N' item suffix ('fde_eval.AppleFDEKeyStore_gram-1') survives intact --
+    only the trailing executor index is stripped off.
+    """
+    return name[len("syz-exec-"):].rsplit("-", 1)[0]
+
+
 # Darwin stores a process name in two struct proc fields, and which one a kext
 # reads decides how much of executor_name survives (verified on macOS 26.5):
 #   p_comm  16 bytes -- ps -o ucomm, proc_selfname(), AND the kernel proc_name()
@@ -2387,6 +2397,72 @@ def build_config_name(kext, date, cover, backend, label):
     return "_".join([kext, date, tok] + ([label] if label else []))
 
 
+# ---- the box overlay (config/box.json) -------------------------------------
+# A syzkaller config mixes three kinds of field with different owners (see
+# scripts/docs/campaign-planning.md §3): the BOX fields identify this machine and
+# are identical for every campaign on it; the EXPERIMENT fields are what an
+# evaluation varies and are authored by hand; the RUNTIME fields are rendered per
+# campaign item by the runner. Once config/box.json holds the box fields, a
+# hand-written config carries only the experiment fields -- the campaign renders
+# `box ⊕ config ⊕ runtime` per item. An explicit box key in a config still wins
+# (the campaign reports the drift), so existing standalone configs keep working.
+#
+# BOX_KEYS are the top-level box fields; the box set also includes the nested
+# kext_coverage.kcov_device. RUNTIME_KEYS are the top-level runtime fields; the
+# runtime set also includes the nested kext_coverage.cover_log. The two nested
+# members are handled explicitly wherever these tuples are swept (box_keys_in_config,
+# the --strip-box label set), since a flat top-level sweep cannot see them.
+BOX_KEYS = ("target", "syzkaller", "http", "procs", "type", "log_file",
+            "kernel_obj", "kernel_obj_file", "sandbox", "reproduce")
+RUNTIME_KEYS = ("workdir",)
+# Nested-under-kext_coverage members of each set (the label suffix after the dot).
+BOX_KEXT_COVERAGE_KEYS = ("kcov_device",)
+RUNTIME_KEXT_COVERAGE_KEYS = ("cover_log",)
+
+
+def box_path():
+    """Where this machine's box fields live (campaign-planning.md §3)."""
+    return REPO_ROOT / "config" / "box.json"
+
+
+def load_box():
+    """The box overlay as a dict, or {} when there is no (or an unreadable)
+    box.json.
+
+    Tolerant on purpose: a missing or malformed box.json means 'no overlay', so
+    config new/lint simply fall back to their standalone behaviour instead of
+    crashing. Parsed with cfgutil so a '#'-commented box.json is accepted the
+    same way a config is.
+    """
+    p = box_path()
+    if not p.exists():
+        return {}
+    try:
+        return cfgutil.load(p) or {}
+    except Exception:
+        return {}
+
+
+def box_keys_in_config(d):
+    """The box-field labels a config carries: the top-level BOX_KEYS it defines,
+    plus 'kext_coverage.<member>' for each nested box field present. Dotted labels
+    name the nested fields so lint and --strip-box can report and compare them.
+    """
+    labels = [k for k in BOX_KEYS if k in d]
+    kc = d.get("kext_coverage") or {}
+    labels += ["kext_coverage.%s" % m for m in BOX_KEXT_COVERAGE_KEYS if m in kc]
+    return labels
+
+
+def box_field_value(d, label):
+    """The value of one (possibly dotted) box label in a config or box dict, or
+    None when absent -- so a config and box.json can be compared key by key."""
+    if "." in label:
+        outer, inner = label.split(".", 1)
+        return (d.get(outer) or {}).get(inner)
+    return d.get(label)
+
+
 # ---- config lint (drift doctor) --------------------------------------------
 def _section(title, items, is_error=False, info=False):
     """Print one check's result. Returns the number of findings.
@@ -2431,6 +2507,10 @@ def cmd_lint():
         except Exception as e:
             parse_errs.append("%s: %s" % (f.name, e))
 
+    # With a box overlay present, the box and runtime fields live in box.json and
+    # are rendered per item, so a config may legitimately omit them (§3).
+    box = load_box()
+
     print("%s  %s config(s) in %s" % (style("lint", "bold"),
                                       len(cfgs) + len(parse_errs), CONFIG_DIR))
     errors = warns = notes = 0
@@ -2438,12 +2518,35 @@ def cmd_lint():
     _group("config files")
     errors += _section("config parse errors", parse_errs, is_error=True)
 
+    # --- box keys carried while box.json exists ---
+    # With a box overlay, a config need not carry the box fields; one that still
+    # does is not an error -- the explicit value simply wins over box.json, and the
+    # campaign reports the drift -- so this is an INFO note. We name the keys that
+    # DIFFER from box.json, since those are the ones where carrying them changes the
+    # rendered config; keys that merely duplicate box.json are redundant but inert.
+    carries_box = []
+    if box:
+        for b, d in sorted(cfgs.items()):
+            labels = box_keys_in_config(d)
+            if not labels:
+                continue
+            differ = [l for l in labels
+                      if box_field_value(d, l) != box_field_value(box, l)]
+            msg = "%s: carries %s" % (b, ", ".join(labels))
+            msg += (" (box.json wins unless they differ: %s)" % ", ".join(differ)
+                    if differ else " (all match box.json)")
+            carries_box.append(msg)
+    notes += _section("box keys in config (box.json present)", carries_box, info=True)
+
     # --- configs vs workdirs ---
     mism, orphaned, neverrun, nokobj, nocoverlog = [], [], [], [], []
     by_workdir = collections.defaultdict(list)
     for b, d in sorted(cfgs.items()):
         wd = d.get("workdir", "")
-        if "_" in b:
+        # A config with no workdir is fine when box.json exists -- the runner
+        # renders it per item -- so the name<->workdir check only runs when the
+        # config actually sets one, or when there is no box overlay to supply it.
+        if "_" in b and (wd or not box):
             kext, variant = b.split("_", 1)
             expect = str(WORKDIR_ROOT / kext / variant)
             if wd != expect:
@@ -2459,9 +2562,13 @@ def cmd_lint():
                     orphaned.append("%s -> %s (ran; workdir gone)" % (b, Path(wd).name))
                 else:
                     neverrun.append("%s -> %s" % (b, Path(wd).name))
-        if d.get("cover") and not d.get("kernel_obj"):
+        # kernel_obj is a box field and cover_log is a runtime field (§3), so with a
+        # box overlay the effective config gets kernel_obj from box.json and its
+        # cover_log rendered per item -- only a genuinely missing value is flagged.
+        if d.get("cover") and not d.get("kernel_obj") and not box.get("kernel_obj"):
             nokobj.append(b)
-        if d.get("cover") and not (d.get("kext_coverage") or {}).get("cover_log"):
+        if (d.get("cover") and not (d.get("kext_coverage") or {}).get("cover_log")
+                and not box):
             nocoverlog.append(b)
 
     _group("configs vs workdirs")
@@ -2613,7 +2720,7 @@ def cmd_lint():
     for d in sorted(EXEC_SCRATCH_BASE.glob("syz-exec-*")):
         if not d.is_dir():
             continue
-        sid = d.name[len("syz-exec-"):].rsplit("-", 1)[0]
+        sid = scratch_sid(d.name)
         if sid not in live:
             try:
                 n = sum(1 for _ in d.iterdir())
@@ -2638,6 +2745,104 @@ def cmd_lint():
         print(style("errors indicate a run would write to the wrong place "
                     "-- fix before fuzzing", "red"))
     sys.exit(1 if errors else 0)
+
+
+# The single-line keys --strip-box removes: the box fields (top-level BOX_KEYS plus
+# the nested kcov_device) and the runtime fields (workdir plus the nested cover_log).
+# Matched by bare key name because none of these names collide across nesting levels
+# in a syzkaller config, and every one holds a single-line scalar value.
+_STRIP_BOX_LINE_KEYS = (set(BOX_KEYS) | set(RUNTIME_KEYS)
+                        | set(BOX_KEXT_COVERAGE_KEYS) | set(RUNTIME_KEXT_COVERAGE_KEYS))
+# A pretty-printed JSON key line: optional indent, then "<key>":  (array elements
+# have no colon after the string, so they never match).
+_CFG_KEY_LINE_RE = re.compile(r'^\s*"([^"]+)"\s*:')
+
+
+def _strip_box_text(raw, keys):
+    """Remove the given keys' lines from a pretty-printed config text, keeping the
+    whole-line '#' comments and blank lines. Returns (new_text, removed_keys).
+
+    This edits the text rather than going through _save_config (json.dump of the
+    parsed dict), because that path drops the comments. It is safe here precisely
+    because every stripped key holds a single-line value in our configs, so the
+    whole line can be dropped; the only JSON damage that leaves is a trailing comma
+    on the member before a now-last position, which the second pass repairs.
+    """
+    kept, removed = [], []
+    for line in raw.splitlines():
+        m = _CFG_KEY_LINE_RE.match(line)
+        if m and m.group(1) in keys:
+            removed.append(m.group(1))
+            continue
+        kept.append(line)
+    # Repair a trailing comma exposed when the last member(s) of an object were
+    # removed: a comma just before a closing '}' or ']' (across blank/comment lines)
+    # is invalid JSON, so drop it.
+    for i, line in enumerate(kept):
+        if not line.rstrip().endswith(","):
+            continue
+        j = i + 1
+        while j < len(kept) and (not kept[j].strip() or kept[j].lstrip().startswith("#")):
+            j += 1
+        if j < len(kept) and kept[j].lstrip()[:1] in ("}", "]"):
+            kept[i] = line.rstrip()[:-1]
+    return "\n".join(kept) + ("\n" if raw.endswith("\n") else ""), removed
+
+
+def cmd_strip_box(names=None, force=False):
+    """Remove the box.json-provided fields from configs: a WRITER, unlike the rest
+    of lint.
+
+    Once config/box.json holds the box fields, a hand-written config should stop
+    carrying them (and the runtime fields the campaign renders per item), so this
+    strips BOX_KEYS, kext_coverage.kcov_device, workdir and kext_coverage.cover_log
+    from the named configs (all configs when none are named). It text-edits the
+    files (see _strip_box_text) so the '#' comments survive. A config whose box key
+    value DIFFERS from box.json is left untouched unless --force, since that
+    difference may be a deliberate override.
+    """
+    box = load_box()
+    if not box:
+        die("no %s: nothing to strip against (strip-box renders the box fields from "
+            "the overlay, so it needs one)" % box_path().name)
+
+    if names:
+        paths = []
+        for n in names:
+            stem = n[:-4] if n.endswith(".cfg") else n
+            p = CONFIG_DIR / ("%s.cfg" % stem)
+            if not p.exists():
+                warn("no such config: %s" % p)
+                continue
+            paths.append(p)
+    else:
+        paths = sorted(CONFIG_DIR.glob("*.cfg"))
+
+    print("%s  box.json: %s" % (style("strip-box", "bold"), box_path()))
+    for p in paths:
+        try:
+            d = load_config(p)
+        except Exception as e:
+            warn("skip %s: %s" % (p.name, e))
+            continue
+        # The differ-refusal considers only box keys; the runtime keys (workdir,
+        # cover_log) are always safe to strip since the runner renders them.
+        differ = [l for l in box_keys_in_config(d)
+                  if box_field_value(d, l) != box_field_value(box, l)]
+        if differ and not force:
+            print("  %s %s: refused -- %s differ(s) from box.json (use --force to "
+                  "strip anyway)" % (style(GLYPH["warn"], "yellow", "bold"),
+                                     p.name, ", ".join(differ)))
+            continue
+        new, removed = _strip_box_text(p.read_text(), _STRIP_BOX_LINE_KEYS)
+        if not removed:
+            print("  %s %s: nothing to strip" % (style(GLYPH["ok"], "green", "bold"),
+                                                 p.name))
+            continue
+        p.write_text(new)
+        note = " (--force over differing: %s)" % ", ".join(differ) if differ else ""
+        print("  %s %s: removed %s%s" % (style(GLYPH["ok"], "green", "bold"),
+                                         p.name, ", ".join(removed), note))
 
 
 def cmd_clean(target):
@@ -2921,7 +3126,8 @@ def infer_cover(variant):
     return None
 
 
-def cmd_new(name, like=None, kext_id=None, cover=None, ring=None, http=None, force=False):
+def cmd_new(name, like=None, kext_id=None, cover=None, ring=None, http=None,
+            force=False, full=False):
     if name.endswith(".cfg"):
         name = name[:-4]
     if "_" not in name:
@@ -2969,62 +3175,91 @@ def cmd_new(name, like=None, kext_id=None, cover=None, ring=None, http=None, for
         if cover is None:
             cover = True   # configs are overwhelmingly cover:true
 
+    # With a config/box.json present, a new config carries ONLY the experiment
+    # fields -- the campaign renders box ⊕ config ⊕ runtime per item (§3), so the
+    # box fields and the runtime fields (workdir, cover_log) do not belong here.
+    # --full forces the standalone output for a manual session that still needs a
+    # self-contained config.
+    box_mode = bool(load_box()) and not full
     cfg = {}
     borrowed = []
-    for k in CONFIG_KEY_ORDER:
-        if k in BOILERPLATE_KEYS:
-            if k in tpl:
-                cfg[k] = tpl[k]
-            else:
-                # Template omits it (many older configs lack kernel_obj*): take it
-                # from the newest config that has it rather than dropping it.
-                val, src = boilerplate_fallback(k)
-                if val is not None:
-                    cfg[k] = val
-                    borrowed.append((k, src.name))
-        elif k == "http":
-            cfg[k] = http or tpl.get("http", "127.0.0.1:56741")
-        elif k == "workdir":
-            cfg[k] = str(WORKDIR_ROOT / kext / variant)   # derived from the name
-        elif k == "cover":
-            cfg[k] = cover
-        elif k == "kext_coverage":
-            kc = dict(tpl.get("kext_coverage") or {})
-            kc["kext_id"] = kext_id
-            kc.setdefault("kcov_device", "/dev/pishi")
-            cfg[k] = {"kcov_device": kc["kcov_device"], "kext_id": kc["kext_id"]}
-            # Log each newly-covered basic-block PC (fsync'd per program, so it
-            # survives a kernel panic). syz-manager truncates it on start, so it
-            # holds THIS run's BBs; start/collect archive it for history. Path is
-            # workdir-relative (mgrconfig joins it with workdir at load).
-            if cover:
-                cfg[k]["cover_log"] = "cover.log"
-        elif k == "ring_buffer_size":
-            cfg[k] = ring if ring is not None else tpl.get("ring_buffer_size", 5)
-        elif k == "enable_syscalls":
-            # Only inherit the syscall list on an explicit --like; otherwise leave
-            # it empty to paste into (a silently inherited grammar would be worse).
-            cfg[k] = list(tpl.get("enable_syscalls", [])) if like else []
-        elif k == "disable_syscalls":
-            if like and tpl.get("disable_syscalls"):
-                cfg[k] = list(tpl["disable_syscalls"])
+    if box_mode:
+        # Experiment fields only, in the documented order: cover, kext_coverage
+        # {kext_id}, ring_buffer_size, executor_name (when the template names one),
+        # then the syscall lists. No workdir/http/box fields, no kcov_device, no
+        # cover_log.
+        cfg["cover"] = cover
+        cfg["kext_coverage"] = {"kext_id": kext_id}
+        cfg["ring_buffer_size"] = ring if ring is not None else tpl.get("ring_buffer_size", 5)
+        exec_name = (tpl.get("executor_name") or "").strip()
+        if exec_name:
+            cfg["executor_name"] = exec_name
+        cfg["enable_syscalls"] = list(tpl.get("enable_syscalls", [])) if like else []
+        if like and tpl.get("disable_syscalls"):
+            cfg["disable_syscalls"] = list(tpl["disable_syscalls"])
+    else:
+        for k in CONFIG_KEY_ORDER:
+            if k in BOILERPLATE_KEYS:
+                if k in tpl:
+                    cfg[k] = tpl[k]
+                else:
+                    # Template omits it (many older configs lack kernel_obj*): take it
+                    # from the newest config that has it rather than dropping it.
+                    val, src = boilerplate_fallback(k)
+                    if val is not None:
+                        cfg[k] = val
+                        borrowed.append((k, src.name))
+            elif k == "http":
+                cfg[k] = http or tpl.get("http", "127.0.0.1:56741")
+            elif k == "workdir":
+                cfg[k] = str(WORKDIR_ROOT / kext / variant)   # derived from the name
+            elif k == "cover":
+                cfg[k] = cover
+            elif k == "kext_coverage":
+                kc = dict(tpl.get("kext_coverage") or {})
+                kc["kext_id"] = kext_id
+                kc.setdefault("kcov_device", "/dev/pishi")
+                cfg[k] = {"kcov_device": kc["kcov_device"], "kext_id": kc["kext_id"]}
+                # Log each newly-covered basic-block PC (fsync'd per program, so it
+                # survives a kernel panic). syz-manager truncates it on start, so it
+                # holds THIS run's BBs; start/collect archive it for history. Path is
+                # workdir-relative (mgrconfig joins it with workdir at load).
+                if cover:
+                    cfg[k]["cover_log"] = "cover.log"
+            elif k == "ring_buffer_size":
+                cfg[k] = ring if ring is not None else tpl.get("ring_buffer_size", 5)
+            elif k == "enable_syscalls":
+                # Only inherit the syscall list on an explicit --like; otherwise leave
+                # it empty to paste into (a silently inherited grammar would be worse).
+                cfg[k] = list(tpl.get("enable_syscalls", [])) if like else []
+            elif k == "disable_syscalls":
+                if like and tpl.get("disable_syscalls"):
+                    cfg[k] = list(tpl["disable_syscalls"])
 
     _save_config(dest, cfg)
     print("created %s" % dest)
     print("  template : %s" % tpl_path)
     for k, src in borrowed:
         print("  borrowed : %s (missing from template; took it from %s)" % (k, src))
-    print("  workdir  : %s" % cfg["workdir"])
+    if box_mode:
+        print("  box keys : from %s (campaign renders box ⊕ config ⊕ runtime per item)"
+              % box_path().name)
+        print("  runtime  : workdir + kext_coverage.cover_log rendered per item")
+    else:
+        print("  workdir  : %s" % cfg["workdir"])
     print("  cover    : %s%s" % (cfg["cover"], "" if cover is not None else " (default)"))
     print("  kext_id  : %s  [%s]" % (kext_id, id_src))
     print("  syscalls : %d enabled%s"
           % (len(cfg["enable_syscalls"]),
              " (copied from --like)" if like else " -- paste yours into enable_syscalls"))
-    if cfg.get("cover") and not cfg.get("kernel_obj"):
-        warn("cover:true but no kernel_obj (BKC path) -- coverage PCs will not symbolize")
-    wd = Path(cfg["workdir"])
-    if (wd / "corpus.db").exists():
-        warn("workdir already has a corpus.db; a run will RESUME from it, not start fresh")
+    # These warnings only apply to a standalone config; in box_mode kernel_obj and
+    # the workdir come from box.json and the runner, so there is nothing to check.
+    if not box_mode:
+        if cfg.get("cover") and not cfg.get("kernel_obj"):
+            warn("cover:true but no kernel_obj (BKC path) -- coverage PCs will not symbolize")
+        wd = Path(cfg["workdir"])
+        if (wd / "corpus.db").exists():
+            warn("workdir already has a corpus.db; a run will RESUME from it, not start fresh")
     print("next: %s grammar list %s   |   %s start config/%s.cfg"
           % (sys.argv[0], name, sys.argv[0], name))
 
@@ -3053,8 +3288,16 @@ def main():
     sp.add_argument("--ring", type=int, default=None, metavar="N", help="ring_buffer_size")
     sp.add_argument("--http", default=None, metavar="HOST:PORT")
     sp.add_argument("--force", action="store_true", help="overwrite an existing config")
+    sp.add_argument("--full", action="store_true",
+                    help="write a standalone config (all box+runtime keys) even when "
+                         "config/box.json exists; the default omits them")
 
-    cfg_sub.add_parser("lint", help="check configs/workdirs/registry for drift (read-only)")
+    lp = cfg_sub.add_parser("lint", help="check configs/workdirs/registry for drift (read-only)")
+    lp.add_argument("--strip-box", dest="strip_box", nargs="*", default=None, metavar="NAME",
+                    help="WRITER: remove box.json-provided keys from the named configs "
+                         "(all if none named), keeping '#' comments")
+    lp.add_argument("--force", action="store_true",
+                    help="with --strip-box, strip even a key whose value differs from box.json")
 
     sp = sub.add_parser("start", help="launch a run from a config (+1 executor by default)")
     sp.add_argument("config")
@@ -3166,9 +3409,14 @@ def main():
     if args.cmd == "config":
         if args.config_cmd == "new":
             cmd_new(args.name, like=args.like, kext_id=args.kext_id, cover=args.cover,
-                    ring=args.ring, http=args.http, force=args.force)
+                    ring=args.ring, http=args.http, force=args.force, full=args.full)
         elif args.config_cmd == "lint":
-            cmd_lint()
+            # --strip-box turns lint into a writer; nargs="*" gives None when the
+            # flag is absent, [] when given bare (all configs), or the named list.
+            if args.strip_box is not None:
+                cmd_strip_box(args.strip_box or None, force=args.force)
+            else:
+                cmd_lint()
         else:
             cfg_p.print_help()
             sys.exit(1)

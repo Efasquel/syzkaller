@@ -30,17 +30,28 @@ number a corpus loss makes go backwards. Signal is the manager's own figure.
 Tags (annotated): <prefix>/start, <prefix>/<crash|hang>-N, <prefix>/end, and at
 the end at most one <kext>/record-cov-N on the commit where this campaign first
 reached its maximum -- only when that beats every earlier record for the kext.
+The tag prefix is given by --tag-prefix (the campaign passes <campaign>/<item-id>
+now that one config has several items); the kext for record-cov is --kext (the
+authored config's <Kext> prefix), since with an explicit --unit its first
+component is the campaign name, not the kext.
 
 Every git failure is reported and swallowed: results must never stop fuzzing.
 A failed push is retried by the next commit's push.
 
 Usage:
   fuzz-results.py commit  <config> --event E [--campaign NAME] [--tag-prefix P]
+                          [--unit PATH] [--kext NAME]
                           [--wall-seconds S] [--no-freq] [--push wait|detach|no]
   fuzz-results.py push
-  fuzz-results.py backfill <config> [--campaign NAME] [--push ...]
+  fuzz-results.py backfill <config> [--campaign NAME] [--unit PATH] [--kext NAME] [--push ...]
   fuzz-results.py import  <src-dir> <repo-path> -m MESSAGE
-  fuzz-results.py restore <kext>/<name> <dest> [--at REV]
+  fuzz-results.py restore <unit> <dest> [--at REV]
+
+--unit is the repo directory for this run, relative to the repo root. The new
+campaign layout runs a config several times, so it passes a 3-component unit
+(e.g. fde_eval/AppleFDEKeyStore_gram/AppleFDEKeyStore_gram-1): each item keeps
+its own directory and samples of one config no longer overwrite each other.
+Without --unit the legacy <kext>/<name> unit from the workdir path is used.
 """
 
 import argparse
@@ -262,9 +273,20 @@ def load_config(path):
 
 
 def unit_of(workdir):
-    """Repo directory for a workdir: <kext>/<name>, as under fuzz-run/workdir."""
+    """Default repo directory for a workdir: <kext>/<name>, as under
+    fuzz-run/workdir. The campaign overrides this with an explicit --unit,
+    because its <item-id>/workdir names would otherwise collide across configs
+    and campaigns (every item's workdir is literally named `workdir`)."""
     workdir = Path(workdir)
     return Path(workdir.parent.name) / workdir.name
+
+
+def cover_log_name(cfg):
+    """Workdir-relative name of the manager's cover log, from the config's
+    kext_coverage.cover_log (default `cover.log`). The copy in the repo is
+    always `cover.log`, so restore and coverage counting never depend on how a
+    config happened to name it."""
+    return (cfg.get("kext_coverage") or {}).get("cover_log") or "cover.log"
 
 
 def run_logs(workdir):
@@ -281,9 +303,9 @@ def tail(path, n=65536):
         return ""
 
 
-def bb_coverage(workdir):
+def bb_coverage(workdir, cover_log="cover.log"):
     seen = set()
-    for p in [Path(workdir) / "cover.log"] + sorted((Path(workdir) / "results").glob("cover-*.log")):
+    for p in [Path(workdir) / cover_log] + sorted((Path(workdir) / "results").glob("cover-*.log")):
         try:
             seen.update(ln.split()[0] for ln in p.read_text(errors="replace").splitlines()
                         if ln.strip())          # '0x<pc>' or '0x<pc> <unix>'
@@ -471,12 +493,17 @@ def sync_bundles(workdir, unit_dir):
                     for c in cores])
 
 
-def sync_workdir(workdir, config_path, unit_dir, campaign_def=None, freq=True):
+def sync_workdir(workdir, config_path, unit_dir, campaign_def=None, freq=True,
+                 cover_log="cover.log"):
     workdir = Path(workdir)
     unit_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("corpus.db", "cover.log", "manager.log"):
+    for name in ("corpus.db", "manager.log"):
         if (workdir / name).is_file():
             copy_file(workdir / name, unit_dir / name)
+    # The config may name the cover log (kext_coverage.cover_log); it is always
+    # stored as cover.log so the rest of the repo layout stays fixed.
+    if (workdir / cover_log).is_file():
+        copy_file(workdir / cover_log, unit_dir / "cover.log")
     corpus = unpack_corpus(workdir / "corpus.db", unit_dir / "corpus")
     for sub in ("results", "ring_buffer", "grammar", "snapshots", "reports"):
         mirror_tree(workdir / sub, unit_dir / sub)
@@ -498,7 +525,7 @@ def metrics(workdir, cfg, corpus, wall=None):
         "session": session_stamp(workdir),
         "corpus": corpus,
         "corpus_sha256": sha256(db) if db.exists() else None,
-        "coverage": bb_coverage(workdir),
+        "coverage": bb_coverage(workdir, cover_log_name(cfg)),
         "signal": signal,
         "exec_total": execs,
         "wall_seconds": int(wall) if wall is not None else None,
@@ -605,7 +632,7 @@ def cmd_commit(a):
     repo = Path(a.repo)
     cfg = load_config(a.config)
     workdir = Path(cfg["workdir"])
-    unit = unit_of(workdir)
+    unit = Path(a.unit.strip("/")) if a.unit else unit_of(workdir)
     campaign = a.campaign or workdir.name
     prefix = a.tag_prefix or campaign
     try:
@@ -614,7 +641,8 @@ def cmd_commit(a):
             unit_dir = repo / unit
             prev = read_json(unit_dir / "STATE.json")
             corpus = sync_workdir(workdir, a.config, unit_dir,
-                                  campaign_def=a.campaign_def, freq=not a.no_freq)
+                                  campaign_def=a.campaign_def, freq=not a.no_freq,
+                                  cover_log=cover_log_name(cfg))
             m = metrics(workdir, cfg, corpus, a.wall_seconds)
             if a.event == "corpus" and not changed(m, prev):
                 # Freq chunks written above ride along on the next real commit.
@@ -634,7 +662,7 @@ def cmd_commit(a):
                 tag(repo, "%s/end" % prefix, "%s ended on %s" % (campaign, unit))
                 start = "%s/start" % prefix
                 since = start if git(repo, "tag", "-l", start).strip() else None
-                record_tag(repo, unit.parts[0], unit, since)
+                record_tag(repo, a.kext or unit.parts[0], unit, since)
     except GitError as e:
         log("commit failed: %s" % e)
         return 1
@@ -677,7 +705,7 @@ def cmd_backfill(a):
     repo = Path(a.repo)
     cfg = load_config(a.config)
     workdir = Path(cfg["workdir"])
-    unit = unit_of(workdir)
+    unit = Path(a.unit.strip("/")) if a.unit else unit_of(workdir)
     campaign = a.campaign or workdir.name
     try:
         prepare_repo(repo)
@@ -715,13 +743,14 @@ def cmd_backfill(a):
                 rev = commit(repo, unit, msg, allow_empty=False, date=date)
                 log("%s: %s %s -> %s" % (unit, kind, rel, (rev or "-")[:12]))
                 prev = m
-            corpus = sync_workdir(workdir, a.config, unit_dir, campaign_def=a.campaign_def)
+            corpus = sync_workdir(workdir, a.config, unit_dir, campaign_def=a.campaign_def,
+                                  cover_log=cover_log_name(cfg))
             m = metrics(workdir, cfg, corpus)
             write_json(unit_dir / "STATE.json",
                        dict(m, campaign=campaign, event="backfill", updated_at=timefmt.now_iso()))
             rev = commit(repo, unit, message(campaign, "backfill", m, prev), allow_empty=True)
             log("%s: current state -> %s" % (unit, (rev or "-")[:12]))
-            record_tag(repo, unit.parts[0], unit)
+            record_tag(repo, a.kext or unit.parts[0], unit)
     except GitError as e:
         log("backfill failed: %s" % e)
         return 1
@@ -814,6 +843,10 @@ def main():
     p.add_argument("--campaign")
     p.add_argument("--campaign-def")
     p.add_argument("--tag-prefix")
+    p.add_argument("--unit", help="repo dir for this run, relative to the repo "
+                   "root (default <kext>/<name> from the workdir path)")
+    p.add_argument("--kext", help="kext for the <kext>/record-cov-N tag "
+                   "(default the unit's first component)")
     p.add_argument("--wall-seconds", type=float)
     p.add_argument("--no-freq", action="store_true")
     add_common(p)
@@ -824,6 +857,10 @@ def main():
     p.add_argument("config")
     p.add_argument("--campaign")
     p.add_argument("--campaign-def")
+    p.add_argument("--unit", help="repo dir for this run, relative to the repo "
+                   "root (default <kext>/<name> from the workdir path)")
+    p.add_argument("--kext", help="kext for the <kext>/record-cov-N tag "
+                   "(default the unit's first component)")
     add_common(p)
     p = sub.add_parser("import")
     p.add_argument("src")

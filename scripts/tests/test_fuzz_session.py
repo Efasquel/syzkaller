@@ -4,8 +4,11 @@
 Both bugs covered here produced the same class of failure: a healthy thing
 reported as dead, or an impossible cleanup reported as work."""
 
+import contextlib
 import errno
 import importlib.util
+import io
+import json
 import os
 import sys
 import tempfile
@@ -496,3 +499,281 @@ class CoverLogTimestampTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "cover.log").write_text("0x1 1761030412\n0x2 1761030412\n0x2\n\n")
             self.assertEqual(fs.bb_unique([Path(tmp, "cover.log")]), 2)
+
+
+# A full, standalone template config: config new copies its box/runtime fields in
+# standalone mode and takes only its experiment fields when a box.json exists.
+_FULL_TEMPLATE = {
+    "target": "darwin/arm64",
+    "http": "127.0.0.1:56741",
+    "workdir": "/old/workdir",
+    "syzkaller": "/syz",
+    "procs": 1,
+    "type": "none",
+    "cover": True,
+    "kext_coverage": {"kcov_device": "/dev/pishi", "kext_id": 2, "cover_log": "cover.log"},
+    "ring_buffer_size": 5,
+    "kernel_obj": "/bkc/kernel",
+    "sandbox": "none",
+    "reproduce": False,
+    "executor_name": "smcexec",
+    "enable_syscalls": ["syz_IOServiceOpen$AppleSMC_AppleSMCClient"],
+    "disable_syscalls": [],
+}
+
+
+class ConfigNewBoxTest(unittest.TestCase):
+    """`config new` writes a standalone config without box.json, and only the
+    experiment fields once box.json holds the machine's identity (§3)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfgdir = self.root / "config"
+        self.cfgdir.mkdir()
+        self.wdroot = self.root / "workdir"
+        (self.cfgdir / "AppleSMC_250101_cov.cfg").write_text(
+            json.dumps(_FULL_TEMPLATE, indent=4) + "\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_box(self):
+        (self.cfgdir / "box.json").write_text(json.dumps({
+            "target": "darwin/arm64", "http": "127.0.0.1:56741", "syzkaller": "/syz",
+            "procs": 1, "type": "none", "kernel_obj": "/bkc/kernel",
+            "sandbox": "none", "reproduce": False,
+            "kext_coverage": {"kcov_device": "/dev/pishi"},
+        }) + "\n")
+
+    def _run_new(self, name, **kw):
+        fs._ALL_CONFIGS = None                      # boilerplate_fallback caches it
+        buf = io.StringIO()
+        with mock.patch.object(fs, "CONFIG_DIR", self.cfgdir), \
+             mock.patch.object(fs, "WORKDIR_ROOT", self.wdroot), \
+             mock.patch.object(fs, "box_path", lambda: self.cfgdir / "box.json"), \
+             mock.patch.object(fs, "KEXT_MAP_PATH", self.cfgdir / "absent.json"), \
+             contextlib.redirect_stdout(buf):
+            fs.cmd_new(name, kext_id=2, **kw)
+        data = json.loads((self.cfgdir / ("%s.cfg" % name)).read_text())
+        return data, buf.getvalue()
+
+    def test_standalone_without_box_json(self):
+        data, out = self._run_new("AppleSMC_260101_cov")
+        # The full set of keys, including box and runtime fields.
+        self.assertIn("workdir", data)
+        self.assertIn("target", data)
+        self.assertIn("kernel_obj", data)
+        self.assertEqual(data["kext_coverage"].get("kcov_device"), "/dev/pishi")
+        self.assertEqual(data["kext_coverage"].get("cover_log"), "cover.log")
+        self.assertIn("workdir  :", out)
+
+    def test_box_mode_writes_only_experiment_keys(self):
+        self._write_box()
+        data, out = self._run_new("AppleSMC_260101_cov")
+        self.assertEqual(set(data), {"cover", "kext_coverage", "ring_buffer_size",
+                                     "executor_name", "enable_syscalls"})
+        # No box or runtime fields, and kext_coverage keeps only the experiment id.
+        for k in ("workdir", "http", "target", "syzkaller", "kernel_obj", "sandbox"):
+            self.assertNotIn(k, data)
+        self.assertEqual(data["kext_coverage"], {"kext_id": 2})
+        self.assertEqual(data["executor_name"], "smcexec")   # carried when known
+        self.assertIn("box.json", out)
+        self.assertIn("rendered per item", out)
+
+    def test_full_flag_forces_standalone_even_with_box_json(self):
+        self._write_box()
+        data, out = self._run_new("AppleSMC_260101_cov", full=True)
+        self.assertIn("workdir", data)
+        self.assertIn("target", data)
+        self.assertEqual(data["kext_coverage"].get("kcov_device"), "/dev/pishi")
+
+
+class ConfigLintBoxTest(unittest.TestCase):
+    """A config may omit workdir once box.json renders it per item; without a box
+    overlay the missing workdir is still drift."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.cfgdir = self.root / "config"
+        self.cfgdir.mkdir()
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
+        # A valid-named config carrying no workdir (and no box fields).
+        (self.cfgdir / "AppleSMC_260101_cov.cfg").write_text(json.dumps({
+            "cover": True,
+            "kext_coverage": {"kext_id": 2},
+            "ring_buffer_size": 5,
+            "kernel_obj": "/bkc/kernel",
+            "enable_syscalls": ["syz_IOServiceOpen$AppleSMC_AppleSMCClient",
+                                "syz_IOConnectCallMethod$AppleSMCClient_0"],
+            "disable_syscalls": [],
+        }, indent=4) + "\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_box(self):
+        (self.cfgdir / "box.json").write_text(json.dumps({
+            "target": "darwin/arm64", "http": "127.0.0.1:56741", "syzkaller": "/syz",
+            "procs": 1, "type": "none", "kernel_obj": "/bkc/kernel",
+            "sandbox": "none", "reproduce": False,
+            "kext_coverage": {"kcov_device": "/dev/pishi"},
+        }) + "\n")
+
+    def _run_lint(self):
+        buf = io.StringIO()
+        with mock.patch.object(fs, "CONFIG_DIR", self.cfgdir), \
+             mock.patch.object(fs, "WORKDIR_ROOT", self.root / "workdir"), \
+             mock.patch.object(fs, "EXEC_SCRATCH_BASE", self.scratch), \
+             mock.patch.object(fs, "box_path", lambda: self.cfgdir / "box.json"), \
+             mock.patch.object(fs, "KEXT_MAP_PATH", self.cfgdir / "absent.json"), \
+             mock.patch.object(fs, "all_ids", lambda: []), \
+             contextlib.redirect_stdout(buf):
+            try:
+                fs.cmd_lint()
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, buf.getvalue()
+
+    def test_missing_workdir_is_an_error_without_box_json(self):
+        code, out = self._run_lint()
+        self.assertEqual(code, 1)
+        self.assertIn("name<->workdir mismatch", out)
+
+    def test_missing_workdir_is_fine_with_box_json(self):
+        self._write_box()
+        code, out = self._run_lint()
+        self.assertEqual(code, 0)
+
+    def test_box_keys_in_config_are_an_info_note_naming_what_differs(self):
+        self._write_box()
+        # Give the config a box key that DIFFERS from box.json.
+        p = self.cfgdir / "AppleSMC_260101_cov.cfg"
+        d = json.loads(p.read_text())
+        d["http"] = "127.0.0.1:9999"
+        p.write_text(json.dumps(d, indent=4) + "\n")
+        code, out = self._run_lint()
+        self.assertEqual(code, 0)                     # carrying box keys is not an error
+        self.assertIn("box keys in config", out)
+        self.assertIn("box.json wins unless they differ: http", out)
+
+
+class StripBoxTest(unittest.TestCase):
+    """`config lint --strip-box` is a WRITER that removes the box.json-provided
+    fields while keeping the whole-line '#' comments."""
+
+    CFG_WITH_COMMENTS = (
+        "{\n"
+        "    # box identity\n"
+        '    "target": "darwin/arm64",\n'
+        '    "http": "127.0.0.1:56741",\n'
+        '    "workdir": "/old/workdir",\n'
+        '    "syzkaller": "/syz",\n'
+        '    "procs": 1,\n'
+        '    "type": "none",\n'
+        '    "cover": true,\n'
+        '    "kext_coverage": {\n'
+        '        "kcov_device": "/dev/pishi",\n'
+        '        "kext_id": 2,\n'
+        '        "cover_log": "cover.log"\n'
+        "    },\n"
+        '    "ring_buffer_size": 5,\n'
+        '    "sandbox": "none",\n'
+        '    "reproduce": false,\n'
+        "    # the grammar\n"
+        '    "enable_syscalls": [\n'
+        '        "syz_IOServiceOpen$AppleSMC_AppleSMCClient"\n'
+        "    ],\n"
+        '    "disable_syscalls": []\n'
+        "}\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfgdir = Path(self._tmp.name) / "config"
+        self.cfgdir.mkdir()
+        self.cfg = self.cfgdir / "AppleSMC_260101_cov.cfg"
+        self.cfg.write_text(self.CFG_WITH_COMMENTS)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_box(self, http="127.0.0.1:56741"):
+        (self.cfgdir / "box.json").write_text(json.dumps({
+            "target": "darwin/arm64", "http": http, "syzkaller": "/syz",
+            "procs": 1, "type": "none", "sandbox": "none", "reproduce": False,
+            "kext_coverage": {"kcov_device": "/dev/pishi"},
+        }) + "\n")
+
+    def _strip(self, names=None, force=False):
+        buf = io.StringIO()
+        with mock.patch.object(fs, "CONFIG_DIR", self.cfgdir), \
+             mock.patch.object(fs, "box_path", lambda: self.cfgdir / "box.json"), \
+             contextlib.redirect_stdout(buf):
+            fs.cmd_strip_box(names, force=force)
+        return buf.getvalue()
+
+    def test_removes_box_and_runtime_keys_and_keeps_comments(self):
+        self._write_box()
+        out = self._strip()
+        text = self.cfg.read_text()
+        # Comments survive, so the text path (not _save_config) was used.
+        self.assertIn("# box identity", text)
+        self.assertIn("# the grammar", text)
+        # The result is still valid config with only the experiment fields left.
+        data = fs.load_config(self.cfg)
+        self.assertEqual(data, {
+            "cover": True,
+            "kext_coverage": {"kext_id": 2},
+            "ring_buffer_size": 5,
+            "enable_syscalls": ["syz_IOServiceOpen$AppleSMC_AppleSMCClient"],
+            "disable_syscalls": [],
+        })
+        for k in ("target", "http", "workdir", "syzkaller", "kcov_device", "cover_log"):
+            self.assertIn("removed", out)
+            self.assertIn(k, out)
+
+    def test_refuses_a_differing_value_without_force(self):
+        self._write_box(http="127.0.0.1:9999")       # differs from the config's http
+        before = self.cfg.read_text()
+        out = self._strip()
+        self.assertIn("refused", out)
+        self.assertEqual(self.cfg.read_text(), before)   # untouched
+
+    def test_force_strips_even_a_differing_value(self):
+        self._write_box(http="127.0.0.1:9999")
+        out = self._strip(force=True)
+        self.assertIn("removed", out)
+        data = fs.load_config(self.cfg)
+        self.assertNotIn("http", data)
+
+    def test_no_box_json_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self._strip()
+
+
+class DottedSessionIdTest(unittest.TestCase):
+    """A campaign session id is '<campaign>.<item-id>' and its item id itself ends
+    in '-N' (e.g. 'fde_eval.AppleFDEKeyStore_gram-1'). The dot and the suffix must
+    survive id resolution, the state-file name, the exec scratch dir name, and the
+    lint's parse of that name back to an id."""
+
+    SID = "fde_eval.AppleFDEKeyStore_gram-1"
+
+    def test_resolve_id_passes_a_dotted_id_through(self):
+        self.assertEqual(fs.resolve_id(self.SID), self.SID)
+
+    def test_resolve_id_from_a_cfg_path_keeps_the_dot(self):
+        self.assertEqual(fs.resolve_id("config/%s.cfg" % self.SID), self.SID)
+
+    def test_state_file_name_is_the_whole_id(self):
+        self.assertTrue(str(fs.state_file(self.SID)).endswith("%s.json" % self.SID))
+
+    def test_scratch_dir_name_round_trips(self):
+        name = fs.exec_scratch(self.SID, 0).name
+        self.assertEqual(name, "syz-exec-%s-0" % self.SID)
+        # Only the trailing executor index is stripped; the item's own -1 stays.
+        self.assertEqual(fs.scratch_sid(name), self.SID)

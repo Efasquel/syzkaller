@@ -47,11 +47,19 @@ run as. Run as yourself they are noise — it says so in its own output.
 ## Authoring and installing
 
 ```sh
-/usr/bin/python3 scripts/fuzz-campaign.py new <name> config/<x>.cfg \
-    --budget-hours 24 --budget-clock fuzz \
-    --kcov-device /dev/pishi --kext-id 1 --sandbox none
-sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz
+/usr/bin/python3 scripts/fuzz-campaign.py new <name> config/<x>.cfg [config/<y>.cfg] \
+    --repeat 3 --max-hours 6 --clock fuzz          # writes plans/<name>.json + checks it
+/usr/bin/python3 scripts/fuzz-campaign.py plan check <name> [--strict]
+sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz   # freezes campaigns/<name>/plan.json, installs
 ```
+
+A plan references hand-written configs; listing a config N times (or
+`--repeat N`) runs it N times from scratch as items `<config-id>-1..N`.
+`config/box.json` holds the machine's keys once and is never overwritten by
+sync; a config's own box key wins and shows as drift in `plan check`. The
+runner renders each item's effective config under
+`campaigns/<name>/<config-id>/<item-id>/` and never writes `config/`.
+Campaigns authored as `campaigns/<name>.json` are read-only now.
 
 `--agent` (a LaunchAgent in `gui/502`), never a LaunchDaemon: the driver needs
 the login session. `RunAtLoad` gives exactly one relaunch per panic-reboot, and

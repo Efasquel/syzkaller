@@ -248,7 +248,7 @@ def write_dossier(bugs_dir, rec):
 
 
 # --- routing ----------------------------------------------------------------
-def crash_record(a, campaign=None, config=None, origin=DEFAULT_ORIGIN):
+def crash_record(a, campaign=None, config=None, item=None, origin=DEFAULT_ORIGIN):
     """The per-crash row we keep: the discriminators, de-slid so they mean the
     same thing across reboots, plus which run produced it.
 
@@ -273,6 +273,7 @@ def crash_record(a, campaign=None, config=None, origin=DEFAULT_ORIGIN):
         "signature": a["signature"],
         "campaign": campaign,
         "config": config,
+        "item": item,
         "origin": origin,
     }
 
@@ -301,7 +302,8 @@ def keep_report(bugs_dir, rec, report_path):
         pass
 
 
-def route_one(reg, bugs_dir, a, campaign=None, config=None, origin=DEFAULT_ORIGIN):
+def route_one(reg, bugs_dir, a, campaign=None, config=None, item=None,
+              origin=DEFAULT_ORIGIN):
     """File one analyzed panic under its bug_key, creating the bug if new.
     Returns (bug_id, status, is_new_bug, is_new_crash)."""
     key = a["bug_key"]
@@ -329,7 +331,7 @@ def route_one(reg, bugs_dir, a, campaign=None, config=None, origin=DEFAULT_ORIGI
     existing = next((c for c in rec["crashes"] if c["report"] == name), None)
     is_new_crash = existing is None
     if is_new_crash:
-        rec["crashes"].append(crash_record(a, campaign, config, origin))
+        rec["crashes"].append(crash_record(a, campaign, config, item, origin))
     elif "origin" not in existing and origin != DEFAULT_ORIGIN:
         # Backfill only: a row written before origin existed defaults to "fuzz",
         # so re-routing a known triage panic with --origin triage corrects it.
@@ -394,7 +396,7 @@ def cmd_route(args):
         origin = getattr(args, "origin", DEFAULT_ORIGIN)
         bug_id, status, new_bug, new_crash = route_one(
             reg, args.bugs, a, getattr(args, "campaign", None),
-            getattr(args, "config", None), origin)
+            getattr(args, "config", None), getattr(args, "item", None), origin)
         tag = "NEW BUG " if new_bug else ("new crash" if new_crash else "dup      ")
         print("%s  %s [%s]  %s%s" % (tag, bug_id, status, a["bug_key"],
                                      "  (%s-origin)" % origin if origin != DEFAULT_ORIGIN else ""))
@@ -476,6 +478,36 @@ def find_bug(reg, which=None, sig=None):
     return None
 
 
+def known_culprit(reg, sig):
+    """The verified culprit the ledger already proves for `sig`, or None.
+
+    This is the join the opt-in reuse_known_culprits path reads (campaign-planning.md
+    §3): the campaign imports it, and when it returns a dict the quarantine benches
+    the culprit at first sighting instead of triaging. Returns {bug_id, selectors,
+    job, verified: True} when some bug has a reproducer with verified == True whose
+    own signature is `sig`, or under which `sig` is filed as a crash signature;
+    None for an unverified reproducer, no reproducer, or an unknown sig. A bug whose
+    reproducer.signature == sig wins over one merely filed under it -- that
+    reproducer was proved against this exact signature, not a sibling."""
+    fallback = None
+    for r in sorted(reg["bugs"].values(), key=lambda x: x["id"]):
+        rp = r.get("reproducer")
+        if not rp or not rp.get("verified"):
+            continue
+        if rp.get("signature") == sig:
+            return _culprit_hit(r, rp)
+        if fallback is None and sig in bug_signatures(r):
+            fallback = r
+    if fallback is None:
+        return None
+    return _culprit_hit(fallback, fallback["reproducer"])
+
+
+def _culprit_hit(rec, rp):
+    return {"bug_id": rec["id"], "selectors": list(rp.get("selectors") or []),
+            "job": rp.get("job"), "verified": True}
+
+
 def cmd_attribute(args):
     """Record the minimized reproducer triage produced for a bug.
 
@@ -541,6 +573,17 @@ def cmd_show(args):
     sys.exit(1)
 
 
+def cmd_known(args):
+    """Print the verified culprit for a signature as JSON, or exit 1 when there is
+    none. For the operator; the campaign imports known_culprit() directly."""
+    reg = load_registry(args.bugs, must_exist=True)
+    hit = known_culprit(reg, args.sig)
+    if hit is None:
+        sys.exit(1)
+    json.dump(hit, sys.stdout, indent=2)
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -555,6 +598,7 @@ def main():
     pr.add_argument("report", nargs="+")
     pr.add_argument("--campaign", help="campaign that produced these panics (provenance)")
     pr.add_argument("--config", help="manager config that produced them (provenance)")
+    pr.add_argument("--item", help="campaign item that produced them (provenance)")
     pr.add_argument("--origin", choices=ORIGINS, default=DEFAULT_ORIGIN,
                     help="'triage' for panics the minimizer caused on purpose; "
                          "they are filed as evidence but not counted as sightings")
@@ -580,6 +624,11 @@ def main():
     psh = sub.add_parser("show", help="print one bug's registry record")
     psh.add_argument("which", help="BUG-id or bug_key")
     psh.set_defaults(func=cmd_show)
+
+    pk = sub.add_parser(
+        "known", help="print the verified culprit for a signature (JSON), or exit 1")
+    pk.add_argument("sig", help="crash signature to look up")
+    pk.set_defaults(func=cmd_known)
 
     args = ap.parse_args()
     if not getattr(args, "func", None):

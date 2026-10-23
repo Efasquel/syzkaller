@@ -469,3 +469,144 @@ class ProgressTest(unittest.TestCase):
             "crash_slot": "slot_0030.syz"}))
         p = triage.progress({"dir": str(self.tmp), "stage": triage.REPLAY})
         self.assertIn("verify pass at slot_0012.syz of 40 slots", triage.progress_line(p))
+
+
+class PathAddressed(unittest.TestCase):
+    """A job can live in an arbitrary dir with its state INSIDE that dir,
+    addressed by path, while legacy name-keyed jobs keep working. This is what
+    lets a triage job live under its campaign item, where no name is unique."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # list and the launchd plist walk REPO_ROOT; everything is name/path
+        # resolution otherwise. Sandbox all three and restore on teardown.
+        self._saved = (triage.STATE_DIR, triage.TRIAGE_ROOT, triage.REPO_ROOT,
+                       triage.PANIC_DIRS)
+        triage.STATE_DIR = self.tmp / ".state"
+        triage.TRIAGE_ROOT = self.tmp / "triage"
+        triage.REPO_ROOT = self.tmp
+        triage.PANIC_DIRS = []
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (triage.STATE_DIR, triage.TRIAGE_ROOT, triage.REPO_ROOT,
+         triage.PANIC_DIRS) = self._saved
+
+    def _ring(self):
+        r = self.tmp / "ring"
+        r.mkdir(exist_ok=True)
+        (r / "slot_0000.syz").write_text("open()\n")
+        return r
+
+    def _new(self, name, job_dir_arg=None):
+        # cmd_new requires only that the ring buffer exists; the rest are strings.
+        triage.cmd_new(name, str(self._ring()), "ex", "rr", None, None, None,
+                       None, None, None, -1, 0, False, job_dir_arg=job_dir_arg)
+
+    @staticmethod
+    def _capture(fn, *a):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*a)
+        return buf.getvalue()
+
+    def test_new_dir_writes_job_json_in_the_dir_and_nothing_under_state_dir(self):
+        jdir = (self.tmp / "campaigns" / "c" / "cfg" / "item" / "triage" / "t1")
+        self._new("t1", job_dir_arg=str(jdir))
+        self.assertTrue((jdir / "job.json").is_file())
+        st = triage.read_json(jdir / "job.json")
+        # The short name is preserved; dir and state_path are absolute.
+        self.assertEqual(st["name"], "t1")
+        self.assertEqual(st["dir"], str(jdir.resolve()))
+        self.assertEqual(st["state_path"], str((jdir / "job.json").resolve()))
+        self.assertTrue(triage.is_path_addressed(st))
+        state_jsons = (sorted(triage.STATE_DIR.glob("*.json"))
+                       if triage.STATE_DIR.is_dir() else [])
+        self.assertEqual(state_jsons, [])
+
+    def test_legacy_new_still_writes_under_state_dir_with_state_path(self):
+        self._new("leg")
+        sp = triage.STATE_DIR / "leg.json"
+        self.assertTrue(sp.is_file())
+        st = triage.read_json(sp)
+        # state_path is recorded for uniformity, but the job is NOT path-addressed.
+        self.assertEqual(st["state_path"], str(sp.resolve()))
+        self.assertFalse(triage.is_path_addressed(st))
+        self.assertEqual(triage.job_ident(st), "leg")
+
+    def test_load_job_by_dir_by_file_and_by_legacy_name(self):
+        jdir = (self.tmp / "job").resolve()
+        self._new("t2", job_dir_arg=str(jdir))
+        self.assertEqual(triage.load_job(str(jdir))["name"], "t2")
+        self.assertEqual(triage.load_job(str(jdir / "job.json"))["name"], "t2")
+        self._new("leg")
+        self.assertEqual(triage.load_job("leg")["name"], "leg")
+
+    def test_save_job_round_trips_to_the_dir(self):
+        jdir = (self.tmp / "job").resolve()
+        self._new("t2", job_dir_arg=str(jdir))
+        st = triage.load_job(str(jdir))
+        st["stage"] = "DONE"
+        triage.save_job(st)
+        # It went back into the dir, not to the legacy STATE_DIR path.
+        self.assertEqual(triage.read_json(jdir / "job.json")["stage"], "DONE")
+        self.assertFalse((triage.STATE_DIR / "t2.json").exists())
+        self.assertEqual(triage.load_job(str(jdir))["stage"], "DONE")
+
+    def test_list_finds_path_addressed_and_legacy_jobs(self):
+        jdir = self.tmp / "campaigns" / "camp" / "cfg" / "item" / "triage" / "t1"
+        self._new("t1", job_dir_arg=str(jdir))
+        self._new("leg")
+        out = self._capture(triage.cmd_list)
+        self.assertIn("t1", out)
+        self.assertIn("leg", out)
+        # The path-addressed row shows its location, relative to REPO_ROOT.
+        self.assertIn("campaigns/camp/cfg/item/triage/t1", out)
+
+    def test_run_accepts_a_path_and_persists_back_into_the_dir(self):
+        jdir = (self.tmp / "job").resolve()
+        self._new("t3", job_dir_arg=str(jdir))
+        # Stub the stage runner: prove run resolves the job by path, advances it,
+        # and saves back into the dir -- no device work.
+        seen = []
+
+        def fake_merge(st):
+            seen.append(st["name"])
+            st["stage"] = "DONE"
+            triage.save_job(st)
+        self.addCleanup(setattr, triage, "run_merge", triage.run_merge)
+        triage.run_merge = fake_merge
+        self.addCleanup(setattr, triage.bootinfo, "boot_epoch",
+                        triage.bootinfo.boot_epoch)
+        triage.bootinfo.boot_epoch = lambda: time.time()
+        triage.cmd_run(str(jdir))
+        self.assertEqual(seen, ["t3"])
+        self.assertEqual(triage.load_job(str(jdir))["stage"], "DONE")
+
+    def test_status_accepts_a_path(self):
+        jdir = (self.tmp / "job").resolve()
+        self._new("t3", job_dir_arg=str(jdir))
+        out = self._capture(triage.cmd_status, str(jdir))
+        self.assertIn("t3", out)
+        self.assertIn(str(jdir), out)
+
+    def test_plist_argv_round_trips_a_path_for_relaunch(self):
+        jdir = (self.tmp / "job").resolve()
+        self._new("t3", job_dir_arg=str(jdir))
+        st = triage.load_job(str(jdir))
+        xml = triage._plist_xml(st)
+        # The relaunch must re-address the same job: its dir is in the argv, and
+        # load_job accepts that dir.
+        self.assertIn("<string>run</string>", xml)
+        self.assertIn("<string>%s</string>" % str(jdir), xml)
+        self.assertEqual(triage.job_ident(st), str(jdir))
+        # A path-addressed job's launchd label/log fold in the path, so two jobs
+        # that share the short name "t3" do not collide.
+        other = (self.tmp / "job2").resolve()
+        self._new("t3", job_dir_arg=str(other))
+        st2 = triage.load_job(str(other))
+        self.assertNotEqual(triage.plist_label(st), triage.plist_label(st2))
+        self.assertNotEqual(triage.launchd_log(st), triage.launchd_log(st2))

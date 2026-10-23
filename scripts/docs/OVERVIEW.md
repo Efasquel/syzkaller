@@ -44,6 +44,10 @@ Pure helpers, no CLI, no repo-root anchoring — imported as `from lib import X`
 | `timefmt.py` | One clock for every tool: stored timestamps with a real UTC offset, local display, tolerant parsing, `now_ts()` directory stamps. |
 | `fsutil.py` | `hardlink_or_copy` (share evidence across consumers without duplicating blocks) and a link-count refcount. |
 | `tablefmt.py` | `render` / `tabulate` for the aligned tables the CLIs print. |
+| `style.py` | tty-aware ANSI colour and glyphs shared by the status views. |
+| `schedule.py` | The campaign scheduler, pure: item ids, `next_step`, `stop_reason`. |
+| `requests.py` | The operator's request list (`next`, `skip`...), appended by verbs and taken by the runner. |
+| `plan.py` | Plans and effective configs: load/normalize a plan, render `box ⊕ config ⊕ runtime`, item folders. |
 
 ## Shell
 

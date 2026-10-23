@@ -336,6 +336,38 @@ class EscapePaths(unittest.TestCase):
         self.assertTrue(st["soft_groups"], "a multi-selector path must rotate, not hard-bench")
 
 
+class BenchKnown(unittest.TestCase):
+    """The opt-in reuse_known_culprits path: a ledger-verified culprit is benched
+    at the first sighting, with no SUSPECT gate and no triage."""
+
+    def test_benches_at_first_sighting(self):
+        s = fresh(confirm=2)
+        res = q.bench_known(s, "sigK", ["A"], bug_id="BUG-0007")
+        self.assertEqual(res["decision"], "bench-known")
+        self.assertEqual(res["category"], q.HARD)
+        self.assertEqual(res["disposition"], q.DISABLED)
+        self.assertIn("A", s["hard"])
+        self.assertEqual(q.disabled_set(s), ["A"])       # benched despite one sighting
+
+    def test_catalog_record_fields(self):
+        s = fresh()
+        q.bench_known(s, "sigK", ["A", "B"], bug_id="BUG-0007")
+        rec = s["catalog"]["sigK"]
+        self.assertEqual(rec["category"], q.HARD)
+        self.assertEqual(rec["disposition"], q.DISABLED)
+        self.assertEqual(rec["occurrence_count"], 1)
+        self.assertEqual(rec["culprit_selectors"], ["A", "B"])
+        self.assertEqual(rec["minimized_sequence"], ["A", "B"])   # one call each
+        self.assertEqual(rec["known_from"], "BUG-0007")
+
+    def test_following_crash_is_an_escape(self):
+        s = fresh()
+        q.bench_known(s, "sigK", ["A"], bug_id="BUG-0007")
+        res = q.on_crash(s, "sigK", ["A"])               # fires again while disabled
+        self.assertEqual(res["decision"], "escape")
+        self.assertEqual(s["catalog"]["sigK"]["escaped_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

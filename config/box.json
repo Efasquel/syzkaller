@@ -1,0 +1,10 @@
+{
+    "target": "darwin/arm64",
+    "syzkaller": "/home/wan/Documents/tools/efa_syzkaller",
+    "http": "127.0.0.1:56758",
+    "procs": 1,
+    "type": "none",
+    "sandbox": "none",
+    "reproduce": false,
+    "kext_coverage": {"kcov_device": "/dev/pishi"}
+}

@@ -117,27 +117,66 @@ def write_json(path, obj):
 
 
 # --- job definition + state --------------------------------------------------
-# A job's state lives in one JSON file under .state/<name>.json. It is both the
-# definition (paths, device flags) and the live state (stage, watermark,
-# ledger), so a single durable write advances everything atomically.
+# A job's state lives in one JSON file. It is both the definition (paths, device
+# flags) and the live state (stage, watermark, ledger), so a single durable write
+# advances everything atomically. Two homes for that file: the legacy one, under
+# .state/<name>.json keyed by a globally-unique name; and, for a path-addressed
+# job, <job-dir>/job.json INSIDE the job's own dir, so the job can live anywhere
+# (e.g. under its campaign item) and nothing has to be unique but the path. A
+# job records its own home in "state_path" so save_job writes back to the right
+# place regardless of how it was addressed.
 def state_path(name):
     return STATE_DIR / ("%s.json" % name)
 
 
-def load_job(name):
-    st = read_json(state_path(name))
+def load_job(arg):
+    """Load a job addressed by name OR by path.
+
+    This is what lets a job's state live inside its own dir: `arg` may be the
+    job dir (we read <dir>/job.json), the state file itself, or -- for legacy
+    jobs -- a bare name resolved under STATE_DIR. We try the path interpretations
+    first so a name that happens to match neither a dir nor a file still falls
+    through to the legacy lookup unchanged.
+    """
+    p = Path(arg)
+    if p.is_dir() and (p / "job.json").is_file():
+        st = read_json(p / "job.json")
+    elif p.is_file():
+        st = read_json(p)
+    else:
+        st = read_json(state_path(arg))
     if st is None:
-        die("no such triage job: %s (see: triage.py list)" % name)
+        die("no such triage job: %s (see: triage.py list)" % arg)
     return st
 
 
 def save_job(st):
     st["updated_at"] = now_iso()
-    write_json(state_path(st["name"]), st)
+    # Write back to wherever this job's state lives: its own dir when it is
+    # path-addressed, else the legacy .state/<name>.json.
+    write_json(st.get("state_path") or state_path(st["name"]), st)
 
 
 def job_dir(st):
     return Path(st["dir"])
+
+
+def is_path_addressed(st):
+    """True when the job's state lives inside its own dir rather than under
+    STATE_DIR. These jobs do not assume a globally-unique name, so anything
+    keyed by name (launchd label, log file) has to fold in the path instead."""
+    sp = st.get("state_path")
+    return bool(sp and Path(sp).resolve() != state_path(st["name"]).resolve())
+
+
+def job_ident(st):
+    """The CLI argument that re-addresses this job after a relaunch.
+
+    For a path-addressed job it is the job dir (absolute, so it survives being
+    re-run from launchd's WorkingDirectory, and round-trips through load_job via
+    <dir>/job.json); for a legacy job it is the short, unique name.
+    """
+    return str(job_dir(st)) if is_path_addressed(st) else st["name"]
 
 
 def exec_scratch(st):
@@ -864,14 +903,23 @@ def _print_summary(st):
 def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
             sandbox, max_k, os_name, arch, from_off, to_off, force,
             target_sig=None, executor_name=None, campaign=None, config=None,
-            fuzzed_kext=None):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if state_path(name).exists() and not force:
+            fuzzed_kext=None, job_dir_arg=None):
+    # With --dir the job lives at <job-dir> with its state in <job-dir>/job.json,
+    # so the job (and the item that owns it) is self-contained and nothing needs
+    # a unique name. Without it, exactly today's layout: dir triage/<name>, state
+    # under .state/. Either way we record the state's absolute path for uniformity.
+    if job_dir_arg:
+        jdir = Path(job_dir_arg).expanduser().resolve()
+        sp = jdir / "job.json"
+    else:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        jdir = (TRIAGE_ROOT / name).resolve()
+        sp = state_path(name).resolve()
+    if sp.exists() and not force:
         die("triage job %s already exists (use --force to overwrite)" % name)
     ring = Path(ring_buffer).expanduser().resolve()
     if not ring.exists():
         die("ring buffer not found: %s" % ring)
-    jdir = (TRIAGE_ROOT / name).resolve()
     jdir.mkdir(parents=True, exist_ok=True)
 
     flags = {}
@@ -895,6 +943,10 @@ def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
     st = {
         "name": name,
         "dir": str(jdir),
+        # Where this job's state file lives, absolute. save_job writes back here;
+        # load_job reaches it by dir or file path. Recorded for every job so the
+        # legacy and path-addressed cases are handled the same way everywhere.
+        "state_path": str(sp),
         "ring_buffer": str(ring),
         "ringrepro": str(Path(ringrepro).expanduser().resolve()),
         "executor": str(Path(executor).expanduser().resolve()),
@@ -915,8 +967,10 @@ def cmd_new(name, ring_buffer, executor, ringrepro, kcov_device, kext_id,
     }
     save_job(st)
     log("created triage job %s (stage MERGE) at %s" % (name, jdir))
-    print("  run it:     scripts/triage.py run %s" % name)
-    print("  autonomous: sudo scripts/triage.py install %s" % name)
+    # A path-addressed job is addressed by its dir on the CLI, a legacy one by name.
+    ident = job_ident(st)
+    print("  run it:     scripts/triage.py run %s" % ident)
+    print("  autonomous: sudo scripts/triage.py install %s" % ident)
 
 
 def cmd_status(name):
@@ -931,44 +985,88 @@ def cmd_status(name):
     _print_summary(st)
 
 
+def _list_repro(st):
+    """A finished job's worth: its reproducer, and whether it is proven."""
+    if st.get("stage") == "DONE":
+        return "verified" if st.get("calls_reduced", True) else "verified(conn)"
+    if st.get("stage") == STUCK:
+        return "STUCK:%s" % (st.get("stuck_kind") or "?")
+    return "-"
+
+
+def _list_row(st, path="-"):
+    return (st.get("name", "?"), path, st.get("stage", "?"), _list_repro(st),
+            st.get("target_signature") or "-", len(st.get("incidents", [])))
+
+
 def cmd_list():
-    if not STATE_DIR.is_dir():
-        print("no triage jobs")
-        return
+    # Two homes to scan: legacy jobs keyed by name under STATE_DIR, and
+    # path-addressed jobs that live inside their campaign item, one job.json per
+    # job under the per-item layout (campaigns/<name>/<config>/<item>/triage/t<N>/).
     rows = []
-    for sf in sorted(STATE_DIR.glob("*.json")):
-        st = read_json(sf)
+    if STATE_DIR.is_dir():
+        for sf in sorted(STATE_DIR.glob("*.json")):
+            st = read_json(sf)
+            if st:
+                rows.append(_list_row(st))
+    for jf in sorted(REPO_ROOT.glob("campaigns/*/*/*/triage/*/job.json")):
+        st = read_json(jf)
         if not st:
             continue
-        # A finished job's worth is its reproducer, and whether it is proven.
-        if st["stage"] == "DONE":
-            repro = "verified" if st.get("calls_reduced", True) else "verified(conn)"
-        elif st["stage"] == STUCK:
-            repro = "STUCK:%s" % (st.get("stuck_kind") or "?")
-        else:
-            repro = "-"
-        rows.append((st["name"], st["stage"], repro,
-                     st.get("target_signature") or "-",
-                     len(st.get("incidents", []))))
+        try:
+            rel = str(jf.parent.relative_to(REPO_ROOT))
+        except ValueError:
+            rel = str(jf.parent)
+        rows.append(_list_row(st, rel))
     if not rows:
         print("no triage jobs")
         return
-    tabulate(rows, ("NAME", "STAGE", "REPRO", "TARGET SIG", "PANICS"))
+    tabulate(rows, ("NAME", "PATH", "STAGE", "REPRO", "TARGET SIG", "PANICS"))
 
 
 # --- launchd (survive reboots) ----------------------------------------------
-def plist_label(name):
-    return "com.syz-triage.%s" % name
+def _job_slug(st):
+    """A filesystem-safe, collision-free handle for a job's launchd label and log.
+
+    A legacy job's name is globally unique, so it is the slug. A path-addressed
+    job's name need not be unique (two campaign items may both call theirs "t3"),
+    so its slug folds in a short hash of the state path -- the one thing that IS
+    unique -- keeping two jobs' agents and logs from clobbering each other. This
+    is the only place that still needs a job to be distinguishable, and it no
+    longer relies on the name alone to be so.
+    """
+    name = st["name"]
+    if is_path_addressed(st):
+        import hashlib
+        h = hashlib.sha1(str(Path(st["state_path"]).resolve()).encode()).hexdigest()[:8]
+        return "%s-%s" % (name, h)
+    return name
 
 
-def plist_path(name):
-    return LAUNCHD_DIR / ("%s.plist" % plist_label(name))
+def plist_label(st):
+    return "com.syz-triage.%s" % _job_slug(st)
 
 
-def _plist_xml(name):
-    logf = STATE_DIR / ("%s.launchd.log" % name)
+def plist_path(st):
+    return LAUNCHD_DIR / ("%s.plist" % plist_label(st))
+
+
+def launchd_log(st):
+    """Where the launchd agent's stdout/stderr lands. A path-addressed job keeps
+    it inside its own dir (the job owns everything it produces); a legacy job
+    keeps today's STATE_DIR/<name>.launchd.log."""
+    if is_path_addressed(st):
+        return job_dir(st) / "launchd.log"
+    return STATE_DIR / ("%s.launchd.log" % st["name"])
+
+
+def _plist_xml(st):
+    logf = launchd_log(st)
     py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
-    args = [py, str(SCRIPT_DIR / "triage.py"), "run", name]
+    # Pass whatever re-addresses the job after a reboot: its dir for a
+    # path-addressed job (absolute, round-trips via load_job), else its name. The
+    # relaunch that resumes a crashed boot must land on the same job.
+    args = [py, str(SCRIPT_DIR / "triage.py"), "run", job_ident(st)]
     arg_xml = "\n".join("    <string>%s</string>" % a for a in args)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -982,15 +1080,15 @@ def _plist_xml(name):
         '  <key>StandardOutPath</key><string>%s</string>\n'
         '  <key>StandardErrorPath</key><string>%s</string>\n'
         '</dict>\n</plist>\n'
-        % (plist_label(name), arg_xml, REPO_ROOT, logf, logf)
+        % (plist_label(st), arg_xml, REPO_ROOT, logf, logf)
     )
 
 
 def cmd_install(name):
-    load_job(name)   # validate it exists
+    st = load_job(name)   # validate it exists and learn how it is addressed
     LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
-    path = plist_path(name)
-    path.write_text(_plist_xml(name))
+    path = plist_path(st)
+    path.write_text(_plist_xml(st))
     os.chmod(path, 0o644)
     log("wrote %s" % path)
     uid = os.getuid()
@@ -999,14 +1097,15 @@ def cmd_install(name):
     rc = subprocess.run(["launchctl", "bootstrap", "gui/%d" % uid, str(path)]).returncode
     if rc != 0:
         die("launchctl bootstrap failed (rc=%d)" % rc)
-    log("loaded %s -- RunAtLoad; relaunches after each reboot" % plist_label(name))
-    print("  logs: %s" % (STATE_DIR / ("%s.launchd.log" % name)))
+    log("loaded %s -- RunAtLoad; relaunches after each reboot" % plist_label(st))
+    print("  logs: %s" % launchd_log(st))
     print("  note: RunAtLoad fires once per boot; that is exactly one relaunch "
           "per crash-reboot, which is what triage needs.")
 
 
 def cmd_uninstall(name):
-    path = plist_path(name)
+    st = load_job(name)   # the job's addressing decides its plist label
+    path = plist_path(st)
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", "gui/%d" % uid, str(path)],
                    stderr=subprocess.DEVNULL)
@@ -1026,6 +1125,10 @@ def main():
 
     n = sub.add_parser("new", help="author a triage job")
     n.add_argument("name")
+    n.add_argument("--dir", dest="job_dir", default=None,
+                   help="put the job in this dir with its state inside it "
+                        "(<dir>/job.json), addressed by path; default is "
+                        "triage/<name> with state under .state/")
     n.add_argument("--ring", required=True, help="ring buffer dir (crashing programs)")
     n.add_argument("--executor", default=str(REPO_ROOT / "bin/darwin_arm64/syz-executor"))
     n.add_argument("--executor-name", default=None,
@@ -1069,7 +1172,8 @@ def main():
                 args.kcov_device, args.kext_id, args.sandbox, args.max_k,
                 args.os_name, args.arch, args.from_off, args.to_off, args.force,
                 args.target_sig, executor_name=args.executor_name,
-                campaign=args.campaign, config=args.config, fuzzed_kext=args.fuzzed_kext)
+                campaign=args.campaign, config=args.config, fuzzed_kext=args.fuzzed_kext,
+                job_dir_arg=args.job_dir)
     elif args.cmd == "run":
         cmd_run(args.name, reboot_on_hang=args.reboot_on_hang)
     elif args.cmd == "status":

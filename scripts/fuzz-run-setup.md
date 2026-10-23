@@ -169,22 +169,46 @@ chgrp -R staff "$DST/campaigns" && chmod -R g+rw "$DST/campaigns/.state" "$DST/c
 
 ## Authoring the campaign
 
-The `triage` block is what the coordinator replays to `triage.py new` on every bug it
-decides to minimize. **Author it** — without it triage falls back to no coverage
-device and no kext id, which is not what the manual runs used:
+A campaign is a **plan** that references hand-written configs; it does not run
+them itself. `new` writes `plans/<name>.json` (tracked in git, like the configs
+it names) and checks it; `install` freezes a copy under `campaigns/<name>/` and
+runs that copy, so editing the tracked plan later does not change a campaign
+already created.
 
 ```sh
-./scripts/fuzz-campaign.py new jpeg config/AppleJPEGDriver_260827_cov_gram_test.cfg \
-    --budget-hours 12 --loop --kcov-device /dev/pishi --kext-id 1 --sandbox none
+./scripts/fuzz-campaign.py new fde_eval config/AppleFDEKeyStore_gram.cfg \
+    config/AppleFDEKeyStore_gramsel.cfg --repeat 3 --max-hours 6 --clock fuzz
+./scripts/fuzz-campaign.py plan check fde_eval          # again, any time
 ```
 
-`--loop` with a single config means it never finishes: at each budget expiry it
-snapshots, restarts, and keeps going. Leave `--executor`/`--ringrepro` unset —
-`triage.py`'s own defaults are anchored at its repo root, which is correct in both
-the dev tree and the published tree, whereas a relative path here would resolve
-against launchd's working directory.
-
----
+- **Listing a config twice runs it twice, each time from scratch** (empty
+  corpus, fresh quarantine, its own triage jobs). `--repeat 3` writes each
+  config three times. Items are named `<config-id>-1`, `-2`, `-3` and that is
+  what `status`, `skip` and the folders use.
+- **`--max-hours` is PER ITEM.** Six configs at 6h is 36h; `plan check` prints
+  the total so you see it before the box does.
+- **`config/box.json` holds this machine's keys once** (`target`, `syzkaller`,
+  `http`, `procs`, `type`, `sandbox`, `reproduce`, `kernel_obj*`,
+  `kext_coverage.kcov_device`). A config may still carry them; its value wins
+  and `plan check` lists the difference as **drift** (`--strict` makes drift an
+  error -- use it for evaluation plans, where everything but the varied factor
+  must be identical). `workdir` and `cover_log` in a config are ignored: the
+  runner renders them per item.
+- **Device flags for triage are gone** (`--kcov-device`, `--kext-id`,
+  `--sandbox`, `--executor`): triage reads them from the item's effective
+  config, which has them from `box.json` and the config.
+- **`--reuse-known-culprits`** (off by default): when a crash's signature maps to
+  a bug whose reproducer is already verified in `campaigns/bugs/`, the item
+  benches that culprit at the first sighting and spends no triage on it. Off, every
+  item pays its own minimization -- the strict choice for time-to-reproducer.
+- **The effective config is the record.** What syz-manager actually ran is
+  `campaigns/<name>/<config-id>/<item-id>/<name>.<item-id>.cfg`, rendered as
+  `box.json ⊕ config ⊕ runtime` with the quarantine's benched selectors unioned
+  into the authored `disable_syscalls` (they are never lost). `config/` is never
+  written.
+- A campaign authored before plans (`campaigns/<name>.json`) is **read-only**:
+  `status`, `list`, `replay` still work; `run` and `install` refuse until it is
+  migrated.
 
 ## Pre-flight — as `fuzz`, not as you
 

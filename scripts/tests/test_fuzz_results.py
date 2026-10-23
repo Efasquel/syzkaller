@@ -198,6 +198,55 @@ class ResultsRepoTest(unittest.TestCase):
         self.run_cli("backfill", str(self.cfg), "--campaign", "C0")
         self.assertEqual(len(self.log()), 5)
 
+    def test_unit_and_kext_land_under_a_three_component_unit(self):
+        # The new layout runs a config several times under one campaign; each
+        # item gets its own 3-component unit and names its own kext for the tag.
+        (self.wd / "cover.log").write_text("0xA\n")          # one block -> record-cov-1
+        unit = "fde_eval/KextX_gram/KextX_gram-1"
+        for ev in ("start", "end"):
+            self.run_cli("commit", str(self.cfg), "--event", ev, "--campaign", "fde_eval",
+                         "--tag-prefix", "fde_eval/KextX_gram-1", "--unit", unit,
+                         "--kext", "AppleKext")
+        d = self.repo / "fde_eval" / "KextX_gram" / "KextX_gram-1"
+        self.assertEqual((d / "corpus.db").read_bytes(), b"db-v1")
+        self.assertTrue((d / "config" / self.cfg.name).is_file())
+        # record-cov is tagged for the authored kext, not the campaign name.
+        self.assertIn("AppleKext/record-cov-1", self.tags())
+        self.assertNotIn("fde_eval/record-cov-1", self.tags())
+        # The legacy <kext>/<name> unit was not written.
+        self.assertFalse((self.repo / "KextX" / "260101_cov").exists())
+
+    def test_two_items_of_one_config_do_not_overwrite_each_other(self):
+        base = "fde_eval/KextX_gram"
+        for item in ("KextX_gram-1", "KextX_gram-2"):
+            (self.wd / "corpus.db").write_bytes(b"db-" + item.encode()[-1:])
+            self.run_cli("commit", str(self.cfg), "--event", "start", "--campaign", "fde_eval",
+                         "--unit", "%s/%s" % (base, item), "--kext", "AppleKext")
+        d1 = self.repo / "fde_eval" / "KextX_gram" / "KextX_gram-1" / "corpus.db"
+        d2 = self.repo / "fde_eval" / "KextX_gram" / "KextX_gram-2" / "corpus.db"
+        self.assertEqual(d1.read_bytes(), b"db-1")
+        self.assertEqual(d2.read_bytes(), b"db-2")
+
+    def test_restore_accepts_a_three_component_unit(self):
+        unit = "fde_eval/KextX_gram/KextX_gram-1"
+        self.run_cli("commit", str(self.cfg), "--event", "start", "--campaign", "fde_eval",
+                     "--unit", unit, "--kext", "AppleKext")
+        out = self.tmp / "restored3"
+        self.run_cli("restore", unit, str(out))
+        self.assertEqual((out / "corpus.db").read_bytes(), b"db-v1")
+        self.assertTrue((out / "config" / self.cfg.name).is_file())
+
+    def test_cover_log_named_by_the_config_is_stored_as_cover_log(self):
+        (self.wd / "cover.log").unlink()
+        (self.wd / "kcov.log").write_text("0x1\n0x2\n0x3\n")
+        cfg2 = self.tmp / "named.cfg"
+        cfg2.write_text(json.dumps({"workdir": str(self.wd), "kernel_obj": "/bkc",
+                                    "kext_coverage": {"kext_id": 2, "cover_log": "kcov.log"}}))
+        self.run_cli("commit", str(cfg2), "--event", "start", "--campaign", "C1")
+        unit = self.repo / "KextX" / "260101_cov"
+        self.assertEqual((unit / "cover.log").read_text(), "0x1\n0x2\n0x3\n")
+        self.assertIn("Coverage: 3", sh("git", "-C", str(self.repo), "log", "-1", "--format=%B"))
+
 
 class ChunkLinesTest(unittest.TestCase):
     def test_recreated_file_is_chunked_again_from_zero(self):
