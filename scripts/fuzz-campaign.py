@@ -24,6 +24,7 @@ core is ~220MB), and cores are pruned to the newest few after each collect.
 Commands:
   new <name> <config...> [--max-hours H] [--repeat N] ...   author plans/<name>.json
   plan check <name>              render every item's effective config, show drift
+  readme <name>                  refresh the generated block of the campaign's README.md
   run <name>                     the supervision loop (what launchd invokes)
   status <name>                  campaign runtime state
   quarantine <name> [--all]      what the quarantine has benched, and why
@@ -2766,7 +2767,7 @@ def cmd_run(name):
 def cmd_new(name, configs, max_hours, repeat=1, clock=None, max_crashes=None,
             min_free_gb=None, crashloop_limit=None, crashloop_min_execs=None,
             triage_max_boots=None, max_plateau_hours=None, reuse_known_culprits=False,
-            watch_window=True, force=False, strict=False):
+            watch_window=True, force=False, strict=False, description=None):
     """Author plans/<name>.json (campaign-planning.md §3) and check it.
 
     A plan references hand-written configs; it does not run them. Running is
@@ -2791,6 +2792,9 @@ def cmd_new(name, configs, max_hours, repeat=1, clock=None, max_crashes=None,
         items += [{"config": rel} for _ in range(max(1, repeat))]
     plan = {
         "name": name,
+        # Why this campaign exists, in the operator's words. It travels with the
+        # tracked plan and seeds the campaign's README (write_readme).
+        "description": (description or "").strip(),
         # A plan measures fuzzing by default: minimizing a bug never eats a
         # sample's budget (the legacy definitions defaulted to wall).
         "clock": clock or planlib.DEFAULT_CLOCK,
@@ -2856,6 +2860,72 @@ def cmd_plan_check(name, strict=False):
     return 0
 
 
+README_BEGIN = "<!-- fuzz-campaign: generated, do not edit between these markers -->"
+README_END = "<!-- /fuzz-campaign -->"
+
+
+def readme_block(name, p, box):
+    """The generated part of a campaign's README: what the plan says, and where
+    the things it produces are. Everything else in the file is the operator's."""
+    rows = planlib.check_table(p, box, REPO_ROOT)
+    hours = sum(float(r[2]) for r in rows)
+    lines = [README_BEGIN,
+             "**Plan** `plans/%s.json`, frozen %s as `campaigns/%s/plan.json` -- %d item(s), "
+             "%.1fh total on the `%s` clock%s." % (
+                 p.get("plan", name), timefmt.fmt(now_iso(), short=True), name, len(rows),
+                 hours, p["clock"],
+                 "; benches known culprits at first sighting" if p["defaults"].get("reuse_known_culprits") else ""),
+             "", "| item | config | max h | syscalls | drift from box.json |", "|---|---|---|---|---|"]
+    lines += ["| %s |" % " | ".join(r) for r in rows]
+    lines += ["",
+              "Each item runs its config from scratch under `campaigns/%s/<config>/<item>/`: the "
+              "effective config (`%s.<item>.cfg`, what syz-manager ran), `quarantine.json`, "
+              "`workdir/` (corpus, `results/progress.jsonl`, cover logs), `triage/t<N>/`." % (name, name),
+              "",
+              "Watch: `fuzz-campaign.py status %s -w`; decisions in "
+              "`campaigns/.state/%s.coordinator.log`; what the quarantine benched: "
+              "`fuzz-campaign.py quarantine %s --all`; verification manifest: "
+              "`fuzz-campaign.py replay %s`." % (name, name, name, name),
+              README_END]
+    return "\n".join(lines)
+
+
+def write_readme(name, p=None):
+    """Create campaigns/<name>/README.md, or refresh only its generated block.
+
+    The README is the human-readable record of the campaign: the operator's
+    description and notes, and later the results. The tool owns exactly the
+    text between README_BEGIN and README_END and never touches the rest, so a
+    regeneration (`readme <name>`, or the report later) cannot eat what you
+    wrote. Returns the path."""
+    if p is None:
+        p = planlib.normalize(planlib.load_plan(plan_path(name)), REPO_ROOT)
+    box = planlib.load_box(BOX_PATH)
+    block = readme_block(name, p, box)
+    path = campaign_dir(name) / "README.md"
+    if path.exists():
+        text = path.read_text()
+        if README_BEGIN in text and README_END in text:
+            a = text.index(README_BEGIN)
+            b = text.index(README_END) + len(README_END)
+            text = text[:a] + block + text[b:]
+        else:
+            text = text.rstrip("\n") + "\n\n" + block + "\n"
+        path.write_text(text)
+        return path
+    desc = (p.get("description") or "").strip() or "_(no description -- `new -m` sets one; edit freely)_"
+    path.write_text("# %s\n\n%s\n\n%s\n\n## Notes\n\n## Results\n" % (name, desc, block))
+    return path
+
+
+def cmd_readme(name):
+    if not is_plan_layout(name):
+        die("no campaign %r in the plan layout (install freezes a plan into one)" % name)
+    path = write_readme(name)
+    print("refreshed the generated block of %s" % path)
+    return 0
+
+
 def freeze_plan(name):
     """Make a campaign from a plan: copy plans/<name>.json to
     campaigns/<name>/plan.json -- once; that copy is what runs, so editing the
@@ -2878,6 +2948,7 @@ def freeze_plan(name):
     shutil.copy2(src, plan_path(name))
     if not state_path(name).exists():
         write_json(state_path(name), init_state(name))
+    write_readme(name)
     log("froze %s -> %s" % (src, plan_path(name)))
     return True
 
@@ -4936,6 +5007,7 @@ def main():
     sp.add_argument("--no-watch-window", dest="watch_window", action="store_false",
                     help="do not open a Terminal running `status -w` at each driver start")
     sp.add_argument("--strict", action="store_true", help="treat drift from box.json as an error")
+    sp.add_argument("-m", "--description", help="what this campaign is for; seeds campaigns/<name>/README.md")
     sp.add_argument("--force", action="store_true")
     # Circuit-breaker overrides. A crash-heavy target needs these loosened, or the
     # breaker halts the campaign before any bug reaches its second occurrence.
@@ -4950,6 +5022,9 @@ def main():
     sp.add_argument("--triage-max-boots", type=int,
                     help="advances before giving up on a triage (default %d)"
                          % DEFAULTS["triage_max_boots"])
+
+    sp = sub.add_parser("readme", help="refresh the generated block of campaigns/<name>/README.md")
+    sp.add_argument("name")
 
     sp = sub.add_parser("plan", help="plan check <name>: render every item without running")
     sp.add_argument("action", choices=["check"])
@@ -5053,7 +5128,9 @@ def main():
                 crashloop_limit=args.crashloop_limit, crashloop_min_execs=args.crashloop_min_execs,
                 triage_max_boots=args.triage_max_boots, max_plateau_hours=args.max_plateau_hours,
                 reuse_known_culprits=args.reuse_known_culprits, watch_window=args.watch_window,
-                force=args.force, strict=args.strict)
+                force=args.force, strict=args.strict, description=args.description)
+    elif args.cmd == "readme":
+        sys.exit(cmd_readme(args.name))
     elif args.cmd == "plan":
         sys.exit(cmd_plan_check(args.name, strict=args.strict))
     elif args.cmd == "stop":

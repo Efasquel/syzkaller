@@ -181,6 +181,11 @@ already created.
 ./scripts/fuzz-campaign.py plan check fde_eval          # again, any time
 ```
 
+- **Say what the campaign is for**: `new -m "Does grammar X beat Y on FDE?" …`.
+  The description is stored in the plan and seeds `campaigns/<name>/README.md`
+  at install, together with the item table and where everything lives. The
+  README is yours: add notes and results; the tool only ever rewrites the block
+  between its two markers (`fuzz-campaign.py readme <name>` refreshes it).
 - **Listing a config twice runs it twice, each time from scratch** (empty
   corpus, fresh quarantine, its own triage jobs). `--repeat 3` writes each
   config three times. Items are named `<config-id>-1`, `-2`, `-3` and that is

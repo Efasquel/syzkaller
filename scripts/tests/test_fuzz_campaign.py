@@ -1916,6 +1916,29 @@ class NewPlanTest(unittest.TestCase):
             fc.freeze_plan("old")
         self.assertEqual(fc.load_def("old")["layout"], "legacy")
 
+    def test_the_readme_carries_the_description_and_keeps_your_notes(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.0, description="Does grammar X beat Y on FDE?")
+        self.assertEqual(json.loads((self.dir / "plans" / "c.json").read_text())["description"],
+                         "Does grammar X beat Y on FDE?")
+        fc.freeze_plan("c")
+        readme = self.dir / "campaigns" / "c" / "README.md"
+        text = readme.read_text()
+        self.assertTrue(text.startswith("# c\n\nDoes grammar X beat Y on FDE?\n"))
+        self.assertIn("| AppleX_gram-1 |", text)
+        self.assertIn("## Results", text)
+        # the operator writes; a regeneration touches only the generated block
+        readme.write_text(text.replace("## Results\n", "## Results\n\n3 bugs, see BUG-0007.\n")
+                          .replace("## Notes\n", "## Notes\n\nbox rebooted twice by hand.\n"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_readme("c")
+        text2 = readme.read_text()
+        self.assertIn("3 bugs, see BUG-0007.", text2)
+        self.assertIn("box rebooted twice by hand.", text2)
+        self.assertEqual(text2.count(fc.README_BEGIN), 1)
+        self.assertEqual(text2.count(fc.README_END), 1)
+
 
 class PlanLayoutTest(unittest.TestCase):
     """A plan-layout campaign: the manager runs on a rendered effective config
