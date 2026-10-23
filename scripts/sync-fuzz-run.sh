@@ -75,7 +75,10 @@ SCRIPTS+=(fuzz-results.py)
 # copied as a package (with __init__.py) into $DST/scripts/lib/ so the published
 # drivers resolve it the same way the dev tree does; omitting any member makes
 # every published driver fail at import with ModuleNotFoundError.
-LIBS=(__init__.py cfgutil.py tablefmt.py fsutil.py timefmt.py)
+# Every module in lib/: listed by hand this went stale (bootinfo, style, schedule
+# and requests were missing), and a missing one fails every published driver.
+LIBS=()
+for _f in "$SRC"/scripts/lib/*.py; do LIBS+=("$(basename "$_f")"); done
 # syz-manager itself validates that <syzkaller>/bin/<arch>/ holds BOTH syz-execprog
 # and syz-executor (pkg/mgrconfig/load.go:346-370) and exits FATAL at startup if
 # either is missing -- so syz-execprog belongs here even though nothing in these
@@ -116,8 +119,6 @@ for f in "${SCRIPTS[@]}"; do
 done
 ok "${#SCRIPTS[@]} script(s): ${SCRIPTS[*]}"
 
-<<<<<<< HEAD
-=======
 mkdir -p "$DST/scripts/lib"
 for f in "${LIBS[@]}"; do
   [ -f "$SRC/scripts/lib/$f" ] || fail "missing $SRC/scripts/lib/$f"
@@ -125,7 +126,6 @@ for f in "${LIBS[@]}"; do
 done
 ok "${#LIBS[@]} lib module(s): ${LIBS[*]}"
 
->>>>>>> 105c00c76ef862e714769a48c3ab29d3e46e59e0
 step "binaries"
 for b in "${BINS[@]}"; do
   [ -f "$SRC/$b" ] || fail "missing $SRC/$b -- run \`make target\` / \`make manager\`"
@@ -148,11 +148,7 @@ src, dst, old, new = sys.argv[1:5]
 # (pkg/config/config.go), and the campaign configs use them to record what an
 # experiment excluded. cfgutil is the single source of that rule.
 sys.path.insert(0, sys.argv[6])
-<<<<<<< HEAD
-import cfgutil
-=======
 from lib import cfgutil
->>>>>>> 105c00c76ef862e714769a48c3ab29d3e46e59e0
 # Colour is decided once, by the shell, from isatty + NO_COLOR. Deciding it again
 # here would emit escapes into a redirected log.
 _c = len(sys.argv) > 5 and sys.argv[5] == "1"

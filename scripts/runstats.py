@@ -323,9 +323,11 @@ def campaign_windows(config_id):
     if not STATE_DIR.is_dir():
         return out
     for p in sorted(STATE_DIR.glob("*.json")):
-        if p.name.startswith("quarantine_"):
+        if p.name.startswith("quarantine_") or p.name.endswith(".requests.json"):
             continue
         st = read_json(p, {}) or {}
+        if not isinstance(st, dict):          # a request list, not a state
+            continue
         cur = st.get("current_config") or ""
         hit = Path(cur).stem == config_id if cur else False
         if not hit:
@@ -349,9 +351,11 @@ def campaign_for(config_id):
     if not STATE_DIR.is_dir():
         return None
     for p in sorted(STATE_DIR.glob("*.json")):
-        if p.name.startswith("quarantine_"):
+        if p.name.startswith("quarantine_") or p.name.endswith(".requests.json"):
             continue
         st = read_json(p, {})
+        if not isinstance(st, dict):
+            continue
         cur = st.get("current_config") or ""
         hit = Path(cur).stem == config_id if cur else False
         if not hit:

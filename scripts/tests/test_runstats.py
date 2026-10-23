@@ -330,3 +330,21 @@ class CurveTest(unittest.TestCase):
         (self.wd / "cover.log").write_text("0x1 1761030412\n0x2 1761030412\n0x2\n")
         (self.wd / "results" / "cover-1.log").write_text("0x3\n")
         self.assertEqual(rs.cover_blocks(self.wd), 3)
+
+
+class StateDirNoiseTest(unittest.TestCase):
+    """campaigns/.state holds more than state files: the operator's request
+    lists (a JSON list) must not crash the campaign lookups."""
+
+    def test_request_lists_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "campaigns" / ".state").mkdir(parents=True)
+            (root / "campaigns" / ".state" / "camp.requests.json").write_text(
+                json.dumps([{"verb": "next", "item": None, "at": 1}]))
+            (root / "campaigns" / ".state" / "camp.json").write_text(
+                json.dumps({"name": "camp", "current_config": "/c/X_v.cfg",
+                            "started_at": "2026-10-01T00:00:00+00:00", "incidents": []}))
+            rs.set_root(root)
+            self.assertEqual(rs.campaign_for("X_v")["name"], "camp")
+            self.assertEqual(len(rs.campaign_windows("X_v")), 1)
