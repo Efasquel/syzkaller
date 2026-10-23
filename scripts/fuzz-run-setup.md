@@ -262,6 +262,16 @@ cd /Users/Shared/fuzz-run && /usr/bin/python3 scripts/fuzz-campaign.py status jp
 cat campaigns/bugs/INDEX.md
 /usr/bin/python3 scripts/fuzz-campaign.py replay jpeg
 
+# end the running config now and move to the next one; leave a pending one out.
+# These are REQUESTS: they are appended to campaigns/.state/<name>.requests.json
+# and applied by the driver at its next poll (within 5s while fuzzing, at the
+# next relaunch otherwise) -- so the state file keeps one writer. `status`
+# shows them under `requests` until they are applied. Items are named
+# <config-id>-1, -2 ... as `status` shows them.
+/usr/bin/python3 scripts/fuzz-campaign.py next jpeg
+/usr/bin/python3 scripts/fuzz-campaign.py skip jpeg AppleJPEGDriver_260827_cov_gram_test-1
+/usr/bin/python3 scripts/fuzz-campaign.py unskip jpeg AppleJPEGDriver_260827_cov_gram_test-1
+
 # pause / resume (the driver polls state and stops the session)
 /usr/bin/python3 scripts/fuzz-campaign.py halt jpeg
 /usr/bin/python3 scripts/fuzz-campaign.py resume jpeg

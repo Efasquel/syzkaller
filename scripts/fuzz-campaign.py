@@ -28,6 +28,9 @@ Commands:
   quarantine <name> [--all]      what the quarantine has benched, and why
   list                           all campaigns
   halt <name> / resume <name>    manual stop/continue
+  next <name>                    end the running item now, move to the next
+  skip <name> <item> / unskip    leave a pending item out (operator requests,
+                                 applied at the runner's next poll)
   install <name> / uninstall <name>   generate + (un)load the launchd plist
 """
 import argparse
@@ -73,6 +76,8 @@ import quarantine as qm  # noqa: E402
 import triage as tri  # noqa: E402  (job outcome constants only; runs as a subprocess)
 from lib import bootinfo  # noqa: E402
 from lib import cfgutil  # noqa: E402
+from lib import requests as req  # noqa: E402
+from lib import schedule  # noqa: E402
 from lib import timefmt  # noqa: E402
 from lib.style import style  # noqa: E402
 from lib.tablefmt import render, tabulate  # noqa: E402
@@ -525,6 +530,10 @@ def load_def(name):
         if not Path(cfg_abs).exists():
             die("campaign %r references missing config: %s" % (name, cfg_abs))
         items.append({"config": cfg_abs, "budget_seconds": float(hours) * 3600})
+    # Items have a stable identity: <config-id>-1, -2 ... per distinct config, so
+    # state is keyed by id and not by position in this list.
+    for it, iid in zip(items, schedule.item_ids([it["config"] for it in items])):
+        it["id"] = iid
     merged["items"] = items
     merged["name"] = name
     return merged
@@ -734,7 +743,86 @@ def load_state(name):
     return s if s else init_state(name)
 
 
+def requests_path(name):
+    """Where the operator verbs queue their requests for this campaign."""
+    return STATE_DIR / ("%s.requests.json" % name)
+
+
+def def_items(d):
+    """The definition's items, each with its id. load_def assigns ids; a
+    definition built any other way (tests, older callers) gets them here, in
+    place, so every consumer can rely on it["id"]."""
+    items = (d or {}).get("items") or []
+    if items and any("id" not in it for it in items):
+        for it, iid in zip(items, schedule.item_ids([it["config"] for it in items])):
+            it.setdefault("id", iid)
+    return items
+
+
+def ensure_items(s, d):
+    """Key the state by item id (schedule.item_ids over the definition).
+
+    A state file written before items existed is backfilled from its positional
+    cursor and its abandoned list: everything before the cursor is done, the
+    cursor's item is running if a config was started, later ones are pending,
+    and a config in `abandoned` makes its not-yet-done items abandoned. The
+    definition is re-read at every pass, so an item appended to it shows up
+    pending; one removed while pending disappears."""
+    items = s.setdefault("items", {})
+    ditems = def_items(d)
+    order = [it["id"] for it in ditems]
+    legacy_cursor = s.get("cursor", 0) if not s.get("item_order") else None
+    gone = {a["config"] for a in s.get("abandoned", [])}
+    for i, it in enumerate(ditems):
+        rec = items.get(it["id"])
+        if rec is None:
+            rec = {"config": it["config"], "status": "pending", "reason": None}
+            if legacy_cursor is not None:
+                if i < legacy_cursor:
+                    rec.update(status="done", reason="legacy")
+                elif i == legacy_cursor and s.get("status") == "running" and (
+                        s.get("current_config") == it["config"] or s.get("config_started_at")):
+                    rec["status"] = "running"
+            if it["config"] in gone and rec["status"] in ("pending", "running"):
+                rec.update(status="abandoned", reason="max_crashes")
+            items[it["id"]] = rec
+    for iid in [k for k in items if k not in order]:
+        if items[iid]["status"] == "pending":
+            del items[iid]
+    s["item_order"] = order
+    return order
+
+
+def current_item(s, d=None):
+    """The running item's definition entry, else the first pending one, else
+    the last one (a finished campaign still reports its last config)."""
+    ditems = def_items(d)
+    if not ditems:
+        return None
+    by_id = {it["id"]: it for it in ditems}
+    for status in ("running", "pending"):
+        for iid in s.get("item_order") or []:
+            if (s.get("items") or {}).get(iid, {}).get("status") == status and iid in by_id:
+                return by_id[iid]
+    return ditems[min(s.get("cursor", 0), len(ditems) - 1)]
+
+
+def derived_cursor(s):
+    """The positional cursor, derived from item statuses: the running item,
+    else the first pending, else past the end. Kept so every reader of
+    s["cursor"] (status, list, stop_plan) keeps working."""
+    order = s.get("item_order") or []
+    items = s.get("items") or {}
+    for status in ("running", "pending"):
+        for i, iid in enumerate(order):
+            if items.get(iid, {}).get("status") == status:
+                return i
+    return len(order)
+
+
 def save_state(s):
+    if s.get("item_order"):
+        s["cursor"] = derived_cursor(s)
     s["updated_at"] = now_iso()
     # A campaign that stops is in the "halted"/"done" activity, whichever of the
     # eight halt paths set the status. Hooked here so none of them can forget.
@@ -950,9 +1038,25 @@ def reset_config_counters(s):
     s["startup_failures"] = 0
 
 
+def end_item(s, item_id, reason):
+    """Record how an item ended and leave it: status from the reason (done /
+    abandoned / skipped), then the same bookkeeping as leaving a config."""
+    rec = (s.get("items") or {}).get(item_id)
+    if rec is not None:
+        rec["status"] = schedule.end_status(reason)
+        rec["reason"] = reason
+        rec["ended_at"] = now_iso()
+    advance_config(s)
+
+
 def advance_config(s):
-    """Leave the current config: bank its clocks, reset its counters."""
-    s["cursor"] += 1
+    """Leave the current config: bank its clocks, reset its counters. With
+    item-keyed state the cursor is derived (see derived_cursor); a legacy
+    state without items still steps it."""
+    if s.get("item_order"):
+        s["cursor"] = derived_cursor(s)
+    else:
+        s["cursor"] += 1
     s["results_started"] = False
     roll_budget_clocks(s)
     s["session_id"] = None
@@ -1983,8 +2087,8 @@ def stuck_executor_seconds(d):
 def wait_for_stop(s, d, seconds):
     """Sleep up to `seconds`, returning early if a stop is requested.
 
-    Returns "halted", "brake", or None if the full interval elapsed quietly.
-    The brake is checked here as well as at startup: it is the stop you reach
+    Returns "halted", "brake", "request", or None if the full interval elapsed
+    quietly. The brake is checked here as well as at startup: it is the stop you reach
     for when the box is misbehaving, and having to wait out a poll interval for
     it defeats the purpose.
     """
@@ -2005,12 +2109,18 @@ def wait_for_stop(s, d, seconds):
             s["halt_reason"] = "brake: %s" % (why or path)
             save_state(s)
             return "brake"
+        # An operator request (next, skip, halt) is applied by the loop, not
+        # here, but it must not wait out a 10-minute poll to be seen.
+        if req.pending(requests_path(s["name"])):
+            return "request"
 
 
 def supervise(s, d, sid, budget):
     """Poll until an incident, budget exhaustion, or manager death.
 
-    Returns one of: "crash", "hang", "budget". exec_total resets to 0 each run,
+    Returns one of: "crash", "hang", "budget", "startup", "rotate", "halted",
+    "request" (an operator request is pending; the manager is left running and
+    the loop decides). exec_total resets to 0 each run,
     so a decrease across a restart reads as progress (never a false hang).
     """
     poll = d["poll_seconds"]
@@ -2037,12 +2147,18 @@ def supervise(s, d, sid, budget):
                                                     DEFAULTS["startup_poll_seconds"]))
         stop = wait_for_stop(s, d, min(step, max(1, budget - budget_spent(s, d))))
         if stop == "halted":
-            s["halt_reason"] = s.get("halt_reason") or "halted by user"
+            # The halt lives in the FILE; without copying it here the loop's
+            # next save_state wrote "running" back over it and the next boot
+            # resumed the campaign.
+            s["status"] = "halted"
+            s["halt_reason"] = load_state(s["name"]).get("halt_reason") or "halted by user"
             session("stop", sid)
             return "halted"
         if stop == "brake":
             session("stop", sid)
             return "halted"
+        if stop == "request":
+            return "request"
 
         s.update(load_state(s["name"]))
 
@@ -2108,6 +2224,69 @@ def supervise(s, d, sid, budget):
         save_state(s)
 
 
+def take_requests(s):
+    """Drain the operator's request list and apply the ones that need no
+    scheduling decision: a skip or unskip of an item that is not running. The
+    rest (next, halt, a skip of the running item) are returned for the loop."""
+    requests = req.take(requests_path(s["name"]))
+    for r in requests:
+        log("request: %s%s" % (r["verb"], " %s" % r["item"] if r.get("item") else ""))
+        rec = (s.get("items") or {}).get(r.get("item") or "")
+        if rec is None:
+            if r.get("item"):
+                log("  no such item %r; ignored" % r["item"])
+            continue
+        if r["verb"] == "skip" and rec["status"] == "pending":
+            rec.update(status="skipped", reason="skip", ended_at=now_iso())
+            log("item %s skipped by operator" % r["item"])
+        elif r["verb"] == "unskip" and rec["status"] == "skipped":
+            rec.update(status="pending", reason=None)
+            rec.pop("ended_at", None)
+            log("item %s unskipped by operator" % r["item"])
+    return requests
+
+
+def cut_item(s, d, item, why):
+    """End an item for `why` (a stop_reason): stop and snapshot its manager if
+    one is up, record an abandon when the per-item crash limit did it, commit
+    the results, and leave the item."""
+    if s.get("session_id"):
+        info = inspect(s["session_id"])
+        if info.get("found") and info.get("pid_alive"):
+            close_run(s, info, time.time())
+            session("collect", s["session_id"], "snapshot")
+            session("stop", s["session_id"])
+    if why == "max_crashes":
+        why_text = config_breaker(s, d) or "reached max_crashes"
+        log("ABANDON %s: %s; moving to the next item" % (item["id"], why_text))
+        s.setdefault("abandoned", []).append(
+            {"config": item["config"], "item": item["id"], "reason": why_text, "at": now_iso()})
+    elif why in ("next", "skip"):
+        log("item %s ended by operator (%s); moving on" % (item["id"], why))
+    else:
+        log("budget spent on %s (%s); moving on" % (item["id"], why))
+    results_commit(s, d, "end", cfg=item["config"])
+    end_item(s, item["id"], why)
+    save_state(s)
+
+
+def halt_by_operator(s, d, item):
+    """Halt this campaign on an operator request: stop the manager if one is
+    up, keep the state. (Until the queue exists, the box then sits idle, as
+    after any halt.)"""
+    if s.get("session_id"):
+        info = inspect(s["session_id"])
+        if info.get("found") and info.get("pid_alive"):
+            close_run(s, info, time.time())
+            session("stop", s["session_id"])
+    s["status"] = "halted"
+    s["halt_reason"] = "halted by user (request)"
+    save_state(s)
+    log("HALT: %s" % s["halt_reason"])
+    if item:
+        results_commit(s, d, "halt", cfg=item["config"])
+
+
 def cmd_run(name):
     d = load_def(name)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2145,6 +2324,7 @@ def cmd_run(name):
     s = load_state(name)
     for k, v in COORDINATOR_DEFAULTS.items():   # backfill for pre-coordinator state
         s.setdefault(k, type(v)(v) if isinstance(v, (list, dict)) else v)   # never share a default
+    ensure_items(s, d)
     if s["status"] in ("done", "halted"):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
@@ -2194,10 +2374,33 @@ def cmd_run(name):
             save_state(s)
             log("HALT: %s" % reason)
             return
+        # The definition is re-read every pass (an item appended to it shows
+        # up pending), and the operator's requests are taken once per pass:
+        # whatever verbs were issued since, in order.
+        order = ensure_items(s, d)
+        requests = take_requests(s)
         # Coordinator: while a bug is being triaged, drive triage instead of
         # fuzzing. advance_triage flips phase back to "fuzzing" when it benches
         # the culprit, or halts the campaign if triage cannot make progress.
         if s["phase"] == "triaging":
+            item = current_item(s, d)
+            if any(r["verb"] == "halt" for r in requests):
+                halt_by_operator(s, d, item)
+                return
+            cut = next((r["verb"] for r in requests
+                        if r["verb"] == "next" or (r["verb"] == "skip" and item
+                                                   and r.get("item") == item["id"])), None)
+            if cut and item:
+                # The verb means now: the job is left stopped with its checkpoint,
+                # resumable by hand; its benches so far stay in the quarantine.
+                log("triage job %s stopped by operator (%s); resume it by hand with "
+                    "`triage.py run %s`" % (s.get("triage_job"), cut, s.get("triage_job")))
+                s["phase"], s["triage_job"], s["triage_bug_sig"], s["triage_boots"] = \
+                    "fuzzing", None, None, 0
+                results_commit(s, d, "end", cfg=item["config"])
+                end_item(s, item["id"], cut)
+                save_state(s)
+                continue
             # The budget is otherwise only tested inside supervise, which does
             # not run in this phase -- so a long minimization would overrun a
             # wall budget without ever noticing. Check before spending another
@@ -2205,76 +2408,85 @@ def cmd_run(name):
             # budget deliberately does not charge triage at all.
             # A job is not abandoned half-way when the budget runs out: it is
             # finished (still bounded by triage_max_boots), its result benched,
-            # and the config advanced after -- see the budget check below.
-            item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-            if budget_spent(s, d) >= item["budget_seconds"]:
+            # and the item ended after -- see the budget check below.
+            if item and budget_spent(s, d) >= item["budget_seconds"]:
                 log("budget spent (%s clock) while triaging %s; finishing the job, "
                     "then moving on" % (d.get("budget_clock"), s.get("triage_job")))
             advance_triage(s, d)
             if s["status"] == "halted":
                 return
             continue
-        if s["cursor"] >= len(d["items"]):
+
+        step = schedule.next_step(order, s["items"], requests)
+        if step.kind == "halt":
+            halt_by_operator(s, d, current_item(s, d))
+            return
+        if step.kind == "done":
             if d["loop"]:
-                log("loop: wrapping cursor to 0")
-                s["cursor"] = 0
+                # A config max_crashes gave up on stays given up for this campaign:
+                # a looping campaign skips it, and one with nothing left halts.
+                if all(s["items"][i]["status"] == "abandoned" for i in order):
+                    s["status"] = "halted"
+                    s["halt_reason"] = "every config was abandoned (max_crashes)"
+                    save_state(s)
+                    log("HALT: %s" % s["halt_reason"])
+                    return
+                log("loop: every item ran; starting the list again")
+                for i in order:
+                    if s["items"][i]["status"] != "abandoned":
+                        s["items"][i].update(status="pending", reason=None)
                 roll_budget_clocks(s)
                 reset_config_counters(s)
-            else:
-                s["status"] = "done"
                 save_state(s)
-                log("campaign %r done: prep %s, fuzz %s, triage %s, reboots %s, wall %s"
-                    % (name, fmt_hms(lifetime(s, "prep_seconds")),
-                       fmt_hms(lifetime(s, "active_seconds")),
-                       fmt_hms(lifetime(s, "triage_seconds")),
-                       fmt_hms(lifetime(s, "overhead_seconds")),
-                       fmt_hms(lifetime_wall(s))))
-                return
-        item = d["items"][s["cursor"]]
+                continue
+            s["status"] = "done"
+            save_state(s)
+            log("campaign %r done: prep %s, fuzz %s, triage %s, reboots %s, wall %s"
+                % (name, fmt_hms(lifetime(s, "prep_seconds")),
+                   fmt_hms(lifetime(s, "active_seconds")),
+                   fmt_hms(lifetime(s, "triage_seconds")),
+                   fmt_hms(lifetime(s, "overhead_seconds")),
+                   fmt_hms(lifetime_wall(s))))
+            return
+        if step.kind == "end":          # a pending item the operator skipped
+            s["items"][step.item].update(status="skipped", reason="skip", ended_at=now_iso())
+            log("item %s skipped by operator" % step.item)
+            save_state(s)
+            continue
+
+        item = next(it for it in def_items(d) if it["id"] == step.item)
         cfg, budget = item["config"], item["budget_seconds"]
-        # A config max_crashes gave up on stays given up for this campaign: a
-        # looping campaign skips it, and one with nothing left to run halts.
-        gone = {a["config"] for a in s.get("abandoned", [])}
-        if cfg in gone:
-            if all(it["config"] in gone for it in d["items"]):
-                s["status"] = "halted"
-                s["halt_reason"] = "every config was abandoned (max_crashes)"
-                save_state(s)
-                log("HALT: %s" % s["halt_reason"])
-                return
-            log("skipping %s: abandoned earlier" % config_id(cfg))
-            advance_config(s)
+        rec = s["items"][item["id"]]
+        was_running = rec["status"] == "running"
+        if not was_running:
+            rec["status"] = "running"
+            rec["started_at"] = now_iso()
+            log("item %s (%d/%d): %s" % (item["id"], order.index(item["id"]) + 1,
+                                        len(order), config_id(cfg)))
             save_state(s)
-            continue
-        why = config_breaker(s, d)
-        if why:
-            log("ABANDON %s: %s; moving to the next config" % (config_id(cfg), why))
-            s.setdefault("abandoned", []).append(
-                {"config": cfg, "reason": why, "at": now_iso()})
-            results_commit(s, d, "end", cfg=cfg)
-            advance_config(s)
-            save_state(s)
-            continue
-        # Stamp the real clock's origin once per config. Guarded on absence, not
+        # Stamp the real clock's origin once per item. Guarded on absence, not
         # overwritten: every panic-reboot relaunches this loop, and re-stamping
         # would restart the window on each crash.
         if not s.get("config_started_at"):
             s["config_started_at"] = now_iso()
             save_state(s)
-        remaining = budget - budget_spent(s, d)
-        if remaining <= 0:
-            # Spent while triaging (the only phase that can overrun it). The
-            # manager was stopped at the crash; starting it again only to stop it
-            # at the first budget check would cost a whole preparation.
-            log("budget spent on %s (during triage); advancing" % config_id(cfg))
-            results_commit(s, d, "end", cfg=cfg)
-            advance_config(s)
-            save_state(s)
+        # Should this item end before (re)starting its manager? The scheduler
+        # decides from what the loop observed: the per-item incident count
+        # (max_crashes), the budget (spent while triaging -- the only phase that
+        # can overrun it; starting the manager only to stop it at the first
+        # check would cost a whole preparation), and the operator's requests,
+        # which apply only to an item that was already running when they came.
+        why = schedule.stop_reason(
+            {"spent": budget_spent(s, d), "budget": budget,
+             "incidents": s.get("config_incidents", 0), "max_incidents": d["max_crashes"]},
+            requests if was_running else [], item["id"])
+        if why:
+            cut_item(s, d, item, why)
             continue
-        log("config %d/%d: %s (%.0f min left of %.1fh %s budget; this config so "
-            "far: prep %s, fuzz %s, triage %s, reboots %s)"
-            % (s["cursor"] + 1, len(d["items"]), config_id(cfg),
-               remaining / 60, budget / 3600, d.get("budget_clock", "wall"),
+        log("item %s: %s (%.0f min left of %.1fh %s budget; so far: prep %s, fuzz %s, "
+            "triage %s, reboots %s)"
+            % (item["id"], config_id(cfg), (budget - budget_spent(s, d)) / 60, budget / 3600,
+               d.get("budget_clock", "wall"),
                fmt_hms(s.get("prep_seconds")), fmt_hms(s.get("active_seconds")),
                fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
         try:
@@ -2295,13 +2507,28 @@ def cmd_run(name):
             log("HALT: %s" % s["halt_reason"])
             results_commit(s, d, "halt", cfg=cfg)
             return
+        if outcome == "request":
+            # The manager is still running. Apply what the operator asked: a
+            # halt or a cut of this item stops it; anything else (a skip of a
+            # later item) was applied by take_requests and fuzzing re-attaches.
+            requests = take_requests(s)
+            if any(r["verb"] == "halt" for r in requests):
+                halt_by_operator(s, d, item)
+                return
+            cut = schedule.stop_reason({"spent": 0, "budget": 1, "incidents": 0, "max_incidents": 1},
+                                       requests, item["id"])
+            if cut:
+                cut_item(s, d, item, cut)
+            else:
+                save_state(s)
+            continue
         if outcome == "budget":
             close_run(s, inspect(s["session_id"]), time.time())
-            log("budget spent on %s; snapshot + advance" % config_id(cfg))
+            log("budget spent on %s; snapshot + move on" % item["id"])
             session("collect", s["session_id"], "snapshot")
             session("stop", s["session_id"])
             results_commit(s, d, "end", cfg=cfg)
-            advance_config(s)
+            end_item(s, item["id"], "max_hours")
             save_state(s)
             continue
         if outcome == "startup":
@@ -2357,7 +2584,7 @@ def cmd_run(name):
         save_state(s)
         if triaging:
             continue                     # loop re-enters the triaging phase
-        # policy: restart same config -- loop re-enters ensure_running (resume)
+        # policy: restart same item -- loop re-enters ensure_running (resume)
 
 
 # --- authoring + control -----------------------------------------------------
@@ -2561,6 +2788,7 @@ def status_lines(name, prev=None):
     """
     d = load_def(name)
     s = load_state(name)
+    ensure_items(s, d)          # in memory only: status never writes the state
     prev = prev or {}
     out = []
 
@@ -2589,6 +2817,9 @@ def status_lines(name, prev=None):
                 time.time() - t_upd >= max(2.5 * d["poll_seconds"], 120):
             age = style(age, "red", "bold")
     row("  updated", "%s%s" % (timefmt.fmt(s.get("updated_at")), age))
+    pend = req.pending(requests_path(name))
+    if pend:
+        row("  requests", "%s  (applied at the runner's next poll)" % req.describe(pend))
     if s.get("halt_reason") and s["halt_reason"] != s.get("activity_detail"):
         row("  halt reason", s["halt_reason"])    # the status row has it otherwise
     orphan = orphaned_session(s, d)
@@ -2675,6 +2906,9 @@ def status_lines(name, prev=None):
     if cfg:
         out.append("  config:")
         row("  name", config_id(cfg))
+        cur = current_item(s, d)
+        if cur and (s.get("items") or {}).get(cur["id"]):
+            row("  item", "%s  (%s)" % (cur["id"], s["items"][cur["id"]]["status"]))
         # What is left of THIS config's budget, on its clock -- not the
         # campaign's end: the campaign header says whether more configs or a
         # loop follow. A fuzz-clock budget does not move while triaging, so it
@@ -3204,6 +3438,21 @@ def _set_status(name, status, reason=None):
                      save=False)
     save_state(s)
     log("campaign %r -> %s" % (name, status))
+
+
+def cmd_request(name, verb, item=None):
+    """Queue an operator request. Always a request, never a direct edit of the
+    state: the runner -- whichever one comes next, including after a reboot --
+    applies it at its next poll, so the state file keeps one writer."""
+    d = load_def(name)
+    ids = [it["id"] for it in def_items(d)]
+    if item is not None and item not in ids:
+        die("no item %r in %s; items are: %s" % (item, name, ", ".join(ids)))
+    rec = req.append(requests_path(name), verb, item)
+    pending = req.pending(requests_path(name))
+    print("requested: %s%s -- applied at the runner's next poll (pending: %s)"
+          % (verb, " " + item if item else "", req.describe(pending)))
+    return rec
 
 
 def cmd_halt(name):
@@ -4479,9 +4728,15 @@ def main():
     for _n, _h in (("run", "supervision loop (launchd entry point)"),
                    ("doctor", "pre-flight checks before a run"),
                    ("halt", "soft-pause the campaign (leaves the daemon installed)"),
-                   ("resume", "clear halt and mark running")):
+                   ("resume", "clear halt and mark running"),
+                   ("next", "end the running item now and move to the next (request)")):
         s2 = sub.add_parser(_n, help=_h)
         s2.add_argument("name")
+    for _n, _h in (("skip", "leave a pending item out (request)"),
+                   ("unskip", "put a skipped item back (request)")):
+        s2 = sub.add_parser(_n, help=_h)
+        s2.add_argument("name")
+        s2.add_argument("item", help="item id, as `status` shows it")
 
     for _n, _h in (("install", "generate + load a launchd job that resumes across reboots"),
                    ("uninstall", "stop the daemon/agent now + prevent restart (removes the plist)")):
@@ -4553,6 +4808,10 @@ def main():
         sys.exit(cmd_quarantine(args.name, args.all_))
     elif args.cmd == "halt":
         cmd_halt(args.name)
+    elif args.cmd == "next":
+        cmd_request(args.name, "next")
+    elif args.cmd in ("skip", "unskip"):
+        cmd_request(args.name, args.cmd, args.item)
     elif args.cmd == "resume":
         cmd_resume(args.name)
     elif args.cmd == "forget-exhausted":

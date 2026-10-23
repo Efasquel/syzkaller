@@ -111,6 +111,7 @@ Four rungs. Each works when the one above it does not.
 
 | situation | action |
 |---|---|
+| end only the current config, keep the campaign going | `fuzz-campaign.py next <name>`; `skip <name> <item>` leaves a pending item out (requests, applied at the driver's next poll) |
 | running, box usable | `fuzz-campaign.py halt <name>` |
 | stop it *before* it fuzzes again after the next reboot | `fuzz-campaign.py brake <name> --reason "why"` |
 | panics through login, no usable session | Recovery (⌘R) → Terminal → `touch "/Volumes/Macintosh HD - Data/Users/Shared/fuzz-run/STOP"` |

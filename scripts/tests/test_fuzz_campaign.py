@@ -2708,3 +2708,189 @@ class ProgressSeriesTest(unittest.TestCase):
         rows = {ln.split(":")[0].strip(): ln for ln in lines if ":" in ln}
         self.assertIn("500 (total: 3,000)  +2000 / %s" % fc.fmt_hms(1790), rows["exec total"])
         self.assertIn("15 (total: 115)  +15 / %s" % fc.fmt_hms(1790), rows["basic blocks"])
+
+
+class SchedulerLoopTest(unittest.TestCase):
+    """Phase 1 of the redesign: state keyed by item id, the loop driven by
+    lib.schedule, operator verbs as requests the runner applies."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.state_dir = self.dir / "state"
+        self.state_dir.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, s, configs, loop=False, supervise=None, calls=None):
+        d = dict(fc.DEFAULTS, loop=loop, name="camp",
+                 items=[{"config": c, "budget_seconds": 3600} for c in configs])
+        started = []
+        calls = calls if calls is not None else []
+        n = {"ensure": 0}
+
+        def fake_ensure(st, cfg, dd=None):
+            started.append(cfg)
+            n["ensure"] += 1
+            st["session_id"] = fc.config_id(cfg)
+            if supervise is None or n["ensure"] > len(supervise):
+                st["status"] = "halted"            # stop after the scripted outcomes
+                raise RuntimeError("stop here")
+
+        outcomes = list(supervise or [])
+
+        def fake_supervise(*a):
+            o = outcomes.pop(0)
+            return o() if callable(o) else o
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_def", lambda name: d), \
+             mock.patch.object(fc, "load_state", lambda name: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda name: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+             mock.patch.object(fc, "session", lambda *a, **k: calls.append(a) or (0, "")), \
+             mock.patch.object(fc, "supervise", fake_supervise), \
+             mock.patch.object(fc, "ensure_running", fake_ensure), \
+             mock.patch.object(fc, "log", lambda m: None):
+            fc.cmd_run("camp")
+        return started
+
+    def test_items_are_keyed_by_id_and_the_cursor_is_derived(self):
+        s = fc.init_state("camp")
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"]), ["/a.cfg"])
+        self.assertEqual(s["item_order"], ["a-1", "b-1"])
+        self.assertEqual(s["items"]["a-1"]["status"], "running")
+        self.assertEqual(s["items"]["b-1"]["status"], "pending")
+        self.assertEqual(s["cursor"], 0)
+
+    def test_a_repeated_config_is_two_items(self):
+        s = fc.init_state("camp")
+        self._run(s, ["/a.cfg", "/a.cfg"])
+        self.assertEqual(s["item_order"], ["a-1", "a-2"])
+
+    def test_a_skip_request_leaves_a_pending_item_out(self):
+        s = fc.init_state("camp")
+        fc.req.append(self.state_dir / "camp.requests.json", "skip", "a-1")
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"]), ["/b.cfg"])
+        self.assertEqual((s["items"]["a-1"]["status"], s["items"]["a-1"]["reason"]),
+                         ("skipped", "skip"))
+        self.assertEqual(fc.req.pending(self.state_dir / "camp.requests.json"), [])
+
+    def test_a_next_request_ends_the_running_item_and_keeps_the_rest(self):
+        s = fc.init_state("camp")
+        calls = []
+
+        def operator_types_next():
+            # the request arrives while the item fuzzes; supervise hands back
+            fc.req.append(self.state_dir / "camp.requests.json", "next")
+            return "request"
+        started = self._run(s, ["/a.cfg", "/b.cfg"], supervise=[operator_types_next], calls=calls)
+        self.assertEqual(started, ["/a.cfg", "/b.cfg"])
+        self.assertEqual((s["items"]["a-1"]["status"], s["items"]["a-1"]["reason"]),
+                         ("done", "next"))
+        self.assertEqual(s["cursor"], 1)
+
+    def test_a_next_that_arrives_between_restarts_still_cuts_the_running_item(self):
+        """A crash-restart passes through the loop top; a request taken there
+        must apply to the item that was running, not be dropped."""
+        s = fc.init_state("camp")
+        s["items"] = {"a-1": {"config": "/a.cfg", "status": "running"},
+                      "b-1": {"config": "/b.cfg", "status": "pending"}}
+        s["item_order"] = ["a-1", "b-1"]
+        fc.req.append(self.state_dir / "camp.requests.json", "next")
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"]), ["/b.cfg"])
+        self.assertEqual((s["items"]["a-1"]["status"], s["items"]["a-1"]["reason"]), ("done", "next"))
+
+    def test_a_next_with_nothing_running_does_not_cut_the_item_about_to_start(self):
+        s = fc.init_state("camp")
+        fc.req.append(self.state_dir / "camp.requests.json", "next")
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"]), ["/a.cfg"])
+        self.assertEqual(s["items"]["a-1"]["status"], "running")
+
+    def test_a_halt_request_halts_the_campaign(self):
+        s = fc.init_state("camp")
+        fc.req.append(self.state_dir / "camp.requests.json", "halt")
+        self.assertEqual(self._run(s, ["/a.cfg"]), [])
+        self.assertEqual(s["status"], "halted")
+        self.assertIn("halted by user", s["halt_reason"])    # halt_kind: user
+
+    def test_a_loop_restarts_every_item_but_the_abandoned(self):
+        s = fc.init_state("camp")
+        s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
+        s["items"] = {"a-1": {"config": "/a.cfg", "status": "abandoned", "reason": "max_crashes"},
+                      "b-1": {"config": "/b.cfg", "status": "done", "reason": "max_hours"}}
+        s["item_order"] = ["a-1", "b-1"]
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"], loop=True), ["/b.cfg"])
+        self.assertEqual(s["items"]["a-1"]["status"], "abandoned")
+
+    def test_legacy_state_is_backfilled_from_the_positional_cursor(self):
+        s = fc.init_state("camp")
+        s.update(cursor=1, current_config="/b.cfg", status="running",
+                 abandoned=[{"config": "/c.cfg", "reason": "max", "at": None}])
+        d = dict(fc.DEFAULTS, items=[{"config": c, "budget_seconds": 1}
+                                     for c in ("/a.cfg", "/b.cfg", "/c.cfg")])
+        order = fc.ensure_items(s, d)
+        self.assertEqual(order, ["a-1", "b-1", "c-1"])
+        self.assertEqual([s["items"][i]["status"] for i in order], ["done", "running", "abandoned"])
+        self.assertEqual(fc.derived_cursor(s), 1)
+        # advancing an item-keyed state derives the cursor rather than stepping it
+        fc.end_item(s, "b-1", "max_hours")
+        self.assertEqual((s["items"]["b-1"]["status"], s["cursor"]), ("done", 3))
+
+    def test_a_halt_seen_while_supervising_is_persisted(self):
+        """wait_for_stop returned "halted" without setting the status, so the
+        loop's next save wrote "running" back and the next boot resumed."""
+        s = fc.init_state("camp")
+        s["session_id"] = "sid"
+        with mock.patch.object(fc, "wait_for_stop", lambda *a: "halted"), \
+             mock.patch.object(fc, "load_state", lambda n: {"status": "halted",
+                                                            "halt_reason": "halted by user"}), \
+             mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
+            self.assertEqual(fc.supervise(s, dict(fc.DEFAULTS), "sid", 10 ** 9), "halted")
+        self.assertEqual((s["status"], s["halt_reason"]), ("halted", "halted by user"))
+
+    def test_a_request_wakes_the_wait_within_a_stop_check(self):
+        s = fc.init_state("camp")
+        fc.req.append(self.state_dir / "camp.requests.json", "next")
+        d = dict(fc.DEFAULTS, stop_check_seconds=0.01)
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "brake_held", lambda n: None):
+            t0 = time.time()
+            self.assertEqual(fc.wait_for_stop(s, d, 30), "request")
+        self.assertLess(time.time() - t0, 1)
+
+    def test_cmd_request_validates_the_item_and_queues(self):
+        d = dict(fc.DEFAULTS, items=[{"config": "/a.cfg", "budget_seconds": 1}], name="camp")
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                fc.cmd_request("camp", "skip", "nope")
+            fc.cmd_request("camp", "skip", "a-1")
+            fc.cmd_request("camp", "next")
+        pend = fc.req.pending(self.state_dir / "camp.requests.json")
+        self.assertEqual([(r["verb"], r["item"]) for r in pend], [("skip", "a-1"), ("next", None)])
+
+    def test_status_shows_pending_requests_and_the_item(self):
+        cfg = write_cfg(self.dir, {"target": "darwin/arm64", "workdir": str(self.dir)})
+        s = fc.init_state("camp")
+        s.update(current_config=str(cfg), items={"target-1": {"config": str(cfg), "status": "running"}},
+                 item_order=["target-1"])
+        fc.req.append(self.state_dir / "camp.requests.json", "next")
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
+                 {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+             mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
+             mock.patch.object(fc, "free_gb", lambda: 100.0), \
+             mock.patch.object(fc, "style", type(fc.style)(False)):
+            lines, _ = fc.status_lines("camp")
+        rows = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines if ": " in ln}
+        self.assertEqual(rows["requests"], "next  (applied at the runner's next poll)")
+        self.assertEqual(rows["item"], "target-1  (running)")
