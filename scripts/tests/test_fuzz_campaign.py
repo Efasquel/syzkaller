@@ -1939,6 +1939,34 @@ class NewPlanTest(unittest.TestCase):
         self.assertEqual(text2.count(fc.README_BEGIN), 1)
         self.assertEqual(text2.count(fc.README_END), 1)
 
+    def test_the_readme_gets_the_outcome_when_items_end_and_when_the_campaign_does(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg, cfg], 1.0)
+        fc.freeze_plan("c")
+        s = fc.load_state("c")
+        fc.ensure_items(s, fc.load_def("c"))
+        s["items"]["AppleX_gram-1"]["status"] = "running"
+        s.update(active_seconds=3600.0, crashes=2, exec_by_config={"c.AppleX_gram-1": 123456},
+                 bb_covered={"c.AppleX_gram-1": 77},
+                 incidents=[{"item": "AppleX_gram-1", "kind": "crash", "bug_ids": ["BUG-0007"]},
+                            {"item": "AppleX_gram-1", "kind": "crash", "bug_ids": ["BUG-0007"]}])
+        with mock.patch.object(fc, "log", lambda m: None):
+            fc.end_item(s, "AppleX_gram-1", "max_hours")        # refreshes the README
+        rec = s["items"]["AppleX_gram-1"]
+        self.assertEqual((rec["clocks"]["active_seconds"], rec["crashes"], rec["bug_ids"]),
+                         (3600, 2, ["BUG-0007"]))
+        text = (self.dir / "campaigns" / "c" / "README.md").read_text()
+        self.assertIn("**Outcome** (running", text)
+        self.assertIn("| AppleX_gram-1 | done (max_hours) | %s | 123,456 | 77 | 2 | 0 | BUG-0007 |"
+                      % fc.fmt_hms(3600), text)
+        self.assertNotIn("| AppleX_gram-2 |", text.split("**Outcome**")[1])   # pending: not yet a row
+        s["status"], s["halt_reason"] = "halted", "halted by user"
+        fc.save_state(s)                                          # terminal: refreshed again
+        text = (self.dir / "campaigns" / "c" / "README.md").read_text()
+        self.assertIn("**Outcome** (halted", text)
+        self.assertIn("Halt reason: halted by user.", text)
+
 
 class PlanLayoutTest(unittest.TestCase):
     """A plan-layout campaign: the manager runs on a rendered effective config

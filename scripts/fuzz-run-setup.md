@@ -185,7 +185,10 @@ already created.
   The description is stored in the plan and seeds `campaigns/<name>/README.md`
   at install, together with the item table and where everything lives. The
   README is yours: add notes and results; the tool only ever rewrites the block
-  between its two markers (`fuzz-campaign.py readme <name>` refreshes it).
+  between its two markers -- when each item ends and when the campaign ends, it
+  gains an **Outcome** table (per item: status and reason, fuzzing time, programs,
+  blocks, crashes, benched selectors, bug ids) so the result is on disk before
+  anyone asks. `fuzz-campaign.py readme <name>` refreshes it by hand.
 - **Listing a config twice runs it twice, each time from scratch** (empty
   corpus, fresh quarantine, its own triage jobs). `--repeat 3` writes each
   config three times. Items are named `<config-id>-1`, `-2`, `-3` and that is

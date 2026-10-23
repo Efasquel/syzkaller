@@ -919,9 +919,12 @@ def save_state(s):
     s["updated_at"] = now_iso()
     # A campaign that stops is in the "halted"/"done" activity, whichever of the
     # eight halt paths set the status. Hooked here so none of them can forget.
-    if s.get("status") in ("halted", "done") and s.get("activity") != s["status"]:
+    terminal = s.get("status") in ("halted", "done") and s.get("activity") != s["status"]
+    if terminal:
         set_activity(s, s["status"], s.get("halt_reason") or "", save=False)
     write_json(state_path(s["name"]), s)
+    if terminal:
+        refresh_readme(s)
 
 
 # --- activity ----------------------------------------------------------------
@@ -1133,13 +1136,24 @@ def reset_config_counters(s):
 
 def end_item(s, item_id, reason):
     """Record how an item ended and leave it: status from the reason (done /
-    abandoned / skipped), then the same bookkeeping as leaving a config."""
+    abandoned / skipped), its clocks and counts -- which advance_config is
+    about to roll into the campaign totals -- then the same bookkeeping as
+    leaving a config. A plan-layout campaign's README is refreshed so the
+    outcome table is there before anyone asks."""
     rec = (s.get("items") or {}).get(item_id)
     if rec is not None:
         rec["status"] = schedule.end_status(reason)
         rec["reason"] = reason
         rec["ended_at"] = now_iso()
+        if reason != "skip":
+            rec["clocks"] = {k: round(s.get(k) or 0.0) for k in
+                             ("prep_seconds", "active_seconds", "triage_seconds", "overhead_seconds")}
+            incs = [i for i in s.get("incidents") or [] if i.get("item") == item_id]
+            rec["crashes"] = sum(1 for i in incs if i.get("kind") == "crash")
+            rec["hangs"] = sum(1 for i in incs if i.get("kind") == "hang")
+            rec["bug_ids"] = sorted({b for i in incs for b in i.get("bug_ids") or []})
     advance_config(s)
+    refresh_readme(s)
 
 
 def advance_config(s):
@@ -2864,9 +2878,37 @@ README_BEGIN = "<!-- fuzz-campaign: generated, do not edit between these markers
 README_END = "<!-- /fuzz-campaign -->"
 
 
-def readme_block(name, p, box):
-    """The generated part of a campaign's README: what the plan says, and where
-    the things it produces are. Everything else in the file is the operator's."""
+def outcome_rows(name, p, s):
+    """One row per item that ran or was decided: status (reason), fuzzing time,
+    programs, blocks, crashes, benched selectors, bug ids. Figures for the item
+    still running come from the live counters; ended items keep their own."""
+    rows = []
+    items = s.get("items") or {}
+    for it in p["items"]:
+        rec = items.get(it["id"]) or {}
+        if rec.get("status", "pending") == "pending":
+            continue
+        sid = planlib.session_id(name, it["id"])
+        running = rec.get("status") == "running"
+        clocks = rec.get("clocks") or ({"active_seconds": s.get("active_seconds") or 0} if running else {})
+        incs = [i for i in s.get("incidents") or [] if i.get("item") == it["id"]]
+        crashes = rec.get("crashes") if not running else sum(1 for i in incs if i.get("kind") == "crash")
+        bugs = rec.get("bug_ids") if not running else sorted({b for i in incs for b in i.get("bug_ids") or []})
+        qpath = item_paths(name, it)["quarantine"]
+        benched = len(qm.disabled_set(qm.load_state(str(qpath)))) if qpath.exists() else 0
+        rows.append([it["id"], "%s%s" % (rec.get("status"), " (%s)" % rec["reason"] if rec.get("reason") else ""),
+                     fmt_hms(clocks.get("active_seconds")) if clocks else "-",
+                     "{:,}".format(int((s.get("exec_by_config") or {}).get(sid) or 0)),
+                     str((s.get("bb_covered") or {}).get(sid) or 0),
+                     str(crashes if crashes is not None else 0), str(benched),
+                     ", ".join(bugs or []) or "-"])
+    return rows
+
+
+def readme_block(name, p, box, s=None):
+    """The generated part of a campaign's README: what the plan says, where the
+    things it produces are, and -- once anything has run -- how each item went.
+    Everything else in the file is the operator's."""
     rows = planlib.check_table(p, box, REPO_ROOT)
     hours = sum(float(r[2]) for r in rows)
     lines = [README_BEGIN,
@@ -2885,12 +2927,24 @@ def readme_block(name, p, box):
               "Watch: `fuzz-campaign.py status %s -w`; decisions in "
               "`campaigns/.state/%s.coordinator.log`; what the quarantine benched: "
               "`fuzz-campaign.py quarantine %s --all`; verification manifest: "
-              "`fuzz-campaign.py replay %s`." % (name, name, name, name),
-              README_END]
+              "`fuzz-campaign.py replay %s`." % (name, name, name, name)]
+    out = outcome_rows(name, p, s) if s else []
+    if out:
+        word = {"done": "finished", "halted": "halted"}.get(s.get("status"), "running")
+        lines += ["", "**Outcome** (%s, updated %s): %d crash(es), %d hang(s); fuzzing %s, "
+                  "minimizing %s, rebooting %s, %s in all.%s"
+                  % (word, timefmt.fmt(now_iso(), short=True), s.get("crashes", 0), s.get("hangs", 0),
+                     fmt_hms(lifetime(s, "active_seconds")), fmt_hms(lifetime(s, "triage_seconds")),
+                     fmt_hms(lifetime(s, "overhead_seconds")), fmt_hms(lifetime_wall(s)),
+                     " Halt reason: %s." % s["halt_reason"] if s.get("halt_reason") else ""),
+                  "", "| item | status | fuzzed | exec total | blocks | crashes | benched | bugs |",
+                  "|---|---|---|---|---|---|---|---|"]
+        lines += ["| %s |" % " | ".join(r) for r in out]
+    lines.append(README_END)
     return "\n".join(lines)
 
 
-def write_readme(name, p=None):
+def write_readme(name, p=None, s=None):
     """Create campaigns/<name>/README.md, or refresh only its generated block.
 
     The README is the human-readable record of the campaign: the operator's
@@ -2901,7 +2955,7 @@ def write_readme(name, p=None):
     if p is None:
         p = planlib.normalize(planlib.load_plan(plan_path(name)), REPO_ROOT)
     box = planlib.load_box(BOX_PATH)
-    block = readme_block(name, p, box)
+    block = readme_block(name, p, box, s)
     path = campaign_dir(name) / "README.md"
     if path.exists():
         text = path.read_text()
@@ -2918,10 +2972,20 @@ def write_readme(name, p=None):
     return path
 
 
+def refresh_readme(s):
+    """Best effort, for the runner: a README problem must never stop a run."""
+    if not is_plan_layout(s.get("name") or ""):
+        return
+    try:
+        write_readme(s["name"], s=s)
+    except Exception as e:  # noqa: BLE001
+        log("README refresh failed: %s" % e)
+
+
 def cmd_readme(name):
     if not is_plan_layout(name):
         die("no campaign %r in the plan layout (install freezes a plan into one)" % name)
-    path = write_readme(name)
+    path = write_readme(name, s=load_state(name))
     print("refreshed the generated block of %s" % path)
     return 0
 
