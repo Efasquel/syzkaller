@@ -116,7 +116,8 @@ class LoadTest(TreeTest):
 class NormalizeTest(TreeTest):
     def test_fills_defaults(self):
         out = pl.normalize(self.plan(), self.root)
-        self.assertEqual(out["clock"], "fuzz")
+        self.assertEqual(out["clock"], "real")
+        self.assertIs(out["watch_window"], True)
         self.assertEqual(out["defaults"], {"max_hours": 6, "max_plateau_hours": None,
                                            "reuse_known_culprits": False})
         self.assertEqual(out["limits"], {"max_crashes": 20, "min_free_gb": 20.0,
@@ -340,8 +341,13 @@ class DefTest(TreeTest):
         d = pl.plan_to_def(pl.normalize(p, self.root))
         self.assertEqual(d["name"], "eval")
         self.assertEqual(d["budget_clock"], "wall")
-        self.assertIs(d["loop"], False)
+        self.assertNotIn("loop", d)
         self.assertIs(d["watch_window"], True)
+        # `new --no-watch-window` is stored in the plan and reaches the driver
+        off = pl.plan_to_def(pl.normalize(dict(p, watch_window=False), self.root))
+        self.assertIs(off["watch_window"], False)
+        with self.assertRaises(ValueError):
+            pl.normalize(dict(p, watch_window="no"), self.root)
         self.assertIs(d["reuse_known_culprits"], True)
         self.assertEqual(d["max_hours"], 2)
         # Limits sit at top level, where the breaker code already reads them.

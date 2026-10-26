@@ -33,6 +33,9 @@ def _load_campaign():
 
 
 fc = _load_campaign()
+# Tests that drive cmd_run take the per-campaign lock and read requests; without
+# this they would write into the repo's own run/ directory.
+fc.RUN_DIR = Path(tempfile.mkdtemp(prefix="fc-run-")) / "run"
 
 
 def write_cfg(d: Path, cfg: dict) -> Path:
@@ -174,7 +177,7 @@ class CoordinatorTest(unittest.TestCase):
 
     def _triaging_state(self, cfg):
         s = fc.init_state("camp")
-        s.update({"phase": "triaging", "triage_job": "camp_t1",
+        s.update({"status": "running", "phase": "triaging", "triage_job": "camp_t1",
                   "triage_bug_sig": "SIG1", "current_config": str(cfg)})
         return s
 
@@ -334,7 +337,7 @@ class CoordinatorTest(unittest.TestCase):
 
     def test_advance_triage_not_done_waits(self):
         s = fc.init_state("camp")
-        s.update({"phase": "triaging", "triage_job": "camp_t1", "triage_boots": 0})
+        s.update({"status": "running", "phase": "triaging", "triage_job": "camp_t1", "triage_boots": 0})
         d = dict(fc.DEFAULTS)
         waited = []
         with mock.patch.object(fc, "triage", lambda *a, **k: (0, "")), \
@@ -374,6 +377,7 @@ class CoordinatorTest(unittest.TestCase):
 
     def test_begin_triage_without_workdir_fails_gracefully(self):
         s = fc.init_state("camp")
+        s.update(status="running", phase="fuzzing")      # a started campaign
         s["session_id"] = "sess"
         d = dict(fc.DEFAULTS)
         with mock.patch.object(fc, "inspect", lambda sid: {"found": False}):
@@ -556,6 +560,7 @@ class SecondBugTest(unittest.TestCase):
         self.assertGreaterEqual(self.s["panic_sig_watermark"], before + 100)
 
     def test_a_spent_budget_drops_the_queue(self):
+        self.d["budget_clock"] = "wall"      # the clock that charges triage_seconds
         self.assertEqual(self.finish_job(spent=7200.0), [])
         self.assertEqual(self.s["triage_queue"], [])
 
@@ -792,10 +797,12 @@ class ClockTest(unittest.TestCase):
         s = {"active_seconds": 100.0, "triage_seconds": 900.0, "overhead_seconds": 900.0}
         self.assertEqual(fc.budget_spent(s, {"budget_clock": "wall"}), 1900.0)
 
-    def test_default_budget_clock_is_wall(self):
-        """"Give this config 24 hours of machine time" is what comparing
-        configurations needs, so every phase is charged by default."""
-        self.assertEqual(fc.DEFAULTS["budget_clock"], "wall")
+    def test_default_budget_clock_is_real(self):
+        """An item asked for 6h ends 6h after it started, whatever happened in
+        between: the operator can say when the box frees up. One default for
+        plans and for a legacy definition that says nothing."""
+        self.assertEqual(fc.DEFAULTS["budget_clock"], "real")
+        self.assertEqual(fc.planlib.DEFAULT_CLOCK, "real")
 
     def test_wall_is_never_less_than_fuzz(self):
         """So the default can only ever end a campaign sooner, never overrun."""
@@ -841,7 +848,7 @@ class ClockTest(unittest.TestCase):
         self.assertEqual(advanced, [1])         # the job was finished
         self.assertEqual(commits, ["end"])      # the config was closed
         self.assertEqual(s["cursor"], 1)
-        self.assertEqual(s["status"], "done")   # one config, no loop
+        self.assertEqual(s["status"], "done")   # one item, nothing after it
 
     def test_triage_phase_continues_while_budget_remains(self):
         s = fc.init_state("camp")
@@ -1452,8 +1459,8 @@ class BreakerTest(unittest.TestCase):
                           s["startup_failures"]), (1, 0, 0, 0))
         self.assertEqual(s["crashes"], 20)          # lifetime total kept
 
-    def _run(self, s, items, loop=False):
-        d = dict(fc.DEFAULTS, loop=loop, name="camp",
+    def _run(self, s, items):
+        d = dict(fc.DEFAULTS, name="camp",
                  items=[{"config": c, "budget_seconds": 3600} for c in items])
         started = []
 
@@ -1482,17 +1489,24 @@ class BreakerTest(unittest.TestCase):
         self.assertEqual(started, ["/b.cfg"])
         self.assertEqual([a["config"] for a in s["abandoned"]], ["/a.cfg"])
 
-    def test_a_loop_skips_abandoned_configs(self):
+    def test_one_abandoned_item_among_others_ends_done(self):
         s = fc.init_state("camp")
         s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
-        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"], loop=True), ["/b.cfg"])
+        s["items"] = {"a-1": {"config": "/a.cfg", "status": "abandoned", "reason": "max_crashes"},
+                      "b-1": {"config": "/b.cfg", "status": "done", "reason": "max_hours"}}
+        s["item_order"] = ["a-1", "b-1"]
+        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"]), [])
+        self.assertEqual(s["status"], "done")   # a sample outcome, not a failure
 
-    def test_nothing_left_to_run_halts(self):
+    def test_every_item_abandoned_halts_as_max_crashes(self):
         s = fc.init_state("camp")
         s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
-        self.assertEqual(self._run(s, ["/a.cfg"], loop=True), [])
+        self.assertEqual(self._run(s, ["/a.cfg"]), [])
         self.assertEqual(s["status"], "halted")
-        self.assertIn("abandoned", s["halt_reason"])
+        self.assertEqual(s["halt_reason"], "every item reached max_crashes")
+        self.assertEqual(fc.halt_kind(s["halt_reason"]), "max_crashes")
+        s["activity"] = "halted"
+        self.assertEqual(fc.activity_word(s), "HALTED/MAX_CRASHES")
 
     def test_startup_failures_are_collected_and_halt_at_the_limit(self):
         log = self.dir / "run-20261009-093353.log"
@@ -1617,7 +1631,11 @@ class BrakeTest(unittest.TestCase):
         self.state = self.dir / "state"
         self.state.mkdir()
 
+        self._run = mock.patch.object(fc, "RUN_DIR", self.state)
+        self._run.start()
+
     def tearDown(self):
+        self._run.stop()
         self._tmp.cleanup()
 
     def _patch(self):
@@ -1857,11 +1875,10 @@ class NewPlanTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
-        (self.dir / "plans").mkdir()
         (self.dir / "campaigns").mkdir()
-        self._patches = [mock.patch.object(fc, "PLANS_DIR", self.dir / "plans"),
-                         mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"),
+        self._patches = [mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"),
                          mock.patch.object(fc, "STATE_DIR", self.dir / "state"),
+                         mock.patch.object(fc, "RUN_DIR", self.dir / "run"),
                          mock.patch.object(fc, "BOX_PATH", self.dir / "box.json"),
                          mock.patch.object(fc, "log", lambda m: None)]
         for p in self._patches:
@@ -1879,12 +1896,17 @@ class NewPlanTest(unittest.TestCase):
         p.write_text(json.dumps(body))
         return str(p)
 
-    def test_new_writes_a_plan_with_repeats_and_no_triage_block(self):
+    def test_new_creates_the_campaign_with_repeats_and_no_triage_block(self):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_new("c", [cfg], 1.5, repeat=2, max_crashes=7)
-        plan = json.loads((self.dir / "plans" / "c.json").read_text())
+        cdir = self.dir / "campaigns" / "c"
+        plan = json.loads((cdir / "plan.json").read_text())
         self.assertEqual([it["config"] for it in plan["items"]], [cfg, cfg])
+        self.assertEqual(json.loads((cdir / "state.json").read_text())["status"], "new")
+        self.assertTrue((cdir / "README.md").exists())
+        self.assertEqual(fc.load_def("c")["layout"], "plan")
+        self.assertEqual([it["id"] for it in fc.load_def("c")["items"]], ["AppleX_gram-1", "AppleX_gram-2"])
         self.assertEqual(plan["defaults"]["max_hours"], 1.5)
         self.assertEqual(plan["limits"], {"max_crashes": 7})     # only what was given
         self.assertNotIn("triage", plan)
@@ -1901,28 +1923,36 @@ class NewPlanTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
             fc.cmd_plan_check("c", strict=True)
 
-    def test_install_freezes_the_plan_once_and_refuses_legacy(self):
+    def test_a_campaign_is_not_created_twice_and_copy_copies_another(self):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
-            fc.cmd_new("c", [cfg], 1.0)
-        self.assertTrue(fc.freeze_plan("c"))
-        self.assertTrue((self.dir / "campaigns" / "c" / "plan.json").exists())
-        self.assertTrue((self.dir / "campaigns" / "c" / "state.json").exists())
-        self.assertFalse(fc.freeze_plan("c"))              # already a campaign
-        self.assertEqual(fc.load_def("c")["layout"], "plan")
-        self.assertEqual([it["id"] for it in fc.load_def("c")["items"]], ["AppleX_gram-1"])
+            fc.cmd_new("c", [cfg], 12.0, description="first run", watch_window=False)
+            with self.assertRaises(SystemExit):
+                fc.cmd_new("c", [cfg], 1.0)                 # exists: refused
+            fc.cmd_new("c2", [], copy="c", repeat=1)         # same experiment, new name
+            # a flag given alongside --copy wins, even one equal to its default
+            fc.cmd_new("c3", [], copy="c", max_hours=fc.DEFAULTS["budget_hours"])
+        plan2 = json.loads((self.dir / "campaigns" / "c2" / "plan.json").read_text())
+        self.assertEqual([it["config"] for it in plan2["items"]], [cfg])
+        self.assertEqual(plan2["name"], "c2")
+        self.assertEqual(plan2["description"], "copy of c: first run")
+        self.assertEqual(plan2["defaults"]["max_hours"], 12.0)    # --copy keeps the original's
+        self.assertIs(plan2["watch_window"], False)              # ... all of it
+        plan3 = json.loads((self.dir / "campaigns" / "c3" / "plan.json").read_text())
+        self.assertEqual(plan3["defaults"]["max_hours"], fc.DEFAULTS["budget_hours"])
+        self.assertIs(plan3["watch_window"], False)
+        # legacy campaigns are read-only: install refuses, status still reads them
         (self.dir / "campaigns" / "old.json").write_text(json.dumps({"configs": [cfg]}))
         with self.assertRaises(SystemExit):
-            fc.freeze_plan("old")
+            fc.require_campaign("old")
         self.assertEqual(fc.load_def("old")["layout"], "legacy")
 
     def test_the_readme_carries_the_description_and_keeps_your_notes(self):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_new("c", [cfg], 1.0, description="Does grammar X beat Y on FDE?")
-        self.assertEqual(json.loads((self.dir / "plans" / "c.json").read_text())["description"],
+        self.assertEqual(json.loads((self.dir / "campaigns" / "c" / "plan.json").read_text())["description"],
                          "Does grammar X beat Y on FDE?")
-        fc.freeze_plan("c")
         readme = self.dir / "campaigns" / "c" / "README.md"
         text = readme.read_text()
         self.assertTrue(text.startswith("# c\n\nDoes grammar X beat Y on FDE?\n"))
@@ -1943,7 +1973,6 @@ class NewPlanTest(unittest.TestCase):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_new("c", [cfg, cfg], 1.0)
-        fc.freeze_plan("c")
         s = fc.load_state("c")
         fc.ensure_items(s, fc.load_def("c"))
         s["items"]["AppleX_gram-1"]["status"] = "running"
@@ -1966,6 +1995,39 @@ class NewPlanTest(unittest.TestCase):
         text = (self.dir / "campaigns" / "c" / "README.md").read_text()
         self.assertIn("**Outcome** (halted", text)
         self.assertIn("Halt reason: halted by user.", text)
+
+    def test_the_campaign_keeps_its_own_bug_log_and_the_readme_lists_its_bugs(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.0)
+        bugs = self.dir / "bugs"
+        bugs.mkdir()
+        (bugs / "registry.json").write_text(json.dumps({"version": 1, "bugs": {
+            "k1": {"id": "BUG-0007", "bug_key": "k1", "crashes": [
+                {"report": "a.panic", "first_seen": "2026-10-01T00:00:00+00:00", "signature": "S1",
+                 "campaign": "earlier", "item": None, "origin": "fuzz"},
+                {"report": "b.panic", "first_seen": "2026-10-23T00:00:00+00:00", "signature": "S1",
+                 "campaign": "c", "item": "AppleX_gram-1", "origin": "fuzz"}]},
+            "k2": {"id": "BUG-0009", "bug_key": "k2", "crashes": [
+                {"report": "d.panic", "first_seen": "2026-10-23T01:00:00+00:00", "signature": "S2",
+                 "campaign": "c", "item": "AppleX_gram-1", "origin": "fuzz"}]}}}))
+        s = fc.load_state("c")
+        s["incidents"] = [{"kind": "crash", "item": "AppleX_gram-1", "signature": "S1",
+                           "bug_ids": ["BUG-0007"], "crashing_kext": "AppleX", "decision": "suspect",
+                           "title": "panic: x"}]
+        with mock.patch.object(fc, "BUGS_DIR", bugs):
+            fc.record_bug_line(s)
+            found = fc.campaign_bugs("c")
+            fc.write_readme("c", s=dict(s, items={"AppleX_gram-1": {"status": "running"}},
+                                         item_order=["AppleX_gram-1"]))
+        line = (self.dir / "campaigns" / "c" / "bugs.log").read_text()
+        self.assertIn("AppleX_gram-1", line)
+        self.assertIn("sig S1  BUG-0007  (first seen in earlier)  in AppleX  -> suspect  panic: x", line)
+        self.assertEqual(found["BUG-0007"]["first_here"], False)
+        self.assertEqual(found["BUG-0009"]["first_here"], True)
+        text = (self.dir / "campaigns" / "c" / "README.md").read_text()
+        self.assertIn("`BUG-0007` -- 1 sighting(s) in AppleX_gram-1; first seen in earlier", text)
+        self.assertIn("`BUG-0009` -- 1 sighting(s) in AppleX_gram-1; first seen here", text)
 
 
 class PlanLayoutTest(unittest.TestCase):
@@ -1993,6 +2055,7 @@ class PlanLayoutTest(unittest.TestCase):
         self._patches = [mock.patch.object(fc, "REPO_ROOT", self.root),
                          mock.patch.object(fc, "CAMPAIGN_DIR", self.root / "campaigns"),
                          mock.patch.object(fc, "STATE_DIR", self.root / "state"),
+                         mock.patch.object(fc, "RUN_DIR", self.root / "run"),
                          mock.patch.object(fc, "BOX_PATH", self.root / "config" / "box.json"),
                          mock.patch.object(fc, "log", lambda m: None)]
         for p in self._patches:
@@ -2324,7 +2387,7 @@ class ActivityTest(unittest.TestCase):
                                  - timedelta(minutes=12)).isoformat())
         lines = self._status(s, cfg)
         # The status IS the activity; there is no separate "running" line.
-        self.assertEqual(lines[0], "campaign (config 1/1 - no loop):")
+        self.assertEqual(lines[0], "campaign (item 1/1):")
         self.assertEqual(lines[1], "  name        : camp")
         self.assertTrue(lines[2].startswith("  status      : TRIAGING bug S"), lines[2])
         self.assertIn("for %s" % fc.fmt_hms(12 * 60 + 4), lines[2])
@@ -2347,8 +2410,31 @@ class ActivityTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.pop("activity")        # a state file written before activity existed
         head = self._status(s, cfg)[2]
-        self.assertIn("running", head)             # the status still says something here
+        self.assertIn("NEW", head)                 # never started: says so, not "running"
+        s["status"], s["phase"] = "running", "fuzzing"   # a state file from before activity existed
+        head = self._status(s, cfg)[2]
+        self.assertIn("running", head)
         self.assertIn("phase fuzzing", head)
+
+    def test_a_campaign_is_new_until_the_driver_first_runs_it(self):
+        s = fc.init_state("camp")
+        self.assertEqual((s["status"], s["phase"]), ("new", None))
+        d = dict(fc.DEFAULTS, name="camp", items=[{"config": "/a.cfg", "budget_seconds": 1}])
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "RUN_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None), \
+             mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "breaker", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_boot", lambda *a: None), \
+             mock.patch.object(fc, "reconcile_gap", lambda *a, **k: None), \
+             mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
+             mock.patch.object(fc, "log", lambda m: None), \
+             mock.patch.object(fc, "ensure_running",
+                               lambda st, cfg, dd=None: (_ for _ in ()).throw(RuntimeError("stop"))):
+            fc.cmd_run("camp")
+        self.assertEqual(s["phase"], "fuzzing")            # flipped at the first start
 
     def test_list_shows_the_activity(self):
         camps = self.dir / "camps"
@@ -2375,8 +2461,11 @@ class GlanceTest(unittest.TestCase):
         self.dir = Path(self._tmp.name)
         self._p = mock.patch.object(fc, "STATE_DIR", self.dir / "state")
         self._p.start()
+        self._r = mock.patch.object(fc, "RUN_DIR", self.dir / "state")
+        self._r.start()
 
     def tearDown(self):
+        self._r.stop()
         self._p.stop()
         self._tmp.cleanup()
 
@@ -2506,7 +2595,7 @@ class HaltedHeadlineTest(unittest.TestCase):
                 ("syz-manager failed to start 5 times in a row (died before ...)", "startup"),
                 ("triage stuck on S after 40 boots (job j)", "triage"),
                 ("triage job j hung and the box must be rebooted, but ...", "triage"),
-                ("every config was abandoned (max_crashes)", "abandoned"),
+                ("every item reached max_crashes", "max_crashes"),
                 ("could not start session for x.cfg", "error"), (None, "?")]:
             self.assertEqual(fc.halt_kind(reason), kind, reason)
         s = fc.init_state("camp")
@@ -2686,7 +2775,7 @@ class AnomalyColourTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = write_cfg(Path(tmp), {"target": "darwin/arm64", "workdir": tmp})
             s = fc.init_state("camp")
-            s.update(session_id="a", current_config=str(cfg), activity="fuzzing",
+            s.update(status="running", session_id="a", current_config=str(cfg), activity="fuzzing",
                      activity_since=fc.now_iso(),
                      updated_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
             live = {"found": True, "pid_alive": False, "http": "127.0.0.1:1"}
@@ -2848,6 +2937,13 @@ class IncidentTableTest(unittest.TestCase):
         self.assertEqual(lines[1].split()[2:], ["crash", "84s", "3f2a9c01", "BUG-0007", "AppleSMC",
                                                 "triage", "camp_t1"])
         self.assertIn("IOSurface (NOT fuzzed)  suspect", lines[2])
+
+    def test_a_plan_job_shows_as_its_short_name(self):
+        # A plan campaign's job is addressed by its path; status and the
+        # notification body say 't1', the way the triage block already does.
+        job = "/tree/campaigns/camp/a/a-1/triage/t1"
+        self.assertTrue(fc.incident_table([self._inc(triage_job=job)])[1].endswith("triage t1"))
+        self.assertTrue(fc.incident_line(self._inc(triage_job=job)).endswith("-> triage t1"))
         with mock.patch.object(fc, "style", type(fc.style)(True)):
             coloured = fc.incident_table([self._inc(kext_match=False)], colour=True)
         self.assertIn("\033[33;1m (NOT fuzzed)\033[0m", coloured[1])
@@ -2938,12 +3034,15 @@ class SchedulerLoopTest(unittest.TestCase):
         self.dir = Path(self._tmp.name)
         self.state_dir = self.dir / "state"
         self.state_dir.mkdir()
+        self._run_dir = mock.patch.object(fc, "RUN_DIR", self.state_dir)
+        self._run_dir.start()
 
     def tearDown(self):
+        self._run_dir.stop()
         self._tmp.cleanup()
 
-    def _run(self, s, configs, loop=False, supervise=None, calls=None):
-        d = dict(fc.DEFAULTS, loop=loop, name="camp",
+    def _run(self, s, configs, supervise=None, calls=None):
+        d = dict(fc.DEFAULTS, name="camp",
                  items=[{"config": c, "budget_seconds": 3600} for c in configs])
         started = []
         calls = calls if calls is not None else []
@@ -3038,15 +3137,6 @@ class SchedulerLoopTest(unittest.TestCase):
         self.assertEqual(s["status"], "halted")
         self.assertIn("halted by user", s["halt_reason"])    # halt_kind: user
 
-    def test_a_loop_restarts_every_item_but_the_abandoned(self):
-        s = fc.init_state("camp")
-        s["abandoned"] = [{"config": "/a.cfg", "reason": "x", "at": None}]
-        s["items"] = {"a-1": {"config": "/a.cfg", "status": "abandoned", "reason": "max_crashes"},
-                      "b-1": {"config": "/b.cfg", "status": "done", "reason": "max_hours"}}
-        s["item_order"] = ["a-1", "b-1"]
-        self.assertEqual(self._run(s, ["/a.cfg", "/b.cfg"], loop=True), ["/b.cfg"])
-        self.assertEqual(s["items"]["a-1"]["status"], "abandoned")
-
     def test_legacy_state_is_backfilled_from_the_positional_cursor(self):
         s = fc.init_state("camp")
         s.update(cursor=1, current_config="/b.cfg", status="running",
@@ -3113,3 +3203,72 @@ class SchedulerLoopTest(unittest.TestCase):
         rows = {ln.split(":")[0].strip(): ln.split(": ", 1)[1] for ln in lines if ": " in ln}
         self.assertEqual(rows["requests"], "next  (applied at the runner's next poll)")
         self.assertEqual(rows["item"], "target-1  (running)")
+
+
+class MigrateTest(unittest.TestCase):
+    """Finished legacy campaigns move into the folder layout; the ledger moves
+    up; nothing a campaign produced moves."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "campaigns" / ".state").mkdir(parents=True)
+        (self.root / "campaigns" / "bugs" / "BUG-0001" / "reports").mkdir(parents=True)
+        (self.root / "campaigns" / "bugs" / "registry.json").write_text("{}")
+        (self.root / "config").mkdir()
+        self.cfg = self.root / "config" / "X_v.cfg"
+        self.cfg.write_text(json.dumps({"enable_syscalls": ["a"], "disable_syscalls": ["b"]}))
+        (self.root / "campaigns" / "old.json").write_text(json.dumps(
+            {"configs": ["config/X_v.cfg"], "budget_hours": 2, "max_crashes": 5}))
+        (self.root / "campaigns" / ".state" / "old.json").write_text(json.dumps(
+            {"name": "old", "status": "done", "cursor": 1}))
+        (self.root / "campaigns" / ".state" / "old.coordinator.log").write_text("x\n")
+        (self.root / "campaigns" / "live.json").write_text(json.dumps({"configs": ["config/X_v.cfg"]}))
+        (self.root / "campaigns" / ".state" / "live.json").write_text(json.dumps(
+            {"name": "live", "status": "running"}))
+        self._patches = [mock.patch.object(fc, "REPO_ROOT", self.root),
+                         mock.patch.object(fc, "CAMPAIGN_DIR", self.root / "campaigns"),
+                         mock.patch.object(fc, "STATE_DIR", self.root / "campaigns" / ".state"),
+                         mock.patch.object(fc, "running_processes", lambda p: []),
+                         mock.patch.object(fc, "log", lambda m: None)]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_finished_campaigns_and_the_ledger_move_running_ones_stay(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_migrate()
+        cdir = self.root / "campaigns" / "old"
+        plan = json.loads((cdir / "plan.json").read_text())
+        self.assertTrue(plan["legacy"])
+        self.assertEqual([it["config"] for it in plan["items"]], ["config/X_v.cfg"])
+        self.assertEqual(plan["limits"], {"max_crashes": 5})
+        self.assertEqual(json.loads((cdir / "state.json").read_text())["status"], "done")
+        self.assertTrue((cdir / "coordinator.log").exists())
+        self.assertTrue((cdir / "legacy-def.json").exists())
+        self.assertFalse((self.root / "campaigns" / "old.json").exists())
+        self.assertTrue((self.root / "bugs" / "BUG-0001" / "reports").is_dir())
+        self.assertFalse((self.root / "campaigns" / "bugs").exists())
+        # the running one is left exactly where it was
+        self.assertTrue((self.root / "campaigns" / "live.json").exists())
+        self.assertFalse((self.root / "campaigns" / "live").exists())
+        # a migrated campaign loads as read-only
+        self.assertEqual(fc.load_def("old")["layout"], "legacy")
+        self.assertEqual(json.loads(self.cfg.read_text())["disable_syscalls"], ["b"])   # untouched
+
+    def test_strip_is_opt_in_and_dry_run_moves_nothing(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_migrate(dry_run=True)
+        self.assertTrue((self.root / "campaigns" / "old.json").exists())
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_migrate(strip_disable_syscalls=True)
+        self.assertEqual(json.loads(self.cfg.read_text())["disable_syscalls"], [])
+
+    def test_refuses_while_a_driver_runs(self):
+        with mock.patch.object(fc, "running_processes", lambda p: [(1, "fuzz-campaign.py run x")]), \
+             self.assertRaises(SystemExit):
+            fc.cmd_migrate()

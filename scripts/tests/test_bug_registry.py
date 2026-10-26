@@ -208,7 +208,23 @@ class RegistryIOTest(unittest.TestCase):
         self.assertEqual(reg, {"counter": 0, "bugs": {}})
 
     def test_default_bugs_dir_is_the_campaign_inventory(self):
-        self.assertTrue(br.DEFAULT_BUGS_DIR.endswith("campaigns/bugs"))
+        """The ledger's default home moved up to <tree>/bugs; a tree that has not
+        been migrated (only the old campaigns/bugs present) still resolves to it."""
+        saved = br.TREE_ROOT
+        try:
+            tree = tempfile.mkdtemp()
+            br.TREE_ROOT = tree
+            # New layout: <tree>/bugs is the default, even before it is created.
+            self.assertEqual(br.default_bugs_dir(), os.path.join(tree, "bugs"))
+            # Legacy fallback: only the old directory exists, so keep using it.
+            os.makedirs(os.path.join(tree, "campaigns", "bugs"))
+            self.assertEqual(br.default_bugs_dir(),
+                             os.path.join(tree, "campaigns", "bugs"))
+            # Once the new directory exists it wins again (post-migration).
+            os.makedirs(os.path.join(tree, "bugs"))
+            self.assertEqual(br.default_bugs_dir(), os.path.join(tree, "bugs"))
+        finally:
+            br.TREE_ROOT = saved
 
 
 class EvidenceRetentionTest(unittest.TestCase):

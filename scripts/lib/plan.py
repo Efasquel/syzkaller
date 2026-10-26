@@ -65,7 +65,10 @@ LIMITS = {
     "min_free_gb": 20.0,
     "crashloop_limit": 15,
 }
-DEFAULT_CLOCK = "fuzz"
+# "real": an item asked for 6h ends 6h after it started, whatever happened in
+# between, so the operator knows when the box frees up. "fuzz" and "wall" are
+# opt-in (`new --clock`).
+DEFAULT_CLOCK = "real"
 
 # The one runtime value that is not a path: the cover log always sits in the
 # item's workdir under this name, so the per-run tools can find it.
@@ -188,6 +191,9 @@ def normalize(plan, root):
         limits = out["limits"] = {}
     for key, value in LIMITS.items():
         limits.setdefault(key, value)
+
+    if not isinstance(out.setdefault("watch_window", True), bool):
+        problems.append("watch_window must be true or false")
 
     items = out.get("items")
     if not isinstance(items, list) or not items:
@@ -371,8 +377,8 @@ def plan_to_def(plan):
     The driver's breaker and budget code reads a flat dict (`d["max_crashes"]`,
     `d["budget_clock"]`, `item["budget_seconds"]`) and the plan format nests
     the same values under defaults/limits in hours. This is the adapter, so
-    that code reads a plan without changing. `loop` is always False (a hunt is
-    a long max_hours or the plan queued again) and `watch_window` always True.
+    that code reads a plan without changing. There is no `loop`: a hunt is a
+    long max_hours or the plan queued again.
     """
     defaults = plan["defaults"]
     d = {
@@ -387,8 +393,7 @@ def plan_to_def(plan):
             for item in plan["items"]
         ],
         "budget_clock": plan["clock"],
-        "loop": False,
-        "watch_window": True,
+        "watch_window": plan.get("watch_window", True),
         "reuse_known_culprits": defaults["reuse_known_culprits"],
         "max_hours": defaults["max_hours"],
         "max_plateau_hours": defaults["max_plateau_hours"],

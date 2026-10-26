@@ -31,11 +31,14 @@ right:
 Usage:
   runstats.py list                      # one row per run
   runstats.py show <run>                # everything known about one run
-  runstats.py compare --by grammar      # group and aggregate (grammar|cov|driver|kext)
+  runstats.py compare --by grammar      # group and aggregate (grammar|cov|driver|kext|config)
   runstats.py curve <run>               # coverage vs fuzz-hours, TSV for plotting
   runstats.py export --format csv|json  # the full table, for a notebook or paper
 
-A run is named by its workdir: <Driver>/<variant>, e.g. AppleSSE/260804_cov_gram.
+A run is one workdir. Legacy runs are named <Driver>/<variant>, e.g.
+AppleSSE/260804_cov_gram. Plan-layout runs (campaign-planning.md §4) are named
+<campaign>/<config-id>/<item-id>, one sample of one config under its campaign;
+`compare --by config` groups the samples of a config and reports mean ± spread.
 """
 
 import argparse
@@ -57,7 +60,16 @@ REPO_ROOT = SCRIPT_DIR.parent
 WORKDIR_ROOT = REPO_ROOT / "workdir"
 CONFIG_DIR = REPO_ROOT / "config"
 STATE_DIR = REPO_ROOT / "campaigns" / ".state"
-BUGS_DIR = REPO_ROOT / "campaigns" / "bugs"
+
+
+def bugs_dir(root):
+    """The bug ledger: <root>/bugs, or campaigns/bugs on a tree `migrate` has
+    not moved yet -- the same rule as fuzz-campaign.py and bug_registry.py."""
+    new, old = Path(root) / "bugs", Path(root) / "campaigns" / "bugs"
+    return old if (old.is_dir() and not new.is_dir()) else new
+
+
+BUGS_DIR = bugs_dir(REPO_ROOT)
 
 
 def set_root(root):
@@ -66,7 +78,7 @@ def set_root(root):
     WORKDIR_ROOT = root / "workdir"
     CONFIG_DIR = root / "config"
     STATE_DIR = root / "campaigns" / ".state"
-    BUGS_DIR = root / "campaigns" / "bugs"
+    BUGS_DIR = bugs_dir(root)
 
 # Counters syz-manager resets when the manager restarts. A run is many restarts
 # on this target, so these are summed across bench files; anything not listed is
@@ -223,25 +235,86 @@ def parse_variant(variant):
     return out
 
 
+def campaigns_root(root=None):
+    """campaigns/ sits beside workdir/ under the tree root (see set_root), so it
+    is the sibling of whichever workdir root we were pointed at."""
+    return Path(root or WORKDIR_ROOT).parent / "campaigns"
+
+
+def item_info(workdir):
+    """For a plan-layout item workdir, item.json beside it; None for legacy.
+
+    A plan-layout run lives at campaigns/<name>/<config-id>/<item-id>/workdir,
+    and item.json one level up records {campaign, item, config, workdir} -- the
+    AUTHORED config path among them. We read it rather than parse the path
+    because the authored config is the comparison key (§4) and item.json is the
+    item's own record of it; the <config-id> folder is merely derived from the
+    same stem. `dir` is the on-disk item folder, trusted over item.json's stored
+    workdir string because the tree may have been published to another path.
+    """
+    wd = Path(workdir)
+    if wd.name != "workdir":
+        return None
+    meta = read_json(wd.parent / "item.json")
+    if not isinstance(meta, dict) or not meta.get("config"):
+        return None
+    info = dict(meta)
+    info["dir"] = wd.parent
+    info["cid"] = Path(meta["config"]).stem
+    return info
+
+
 def discover_runs(root=None):
-    """Every workdir under workdir/<Driver>/<variant>/."""
+    """Every run as a workdir, across both layouts.
+
+    Legacy runs are workdir/<Driver>/<variant>/. Plan-layout runs are item
+    workdirs at campaigns/<name>/<config-id>/<item-id>/workdir (§4): one workdir
+    is still one run, just nested under its campaign and config so a config's
+    samples sit side by side. The item.json guard keeps non-run folders (bugs/,
+    .state/) from matching the glob."""
     root = Path(root or WORKDIR_ROOT)
     runs = []
-    if not root.is_dir():
-        return runs
-    for driver in sorted(p for p in root.iterdir() if p.is_dir()):
-        for wd in sorted(p for p in driver.iterdir() if p.is_dir()):
-            runs.append(wd)
+    if root.is_dir():
+        for driver in sorted(p for p in root.iterdir() if p.is_dir()):
+            for wd in sorted(p for p in driver.iterdir() if p.is_dir()):
+                runs.append(wd)
+    camps = campaigns_root(root)
+    if camps.is_dir():
+        for wd in sorted(camps.glob("*/*/*/workdir")):
+            if wd.is_dir() and (wd.parent / "item.json").exists():
+                runs.append(wd)
     return runs
 
 
 def run_name(workdir):
+    """<Driver>/<variant> for a legacy run, <campaign>/<config-id>/<item-id> for
+    a plan-layout item -- the three folders that locate the sample under §4."""
     wd = Path(workdir)
+    if item_info(wd) is not None:
+        return "%s/%s/%s" % (wd.parent.parent.parent.name,
+                             wd.parent.parent.name, wd.parent.name)
     return "%s/%s" % (wd.parent.name, wd.name)
 
 
+def run_path(name, root=None):
+    """The workdir a run name points at, for `show`/`curve`. A 3-component name
+    is a plan-layout item under campaigns/; otherwise it is legacy under
+    workdir/."""
+    parts = name.split("/")
+    if len(parts) == 3:
+        camp, cfg, item = parts
+        return campaigns_root(root) / camp / cfg / item / "workdir"
+    return Path(root or WORKDIR_ROOT) / name
+
+
 def config_id_for(workdir):
-    """The config whose workdir this is: <Driver>_<variant>."""
+    """The config whose run this is, as a stem. Legacy: <Driver>_<variant> from
+    the path. Plan layout: the AUTHORED config's stem from item.json -- NOT the
+    parent folder plus name, because the authored config is what runs of this
+    config across campaigns have in common."""
+    info = item_info(workdir)
+    if info is not None:
+        return info["cid"]
     wd = Path(workdir)
     return "%s_%s" % (wd.parent.name, wd.name)
 
@@ -304,8 +377,16 @@ def grammar_of(workdir):
             len(last.get("files", [])), len(manifests))
 
 
-def config_facts(config_id):
-    cfg = CONFIG_DIR / ("%s.cfg" % config_id)
+def campaign_state_path(campaign):
+    """campaigns/<name>/state.json -- the plan-layout campaign's state (§4)."""
+    return campaigns_root() / campaign / "state.json"
+
+
+def config_facts(config_id, config_path=None):
+    """Enabled/benched syscall counts for the config this run used. Legacy reads
+    config/<id>.cfg by id; an item reads the authored path item.json recorded,
+    since a plan-layout config is not under config/<id>.cfg at all."""
+    cfg = Path(config_path) if config_path else CONFIG_DIR / ("%s.cfg" % config_id)
     conf = read_json(cfg)
     if not conf:
         return {}
@@ -314,11 +395,20 @@ def config_facts(config_id):
             "config_path": str(cfg)}
 
 
-def campaign_windows(config_id):
+def campaign_windows(config_id, item=None):
     """Every campaign that drove this config, with the window it owned.
 
-    A workdir accumulates segments from every campaign that ever used the config,
-    so "this run" is ambiguous unless you say which campaign you mean."""
+    A LEGACY workdir accumulates segments from every campaign that ever used the
+    config, so "this run" is ambiguous unless you say which campaign you mean. A
+    plan-layout item workdir holds exactly one sample of one campaign, so the
+    item IS the scope: one unbounded window (the whole directory), no time
+    bounds to disentangle one experiment's segments from another's."""
+    if item is not None:
+        st = read_json(campaign_state_path(item["campaign"]), {}) or {}
+        if not isinstance(st, dict) or not st:
+            return []
+        return [{"name": st.get("name") or item["campaign"], "state": st,
+                 "start": None, "end": None, "status": st.get("status")}]
     out = []
     if not STATE_DIR.is_dir():
         return out
@@ -346,8 +436,12 @@ def campaign_windows(config_id):
     return out
 
 
-def campaign_for(config_id):
-    """The campaign state that drove this config, if any, plus its clocks."""
+def campaign_for(config_id, item=None):
+    """The campaign state that drove this config, if any, plus its clocks. For a
+    plan-layout item that is campaigns/<name>/state.json directly; for legacy it
+    is the one .state/<name>.json that names this config."""
+    if item is not None:
+        return read_json(campaign_state_path(item["campaign"]))
     if not STATE_DIR.is_dir():
         return None
     for p in sorted(STATE_DIR.glob("*.json")):
@@ -374,8 +468,28 @@ def _lifetime(st, key):
     return (st.get(total, 0.0) or 0.0) + (st.get(key, 0.0) or 0.0)
 
 
-def quarantine_for(config_id):
-    st = read_json(STATE_DIR / ("quarantine_%s.json" % config_id), {})
+_CLOCK_KEYS = ("prep_seconds", "active_seconds", "triage_seconds", "overhead_seconds")
+
+
+def item_clocks(camp_state, item_id):
+    """The four clocks for ONE item. When the item ended, the runner banked them
+    onto its record (state.items[id].clocks); while it is the running item they
+    are the campaign's live top-level counters, which only that item is accruing.
+    This is the per-item answer the shared legacy clocks (_lifetime) cannot give,
+    because a plan campaign runs many items against the same counters in turn."""
+    rec = ((camp_state or {}).get("items") or {}).get(item_id) or {}
+    src = rec.get("clocks") or (camp_state or {})
+    return {k: (src.get(k) or 0.0) for k in _CLOCK_KEYS}
+
+
+def quarantine_for(config_id, item=None):
+    """Benched selectors / catalogued signatures. A plan-layout item keeps its
+    quarantine next to its corpus (<item>/quarantine.json, §4); legacy shares
+    one keyed by config under .state."""
+    if item is not None:
+        st = read_json(item["dir"] / "quarantine.json", {})
+    else:
+        st = read_json(STATE_DIR / ("quarantine_%s.json" % config_id), {})
     cat = (st or {}).get("catalog", {})
     return {"benched": len((st or {}).get("hard", []) or []),
             "catalogued": len(cat)}
@@ -408,20 +522,26 @@ def run_window(series):
     return min(walls), max(walls)
 
 
-def bugs_for(config_id, series, infer=True):
-    """Bugs the inventory attributes to this config.
+def bugs_for(config_id, series, infer=True, item=None):
+    """Bugs the inventory attributes to this run.
 
     Only fuzz-origin crashes count as discoveries: a panic the minimizer caused
     on purpose is evidence, not a find, and counting it would make investigating
     a bug look like finding more of them.
 
-    Attribution is by the crash row's recorded config where present. That field
-    is recent, so most historical crashes carry config=None and would otherwise
-    be attributable to nothing -- making every older run report zero bugs, which
-    reads as "found nothing" rather than "cannot tell". For those, fall back to
-    the run's wall-clock window: a panic that happened while this run was the
-    only thing alive belongs to it. Inferred attributions are counted separately
-    so the difference between measured and reconstructed stays visible.
+    For a plan-layout item the attribution is exact: each crash records its
+    campaign and item, so a sample owns precisely the crashes tagged with it.
+    The item IS the scope -- the time window exists only because legacy workdirs
+    were shared between campaigns -- so the window fallback is skipped once the
+    campaign+item filter has spoken.
+
+    Otherwise attribution is by the crash row's recorded config where present.
+    That field is recent, so most historical crashes carry config=None and would
+    otherwise be attributable to nothing -- making every older run report zero
+    bugs, which reads as "found nothing" rather than "cannot tell". For those,
+    fall back to the run's wall-clock window: a panic that happened while this
+    run was the only thing alive belongs to it. Inferred attributions are counted
+    separately so the difference between measured and reconstructed stays visible.
     """
     reg = read_json(BUGS_DIR / "registry.json", {}) or {}
     win = run_window(series)
@@ -429,8 +549,13 @@ def bugs_for(config_id, series, infer=True):
     for rec in (reg.get("bugs") or {}).values():
         crashes = [c for c in rec.get("crashes", [])
                    if (c.get("origin") or "fuzz") == "fuzz"]
-        firsts = [c for c in crashes if c.get("config") == config_id]
         inferred = False
+        if item is not None:
+            firsts = [c for c in crashes
+                      if c.get("campaign") == item["campaign"]
+                      and c.get("item") == item["item"]]
+        else:
+            firsts = [c for c in crashes if c.get("config") == config_id]
         if not firsts and infer and win:
             firsts = [c for c in crashes
                       if not c.get("config")
@@ -453,27 +578,42 @@ def bugs_for(config_id, series, infer=True):
 
 # --- the record --------------------------------------------------------------
 def collect(workdir, campaign=None):
-    """Metrics for one run. campaign scopes the bench segments to that campaign's
-    lifetime; without it, EVERY campaign that used this config is folded in."""
+    """Metrics for one run. For a LEGACY run, `campaign` scopes the bench segments
+    to that campaign's lifetime; without it, EVERY campaign that used this config
+    is folded in. A plan-layout item workdir needs no such scoping -- it holds one
+    sample of one campaign, so the item is the scope -- and its clocks, bugs,
+    config and quarantine are read per item rather than per shared config."""
     wd = Path(workdir)
+    item = item_info(wd)
     cid = config_id_for(wd)
-    wins = campaign_windows(cid)
     scope = None
-    if campaign:
-        scope = next((c for c in wins if c["name"] == campaign), None)
-        if scope is None:
-            bench = {"segments": 0, "fuzz_seconds": 0.0, "uptime_seconds": 0.0,
-                     "series": [], "segment_rows": []}
-        else:
-            bench = merge_bench(wd, scope["start"], scope["end"])
-    else:
+    if item is not None:
+        # The item IS the scope: one workdir, one sample, so fold the whole dir
+        # with no window and read everything from the item's own records.
         bench = merge_bench(wd)
-    ident = parse_variant(wd.name)
+        wins = campaign_windows(cid, item=item)
+        camp = campaign_for(cid, item=item)
+        driver, _, variant = cid.partition("_")
+        ident = parse_variant(variant)
+        bugs = bugs_for(cid, bench["series"], item=item)
+    else:
+        wins = campaign_windows(cid)
+        if campaign:
+            scope = next((c for c in wins if c["name"] == campaign), None)
+            if scope is None:
+                bench = {"segments": 0, "fuzz_seconds": 0.0, "uptime_seconds": 0.0,
+                         "series": [], "segment_rows": []}
+            else:
+                bench = merge_bench(wd, scope["start"], scope["end"])
+        else:
+            bench = merge_bench(wd)
+        driver = wd.parent.name
+        ident = parse_variant(wd.name)
+        camp = (scope or {}).get("state") if scope else campaign_for(cid)
+        bugs = bugs_for(cid, bench["series"])
     fuzz_s = bench["fuzz_seconds"]
     cbytes = corpus_bytes(wd)
     gfp, gfiles, gversions = grammar_of(wd)
-    camp = (scope or {}).get("state") if scope else campaign_for(cid)
-    bugs = bugs_for(cid, bench["series"])
 
     # Coverage: the bench counter and the cover log are independent measurements
     # (manager-side vs the kext's own log), so keep both rather than picking one.
@@ -481,7 +621,8 @@ def collect(workdir, campaign=None):
     blocks = bench.get("coverage") or 0
 
     rec = {
-        "run": run_name(wd), "config": cid, "driver": wd.parent.name,
+        "run": run_name(wd), "config": cid, "driver": driver,
+        "layout": "plan" if item is not None else "legacy",
         # More than one campaign in this workdir means the unscoped numbers mix
         # experiments. Surfaced rather than silently summed.
         "campaigns_here": [c["name"] for c in wins],
@@ -508,15 +649,25 @@ def collect(workdir, campaign=None):
         "ttfb_fuzz_seconds": bugs[0]["first_fuzz_s"] if bugs else None,
         "_bugs": bugs,
     }
-    rec.update(config_facts(cid))
-    rec.update(quarantine_for(cid))
+    rec.update(config_facts(cid, item["config"] if item is not None else None))
+    rec.update(quarantine_for(cid, item=item))
 
     if camp:
         rec["campaign"] = camp.get("name")
-        rec["prep_s"] = _lifetime(camp, "prep_seconds")
-        rec["campaign_fuzz_s"] = _lifetime(camp, "active_seconds")
-        rec["minimize_s"] = _lifetime(camp, "triage_seconds")
-        rec["reboot_s"] = _lifetime(camp, "overhead_seconds")
+        if item is not None:
+            # Per-item clocks: this sample's banked record, or the live counters
+            # while it is the running item -- NOT the campaign-wide lifetime sum,
+            # which would credit one sample with every sample's effort.
+            clk = item_clocks(camp, item["item"])
+            rec["prep_s"] = clk["prep_seconds"]
+            rec["campaign_fuzz_s"] = clk["active_seconds"]
+            rec["minimize_s"] = clk["triage_seconds"]
+            rec["reboot_s"] = clk["overhead_seconds"]
+        else:
+            rec["prep_s"] = _lifetime(camp, "prep_seconds")
+            rec["campaign_fuzz_s"] = _lifetime(camp, "active_seconds")
+            rec["minimize_s"] = _lifetime(camp, "triage_seconds")
+            rec["reboot_s"] = _lifetime(camp, "overhead_seconds")
     else:
         rec["campaign"] = None
         rec["campaign_fuzz_s"] = rec["minimize_s"] = rec["reboot_s"] = None
@@ -579,18 +730,20 @@ def cmd_list(args):
         runs = [r for r in runs if r["has_data"]]
     rows = []
     for r in runs:
+        # Plan-layout runs carry their campaign; legacy runs show '-'.
+        camp = r["campaign"] if r.get("layout") == "plan" else "-"
         if not r["has_data"]:
-            rows.append((r["run"], r["cov"] or "-", r["grammar"] or "-",
+            rows.append((r["run"], camp or "-", r["cov"] or "-", r["grammar"] or "-",
                          "no data", "-", "-", "-", "-", "-", "-", 0))
             continue
-        rows.append((r["run"], r["cov"] or "-", r["grammar"] or "-",
+        rows.append((r["run"], camp or "-", r["cov"] or "-", r["grammar"] or "-",
                      _h(r["fuzz_seconds"]), _int(r["execs"]), _n(r["exec_rate"]),
                      _int(r["blocks"]), _n(r["blocks_per_h"], "%.1f"),
                      r["bugs"] or 0, _h(r["ttfb_fuzz_seconds"]), r["segments"]))
     if not rows:
         print("no runs with data (use --empty to list runs that never ticked)")
         return
-    tabulate(rows, ("RUN", "COV", "GRAMMAR", "FUZZ_H", "EXECS", "EX/s",
+    tabulate(rows, ("RUN", "CAMPAIGN", "COV", "GRAMMAR", "FUZZ_H", "EXECS", "EX/s",
                     "BLOCKS", "BLK/H", "BUGS", "TTFB_H", "RESTARTS"))
     dead = sum(1 for r in collect_all(args.all) if not r["has_data"]
                and (not args.driver or r["driver"] == args.driver))
@@ -603,7 +756,7 @@ def cmd_list(args):
 
 
 def cmd_show(args):
-    wd = WORKDIR_ROOT / args.run if "/" in args.run else None
+    wd = run_path(args.run) if "/" in args.run else None
     if wd is None or not wd.is_dir():
         cands = [r for r in discover_runs() if args.run in run_name(r)]
         if len(cands) != 1:
@@ -674,13 +827,83 @@ def cmd_show(args):
           % (r.get("benched", 0), r.get("catalogued", 0)))
 
 
-AXES = {"grammar": "grammar", "cov": "cov", "driver": "driver", "kext": "driver"}
+AXES = {"grammar": "grammar", "cov": "cov", "driver": "driver", "kext": "driver",
+        "config": "config"}
+
+
+def _stats(vals):
+    """n, mean, min, max and SAMPLE stddev for a metric over a config's samples.
+
+    The sample (n-1) stddev, not population, because the samples are a draw from
+    the runs this config COULD produce, not the whole of them -- the spread we
+    report is an estimate of that variability. None below two samples, where a
+    spread is undefined and a single number is an anecdote (see the note)."""
+    vals = [v for v in vals if v is not None]
+    n = len(vals)
+    if n == 0:
+        return {"n": 0, "mean": None, "min": None, "max": None, "sd": None}
+    mean = sum(vals) / n
+    sd = None
+    if n >= 2:
+        sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5
+    return {"n": n, "mean": mean, "min": min(vals), "max": max(vals), "sd": sd}
+
+
+def _cell(st, fmt="%.0f"):
+    """mean (min..max ±sd) for a stats dict; mean alone for one sample; '-' for
+    none. The spread is what makes 3 samples a measurement rather than a point."""
+    if st["n"] == 0:
+        return "-"
+    mean = fmt % st["mean"]
+    if st["n"] < 2:
+        return mean
+    rng = "%s..%s" % (fmt % st["min"], fmt % st["max"])
+    sd = (" ±" + fmt % st["sd"]) if st["sd"] is not None else ""
+    return "%s (%s%s)" % (mean, rng, sd)
+
+
+def _compare_by_config(runs):
+    """Group runs by authored config id and report mean ± spread over the
+    config's samples -- the comparison §4 asks for: 3 repeats of one config give
+    a mean with a spread directly, instead of one run's number read as fact."""
+    skipped = sum(1 for r in runs if not r["has_data"])
+    runs = [r for r in runs if r["has_data"]]
+    groups = {}
+    for r in runs:
+        groups.setdefault(r["config"] or "(unset)", []).append(r)
+    if not groups:
+        print("nothing to compare")
+        return
+    rows = []
+    for name, rs in sorted(groups.items()):
+        rows.append((
+            name, len(rs),
+            _cell(_stats([r["blocks"] for r in rs]), "%.0f"),
+            _cell(_stats([r["blocks_per_h"] for r in rs]), "%.1f"),
+            _cell(_stats([r["execs"] for r in rs]), "%.0f"),
+            _cell(_stats([r["exec_rate"] for r in rs]), "%.1f"),
+            _cell(_stats([r["bugs"] for r in rs]), "%.1f"),
+        ))
+    tabulate(rows, ("CONFIG", "N", "BLOCKS", "BLK/H", "EXECS", "EX/s", "BUGS"))
+    print("\nEach cell is mean (min..max ±sample sd) over the config's "
+          "samples; the\nsd appears only with 2+ samples. BLOCKS are a per-run "
+          "maximum, never\nsummed: repeat samples of one target rediscover the "
+          "same blocks.")
+    if skipped:
+        print("%d run(s) excluded: no bench data, which is not the same as a "
+              "measured zero." % skipped)
+    thin = [n for n, rs in groups.items() if len(rs) < 2]
+    if thin:
+        print("Note: %s has a single run, so its numbers are an anecdote, not a "
+              "measurement." % ", ".join(sorted(thin)))
 
 
 def cmd_compare(args):
     runs = collect_all(args.all)
     if args.driver:
         runs = [r for r in runs if r["driver"] == args.driver]
+    if args.by == "config":
+        return _compare_by_config(runs)
     key = AXES[args.by]
     skipped = sum(1 for r in runs if not r["has_data"])
     runs = [r for r in runs if r["has_data"]]
@@ -792,7 +1015,7 @@ def curve_rows(workdir, field):
 
 
 def cmd_curve(args):
-    wd = WORKDIR_ROOT / args.run
+    wd = run_path(args.run)
     if not wd.is_dir():
         print("no such run: %s" % args.run, file=sys.stderr)
         sys.exit(1)
@@ -845,14 +1068,17 @@ def main():
     common(sub.add_parser("list", help="one row per run")).set_defaults(func=cmd_list)
 
     p = sub.add_parser("show", help="everything known about one run")
-    p.add_argument("run", help="<Driver>/<variant>, or a unique substring")
+    p.add_argument("run", help="<Driver>/<variant> or <campaign>/<config-id>/"
+                               "<item-id>, or a unique substring")
     p.add_argument("--campaign", help="scope to one campaign's segments; without "
                                       "it, every campaign that used this config "
                                       "is folded together")
     p.set_defaults(func=cmd_show)
 
     p = common(sub.add_parser("compare", help="group runs and aggregate"))
-    p.add_argument("--by", choices=sorted(AXES), default="grammar")
+    p.add_argument("--by", choices=sorted(AXES), default="grammar",
+                   help="grouping axis; 'config' reports mean +/- spread over a "
+                        "config's repeated samples")
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("curve", help="a metric against fuzzing hours (TSV)")

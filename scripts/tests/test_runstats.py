@@ -348,3 +348,172 @@ class StateDirNoiseTest(unittest.TestCase):
             rs.set_root(root)
             self.assertEqual(rs.campaign_for("X_v")["name"], "camp")
             self.assertEqual(len(rs.campaign_windows("X_v")), 1)
+
+
+class PlanLayoutTest(unittest.TestCase):
+    """campaign-planning.md §4: a run is still one workdir, but plan-layout items
+    live at campaigns/<name>/<config-id>/<item-id>/workdir. Discovery, identity,
+    per-item clocks/bugs, and `compare --by config` mean +/- spread, all without
+    disturbing the legacy workdir/<Driver>/<variant> tree that coexists with it.
+
+    The fixture is the minimum real shape: one legacy run plus one campaign whose
+    single config ran twice -- the 3-sample comparison an evaluation makes, here
+    with 2 so the spread is defined."""
+
+    def _item(self, cfg_id, item_id, execs, coverage):
+        """Write campaigns/eval/<cfg_id>/<item_id>/ with item.json, quarantine
+        and a bench, as fuzz-campaign.render_item/item_paths lay it out."""
+        idir = self.root / "campaigns" / "eval" / cfg_id / item_id
+        wd = idir / "workdir"
+        (wd / "results").mkdir(parents=True)
+        (idir / "item.json").write_text(json.dumps({
+            "campaign": "eval", "item": item_id,
+            "config": str(self.root / "config" / ("%s.cfg" % cfg_id)),
+            "workdir": str(wd)}))
+        (idir / "quarantine.json").write_text(json.dumps(
+            {"hard": ["sel_a"], "catalog": {"sig1": {}}}))
+        bench(wd / "results" / "bench-20260901-120000.json",
+              [sample(execs // 1, execs, execs, coverage)])
+        (wd / "cover.log").write_text("".join("0x%x\n" % i for i in range(coverage)))
+        return wd
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        # A legacy run, which must keep working exactly as before.
+        leg = self.root / "workdir" / "AppleX" / "260901_cov_gram"
+        (leg / "results").mkdir(parents=True)
+        bench(leg / "results" / "bench-20260901-120000.json",
+              [sample(3600, 3600, 5000, 42)])
+        # One authored config, run twice -> two item folders under one config.
+        (self.root / "config").mkdir()
+        (self.root / "config" / "AppleFDE_gram.cfg").write_text(json.dumps(
+            {"enable_syscalls": ["a", "b", "c"], "disable_syscalls": ["d"]}))
+        # item-1: 1.0h fuzzing, 100 blocks, 1000 execs, found BUG-0001.
+        # item-2: 2.0h fuzzing, 140 blocks, 2000 execs, found nothing.
+        self.wd1 = self._item("AppleFDE_gram", "AppleFDE_gram-1", 1000, 100)
+        self.wd2 = self._item("AppleFDE_gram", "AppleFDE_gram-2", 2000, 140)
+        (self.root / "campaigns" / "eval" / "state.json").write_text(json.dumps({
+            "name": "eval", "status": "done",
+            # Live top-level counters belong to no finished item; the per-item
+            # record is what collect must read.
+            "active_seconds": 99999,
+            "items": {
+                "AppleFDE_gram-1": {"status": "done", "reason": "max_hours",
+                    "clocks": {"prep_seconds": 100, "active_seconds": 3600,
+                               "triage_seconds": 200, "overhead_seconds": 50},
+                    "crashes": 1, "hangs": 0, "bug_ids": ["BUG-0001"]},
+                "AppleFDE_gram-2": {"status": "done", "reason": "next",
+                    "clocks": {"prep_seconds": 120, "active_seconds": 7200,
+                               "triage_seconds": 0, "overhead_seconds": 60},
+                    "crashes": 0, "hangs": 0, "bug_ids": []}},
+            "incidents": [{"item": "AppleFDE_gram-1", "kind": "crash",
+                           "bug_ids": ["BUG-0001"]}],
+        }))
+        (self.root / "campaigns" / "bugs").mkdir(parents=True)
+        (self.root / "campaigns" / "bugs" / "registry.json").write_text(json.dumps({
+            "bugs": {"BUG-0001": {
+                "id": "BUG-0001", "bug_key": "fde::panic",
+                "reproducer": {"verified": True},
+                "crashes": [{"origin": "fuzz", "campaign": "eval",
+                             "item": "AppleFDE_gram-1", "config": "AppleFDE_gram",
+                             "report": "panic-full-2026-09-01-120500.panic",
+                             "first_seen": "2026-09-01T12:05:00Z"}]}}}))
+        rs.set_root(self.root)
+
+    def test_discovers_legacy_and_item_workdirs(self):
+        """All three: the legacy run plus both samples of the campaign config."""
+        names = sorted(rs.run_name(w) for w in rs.discover_runs())
+        self.assertEqual(names, ["AppleX/260901_cov_gram",
+                                 "eval/AppleFDE_gram/AppleFDE_gram-1",
+                                 "eval/AppleFDE_gram/AppleFDE_gram-2"])
+
+    def test_ledger_is_bugs_once_migrated_else_campaigns_bugs(self):
+        """The same rule as fuzz-campaign.py: `migrate` moves the ledger up to
+        <tree>/bugs, and a tree that has one must be read there -- otherwise a
+        migrated box reports every run as finding nothing."""
+        self.assertEqual(rs.BUGS_DIR, self.root / "campaigns" / "bugs")
+        (self.root / "bugs").mkdir()
+        rs.set_root(self.root)
+        self.assertEqual(rs.BUGS_DIR, self.root / "bugs")
+
+    def test_item_run_name_is_three_components(self):
+        self.assertEqual(rs.run_name(self.wd1),
+                         "eval/AppleFDE_gram/AppleFDE_gram-1")
+
+    def test_config_id_is_the_authored_stem_not_parent_plus_name(self):
+        """It comes from item.json's config, so every sample of a config shares
+        one id -- which is what `compare --by config` groups on."""
+        self.assertEqual(rs.config_id_for(self.wd1), "AppleFDE_gram")
+        self.assertEqual(rs.config_id_for(self.wd2), "AppleFDE_gram")
+
+    def test_driver_and_variant_from_the_config_stem(self):
+        r = rs.collect(self.wd1)
+        self.assertEqual(r["driver"], "AppleFDE")
+        self.assertEqual(r["grammar"], "gram")
+
+    def test_collect_reads_this_items_clocks_not_the_lifetime_sum(self):
+        """The per-item banked clocks, never the campaign's live counter or a sum
+        across samples."""
+        r1 = rs.collect(self.wd1)
+        self.assertEqual(r1["campaign"], "eval")
+        self.assertEqual(r1["campaign_fuzz_s"], 3600)
+        self.assertEqual(r1["prep_s"], 100)
+        self.assertEqual(r1["minimize_s"], 200)
+        r2 = rs.collect(self.wd2)
+        self.assertEqual(r2["campaign_fuzz_s"], 7200)
+
+    def test_bugs_attributed_by_campaign_and_item(self):
+        self.assertEqual(rs.collect(self.wd1)["bugs"], 1)
+        self.assertEqual(rs.collect(self.wd1)["bugs_verified"], 1)
+        self.assertEqual(rs.collect(self.wd2)["bugs"], 0)
+
+    def test_quarantine_read_from_the_item_folder(self):
+        r = rs.collect(self.wd1)
+        self.assertEqual(r["benched"], 1)
+        self.assertEqual(r["catalogued"], 1)
+
+    def test_config_facts_read_from_the_authored_path(self):
+        r = rs.collect(self.wd1)
+        self.assertEqual(r["enabled"], 3)
+        self.assertEqual(r["disabled"], 1)
+
+    def test_compare_by_config_gives_n2_with_mean_and_spread(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rs.cmd_compare(type("A", (), {"all": False, "driver": None,
+                                          "by": "config"})())
+        out = buf.getvalue()
+        # One group for the config, counting both samples.
+        line = next(ln for ln in out.splitlines() if "AppleFDE_gram" in ln)
+        self.assertIn(" 2 ", " %s " % line)        # N column
+        # blocks mean 120 with spread 100..140 (per-run maximum, averaged).
+        self.assertIn("120", line)
+        self.assertIn("100..140", line)
+        # The legacy single run is flagged as an anecdote, not a measurement.
+        self.assertIn("anecdote", out)
+
+    def test_show_accepts_the_three_component_name(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rs.cmd_show(type("A", (), {"run": "eval/AppleFDE_gram/AppleFDE_gram-1",
+                                       "campaign": None})())
+        self.assertIn("eval/AppleFDE_gram/AppleFDE_gram-1", buf.getvalue())
+
+    def test_curve_accepts_the_three_component_name(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rs.cmd_curve(type("A", (), {"run": "eval/AppleFDE_gram/AppleFDE_gram-1",
+                                        "field": "coverage"})())
+        self.assertEqual(buf.getvalue().splitlines()[0], "fuzz_hours\tcoverage\twall")
+
+    def test_list_shows_a_campaign_column(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rs.cmd_list(type("A", (), {"all": False, "driver": None,
+                                       "empty": False})())
+        out = buf.getvalue()
+        self.assertIn("CAMPAIGN", out)
+        self.assertIn("eval", out)
+        # The legacy run has no plan campaign, so it shows '-'.
+        legacy = next(ln for ln in out.splitlines() if "260901_cov_gram" in ln)
+        self.assertRegex(legacy, r"260901_cov_gram\s+-\s")

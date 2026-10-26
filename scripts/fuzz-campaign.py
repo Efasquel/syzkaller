@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """fuzz-campaign.py -- autonomous, crash-safe driver over fuzz-session.py.
 
-A campaign is an ordered list of configs, each fuzzed for a wall-clock budget.
-The driver runs one config to its budget, then advances to the next; on a crash
-or hang it collects a reproduction bundle and *restarts the same config* (corpus
+A campaign is an ordered list of items (a config, run for a budget of hours).
+The driver runs one item to its budget, then advances to the next; on a crash
+or hang it collects a reproduction bundle and *restarts the same item* (corpus
 and ring buffer intact), so the budget keeps accumulating toward the next bug.
 
 It drives fuzz-session.py as a subprocess and never imports it: the session
@@ -22,9 +22,10 @@ A circuit breaker halts the campaign on a crash-storm or low disk (a kernel
 core is ~220MB), and cores are pruned to the newest few after each collect.
 
 Commands:
-  new <name> <config...> [--max-hours H] [--repeat N] ...   author plans/<name>.json
+  new <name> <config...> [--max-hours H] [--repeat N] [--copy C] ...   create campaigns/<name>/
   plan check <name>              render every item's effective config, show drift
   readme <name>                  refresh the generated block of the campaign's README.md
+  migrate [--dry-run]            move finished legacy campaigns + the bug ledger into the new layout
   run <name>                     the supervision loop (what launchd invokes)
   status <name>                  campaign runtime state
   quarantine <name> [--all]      what the quarantine has benched, and why
@@ -50,7 +51,6 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -70,7 +70,18 @@ STATE_DIR = CAMPAIGN_DIR / ".state"
 # manual campaign's BUG-0001..0004 span seven separate sessions.) Session-scoped
 # evidence -- panic bundles, ring buffers, culprits -- does live in the workdir;
 # the dossiers cite it by path.
-BUGS_DIR = CAMPAIGN_DIR / "bugs"
+# The ledger lives at <tree>/bugs. An un-migrated tree still has it at
+# campaigns/bugs; `migrate` moves it (a rename, so the hardlinked panic reports
+# keep their inodes). bug_registry.default_bugs_dir applies the same rule.
+def bugs_dir():
+    new, old = REPO_ROOT / "bugs", CAMPAIGN_DIR / "bugs"
+    return old if (old.is_dir() and not new.is_dir()) else new
+
+
+BUGS_DIR = bugs_dir()
+# Ephemeral: locks, brakes, requests, the watch command. Deletable whenever
+# nothing is running; nothing in here is a record.
+RUN_DIR = REPO_ROOT / "run"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
@@ -104,8 +115,7 @@ CORE_GLOBS = ("*.kernel.core.gz", "*.kernel.core.log")
 
 DEFAULTS = {
     "budget_hours": 6.0,
-    "loop": False,
-    "poll_seconds": 600,        # how often to check exec total (10 min)
+    "poll_seconds": 600,       # how often to check exec total (10 min)
     "hang_after_seconds": 1800,  # frozen this long with manager alive => hang
     # Incidents (crash + hang) on ONE config before that config is abandoned and
     # the campaign moves to the next. It used to count the whole campaign and
@@ -141,24 +151,25 @@ DEFAULTS = {
     # on an error; this is a breather, not a wait for anything. It used to be
     # poll_seconds (10 min), uninterruptible, and on no clock at all.
     "triage_retry_seconds": 30,
-    # Which clock --budget measures.
-    #   "wall"  -- everything the campaign occupied the rig for: preparation
-    #              PLUS fuzzing PLUS minimization PLUS reboot overhead. "Give this config 24
-    #              hours of machine time", which is what a comparison between
-    #              configurations needs, and the default for that reason.
-    #   "real"  -- elapsed time since the config started, counting EVERYTHING:
+    # Which clock --max-hours measures. The default is lib/plan.DEFAULT_CLOCK;
+    # this copy is what a legacy campaigns/<name>.json gets when it says nothing.
+    #   "real"  -- elapsed time since the item started, counting EVERYTHING:
     #              halts, reboots, the machine being off. The only clock that
     #              answers "start at 2pm, stop at 4pm", because it is the only
     #              one that keeps running while the campaign is not. Survives the
     #              panic-reboots: the start stamp is persisted, not re-taken on
-    #              relaunch, so a crash does not restart the window.
+    #              relaunch, so a crash does not restart the window. The default:
+    #              an item's end is a moment the operator can plan around.
+    #   "wall"  -- everything the campaign occupied the rig for: preparation
+    #              PLUS fuzzing PLUS minimization PLUS reboot overhead, idle
+    #              time excluded. "Give this config 24 hours of machine time".
     #   "fuzz"  -- from each run's first executed program to its end, so neither
     #              startup nor a long triage eats the budget. Still not pure
     #              execution time: the manager also re-triages its corpus and
     #              waits on RPC. For that figure use `runstats.py show`, which
     #              reads syz-manager's own counter.
-    # wall >= fuzz always, so this default can only end a campaign sooner.
-    "budget_clock": "wall",
+    # real >= wall >= fuzz always.
+    "budget_clock": planlib.DEFAULT_CLOCK,
     # Cap on the launchd-captured log. One real campaign produced 7.0MB across
     # 119,299 lines, of which 33,267 were per-probe minimizer chatter -- the
     # coordinator's own decisions were unreadable inside it, and `tail -f` on the
@@ -281,7 +292,7 @@ GLOBAL_BRAKE = REPO_ROOT / "STOP"
 
 def brake_paths(name):
     """(global, per-campaign) brake file paths."""
-    return GLOBAL_BRAKE, STATE_DIR / ("%s.brake" % name)
+    return GLOBAL_BRAKE, RUN_DIR / ("%s.brake" % name)
 
 
 def brake_held(name):
@@ -480,12 +491,12 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
-# Two layouts coexist until `migrate` (phase 2b). A campaign created from a
-# plan lives in campaigns/<name>/ (plan.json, state.json, one folder per
-# config, one per item). A legacy campaign is campaigns/<name>.json plus
-# .state/<name>.json; it is read-only now -- status, list, replay work, run and
-# install refuse -- and nothing new is created in that shape.
-PLANS_DIR = REPO_ROOT / "plans"
+# A campaign is campaigns/<name>/: plan.json (what to run; tracked in git with
+# the README, the rest of the folder is runtime), state.json, README.md, then
+# one folder per config and one per item. `new` creates it, `new --copy`
+# copies another campaign's plan into a new one, `install` runs it. A legacy
+# campaign is campaigns/<name>.json plus .state/<name>.json; it is read-only
+# now -- status, list, replay work, run and install refuse -- until `migrate`.
 BOX_PATH = REPO_ROOT / "config" / "box.json"
 
 
@@ -494,12 +505,9 @@ def campaign_dir(name):
 
 
 def plan_path(name):
-    """The frozen copy of the plan: what the campaign actually runs."""
+    """The campaign's plan: what it runs. The tool never rewrites it; you may
+    (append or change pending items), and the runner re-reads it every pass."""
     return campaign_dir(name) / "plan.json"
-
-
-def authored_plan_path(name):
-    return PLANS_DIR / ("%s.json" % name)
 
 
 def is_plan_layout(name):
@@ -602,7 +610,7 @@ def load_def(name):
             die("campaign %r: %s" % (name, e))
         merged = dict(DEFAULTS)
         merged.update(planlib.plan_to_def(p))
-        merged["layout"] = "plan"
+        merged["layout"] = "legacy" if p.get("legacy") else "plan"
         merged["plan"] = p
         merged["name"] = name
         return merged
@@ -634,7 +642,9 @@ def load_def(name):
 
 def init_state(name):
     return {
-        "name": name, "status": "running", "cursor": 0,
+        # "new" until the driver first runs it; "running" from then on, until
+        # "halted" or "done". A frozen campaign has run nothing yet.
+        "name": name, "status": "new", "cursor": 0,
         # Four disjoint clocks; wall_seconds() is their sum. Keeping them apart
         # is what lets a writeup say "24h fuzzing, 31h wall, of which 4h
         # minimization" instead of picking one number and hiding the rest.
@@ -652,7 +662,7 @@ def init_state(name):
         "halt_reason": None,
         # coordinator: fuzzing <-> triaging. On a new crash the campaign hands
         # the box to triage, benches the culprit, then resumes fuzzing.
-        "phase": "fuzzing", "triage_job": None, "triage_bug_sig": None,
+        "phase": None, "triage_job": None, "triage_bug_sig": None,
         "triage_boots": 0, "triage_seq": 0, "suppressed_sigs": [],
         "exhausted_sigs": [],
         # Second bugs a triage job surfaced, waiting for a job of their own, and
@@ -838,7 +848,7 @@ def load_state(name):
 
 def requests_path(name):
     """Where the operator verbs queue their requests for this campaign."""
-    return STATE_DIR / ("%s.requests.json" % name)
+    return RUN_DIR / ("%s.requests.json" % name)
 
 
 def def_items(d):
@@ -971,7 +981,7 @@ def activity_seconds(s):
 # including the ones in other commands, gets it for free.
 HALT_KINDS = (("brake", "brake:"), ("user", "by user"), ("crash-loop", "crash loop"),
               ("disk", "low disk"), ("startup", "failed to start"),
-              ("triage", "triage"), ("abandoned", "every config was abandoned"))
+              ("triage", "triage"), ("max_crashes", "every item reached max_crashes"))
 
 
 def halt_kind(reason):
@@ -990,7 +1000,7 @@ def stop_plan(s, d):
     if s.get("status") in ("halted", "done") or not d["items"]:
         return None
     item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-    clock = d.get("budget_clock", "wall")
+    clock = d.get("budget_clock", DEFAULTS["budget_clock"])
     budget = item["budget_seconds"]
     left = max(0.0, budget - budget_spent(s, d))
     if clock == "real":
@@ -1013,14 +1023,18 @@ def activity_word(s):
 
 
 def activity_text(s, colour=False):
-    """'TRIAGING bug 3f2a (job t-0012, MINIMIZE_CALLS, advance 7/40)  for 00:12:04'.
+    """'TRIAGING bug 3f2a9c01  for 0h12m' -- the word, its detail, its duration.
 
     Only the word is coloured, and only on a tty: the point is reading the phase
     from across the room in the auto-opened window, not decoration."""
     what = s.get("activity")
-    if not what:        # a state file from before activity existed
+    if not what:
+        if s.get("status") == "new":
+            word = style("NEW", "cyan", "bold") if colour else "NEW"
+            return "%s  -- not started yet (install runs it)" % word
+        # a state file from before activity existed
         return "%s  (no activity recorded yet; phase %s)" % (s.get("status", "?"),
-                                                             s.get("phase", "fuzzing"))
+                                                             s.get("phase") or "-")
     word = activity_word(s)
     if colour:
         word = style(word, ACTIVITY_COLOUR.get(what, "yellow"), "bold")
@@ -1057,7 +1071,7 @@ def announce_incident(s):
 
 
 def watch_command_path(name):
-    return STATE_DIR / ("%s.watch.command" % name)
+    return RUN_DIR / ("%s.watch.command" % name)
 
 
 def watch_running(name):
@@ -1080,7 +1094,7 @@ def open_watch_window(name, d):
     path = watch_command_path(name)
     py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "#!/bin/sh\n# written by `fuzz-campaign.py run %s`; opened in Terminal "
             "at each driver start\ncd %s && exec %s %s status %s -w\n"
@@ -1589,8 +1603,8 @@ def bench_hang(s, job, cfg, program):
     if not (cfg and program and Path(program).exists()):
         log("  hang culprit missing (%s); nothing benched" % program)
         return
-    bench_lead_program(s, cfg, "hang:%s" % job, program, "hung %d times in triage"
-                       % tri.MAX_HANGS)
+    bench_lead_program(s, cfg, "hang:%s" % job_label(job), program,
+                       "hung %d times in triage" % tri.MAX_HANGS)
 
 
 def newest_ring_program(workdir, dst):
@@ -2032,11 +2046,6 @@ def handle_crash(s, d, info):
         inc["decision"] = "exhausted (%s)" % ((s.get("exhausted_why") or {}).get(sig)
                                               or "no-repro")
         return False
-    if sig in (s.get("exhausted_sigs") or []):
-        log("crash %s: already exhausted a full minimization that reproduced "
-            "nothing; not re-triaging (fuzz-campaign.py forget-exhausted %s to "
-            "retry after fixing the environment)" % (sig, s["name"]))
-        return False
     if d.get("reuse_known_culprits") and s.get("current_config"):
         known = known_culprit(sig)
         if known:
@@ -2196,6 +2205,7 @@ def reconcile_boot(s, d):
     if kind == "crash":
         handle_crash(s, d, info)   # may flip phase to triaging; the loop honours it
     announce_incident(s)
+    record_bug_line(s)
     save_state(s)
     return end
 
@@ -2473,13 +2483,13 @@ def cmd_run(name):
     d = load_def(name)
     if d.get("layout") == "legacy":
         # Exit 0 so the agent stays down (KeepAlive{SuccessfulExit:false}).
-        log("campaign %r uses the legacy layout (campaigns/%s.json) and is read-only "
-            "now; author a plan with `fuzz-campaign.py new` and install that"
-            % (name, name))
+        log("campaign %r is a legacy campaign and read-only now; author a plan with "
+            "`fuzz-campaign.py new` and install that" % name)
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # single driver per campaign, even if launchd double-starts us
-    lock = open(STATE_DIR / ("%s.lock" % name), "w")
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(RUN_DIR / ("%s.lock" % name), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -2517,14 +2527,24 @@ def cmd_run(name):
         log("campaign %r is %s (%s); nothing to do"
             % (name, s["status"], s.get("halt_reason") or ""))
         return
+    if s["status"] == "new":
+        s["status"] = "running"
+        s["phase"] = s.get("phase") or "fuzzing"
+        log("campaign %r: first start" % name)
     set_activity(s, "booting", "reconciling the last boot")
-    log("campaign %r starting: %d config(s), %.1fh budget each, loop=%s, phase=%s"
-        % (name, len(d["items"]), d["budget_hours"], d["loop"], s["phase"]))
-    # Where the three ledgers live. They are campaign-scoped, not session-scoped,
-    # on purpose -- see the note on BUGS_DIR.
+    log("campaign %r starting: %d item(s), %s of %s clock, phase=%s"
+        % (name, len(d["items"]),
+           "/".join(sorted({fmt_hms(it["budget_seconds"]) for it in d["items"]})),
+           d.get("budget_clock", DEFAULTS["budget_clock"]), s["phase"]))
+    # Where the ledgers live. The bug inventory is shared by every campaign on
+    # purpose -- see the note on BUGS_DIR; the rest is per item.
     log("  bug inventory : %s" % BUGS_DIR)
-    log("  quarantine    : %s/quarantine_<config-id>.json" % STATE_DIR)
-    log("  triage jobs   : %s" % (REPO_ROOT / "triage"))
+    if d.get("layout") == "plan":
+        log("  quarantine    : %s/<config-id>/<item-id>/quarantine.json" % campaign_dir(name))
+        log("  triage jobs   : %s/<config-id>/<item-id>/triage/t<N>" % campaign_dir(name))
+    else:
+        log("  quarantine    : %s/quarantine_<config-id>.json" % STATE_DIR)
+        log("  triage jobs   : %s" % (REPO_ROOT / "triage"))
     log("  decisions log : %s" % coord_path)
     # Printed on every start so the stop path is in the log you will already be
     # reading when the box starts misbehaving -- not only in the setup doc.
@@ -2610,23 +2630,15 @@ def cmd_run(name):
             halt_by_operator(s, d, current_item(s, d))
             return
         if step.kind == "done":
-            if d["loop"]:
-                # A config max_crashes gave up on stays given up for this campaign:
-                # a looping campaign skips it, and one with nothing left halts.
-                if all(s["items"][i]["status"] == "abandoned" for i in order):
-                    s["status"] = "halted"
-                    s["halt_reason"] = "every config was abandoned (max_crashes)"
-                    save_state(s)
-                    log("HALT: %s" % s["halt_reason"])
-                    return
-                log("loop: every item ran; starting the list again")
-                for i in order:
-                    if s["items"][i]["status"] != "abandoned":
-                        s["items"][i].update(status="pending", reason=None)
-                roll_budget_clocks(s)
-                reset_config_counters(s)
+            # One item giving up on crashes is a sample outcome and the campaign
+            # moves on; every item giving up is a campaign that could not run at
+            # all, and that is a halt somebody should read (HALTED/MAX_CRASHES).
+            if order and all(s["items"][i]["status"] == "abandoned" for i in order):
+                s["status"] = "halted"
+                s["halt_reason"] = "every item reached max_crashes"
                 save_state(s)
-                continue
+                log("HALT: %s" % s["halt_reason"])
+                return
             s["status"] = "done"
             save_state(s)
             log("campaign %r done: prep %s, fuzz %s, triage %s, reboots %s, wall %s"
@@ -2676,7 +2688,7 @@ def cmd_run(name):
         log("item %s: %s (%.0f min left of %.1fh %s budget; so far: prep %s, fuzz %s, "
             "triage %s, reboots %s)"
             % (item["id"], config_id(cfg), (budget - budget_spent(s, d)) / 60, budget / 3600,
-               d.get("budget_clock", "wall"),
+               d.get("budget_clock", DEFAULTS["budget_clock"]),
                fmt_hms(s.get("prep_seconds")), fmt_hms(s.get("active_seconds")),
                fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
         try:
@@ -2771,6 +2783,7 @@ def cmd_run(name):
         # recurrence is handled in place. See quarantine_decide.
         triaging = outcome == "crash" and handle_crash(s, d, info)
         announce_incident(s)
+        record_bug_line(s)
         save_state(s)
         if triaging:
             continue                     # loop re-enters the triaging phase
@@ -2778,65 +2791,97 @@ def cmd_run(name):
 
 
 # --- authoring + control -----------------------------------------------------
-def cmd_new(name, configs, max_hours, repeat=1, clock=None, max_crashes=None,
+def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=None,
             min_free_gb=None, crashloop_limit=None, crashloop_min_execs=None,
-            triage_max_boots=None, max_plateau_hours=None, reuse_known_culprits=False,
-            watch_window=True, force=False, strict=False, description=None):
-    """Author plans/<name>.json (campaign-planning.md §3) and check it.
+            triage_max_boots=None, max_plateau_hours=None, reuse_known_culprits=None,
+            watch_window=None, force=False, strict=False, description=None, copy=None):
+    """Create campaigns/<name>/: plan.json, state.json (new), README.md.
 
-    A plan references hand-written configs; it does not run them. Running is
-    `install <name>`, which freezes a copy under campaigns/<name>/. Listing a
-    config several times (or --repeat) is how a config is run several times,
-    each from scratch; ids are derived when the plan is read (<config>-1, -2).
+    The plan references hand-written configs; it does not run them -- `install`
+    does. Listing a config several times (or --repeat) is how a config is run
+    several times, each from scratch; ids are derived when the plan is read
+    (<config>-1, -2). --copy <campaign> starts from another campaign's plan
+    (its configs and settings); that is how the same experiment is run again
+    under a new name. Every setting is None when the flag was not given, so a
+    flag given alongside --copy always wins, even one equal to its default.
     """
     if not planlib.ID_RE.match(name):
         die("campaign name %r: allowed [A-Za-z0-9_-] (it is a folder name)" % name)
-    path = authored_plan_path(name)
-    if path.exists() and not force:
-        die("plan %r already exists (%s); use --force to overwrite" % (name, path))
-    items = []
-    for c in configs:
-        cp = Path(c)
+    if is_plan_layout(name) or (CAMPAIGN_DIR / ("%s.json" % name)).exists():
+        st = read_json(state_path(name)) or {}
+        if not (force and st.get("status", "new") == "new"):
+            die("campaign %r already exists (%s); pick another name, or --force while "
+                "it has not run" % (name, campaign_dir(name)))
+    plan = None
+    if copy:
+        if not is_plan_layout(copy):
+            die("no campaign %r to copy from" % copy)
+        plan = planlib.load_plan(plan_path(copy))
+        plan.pop("legacy", None)
+        plan["name"] = name
+        plan["description"] = (description or "").strip() or \
+            "copy of %s: %s" % (copy, plan.get("description") or "")
+        if configs:
+            plan["items"] = [{"config": c} for c in configs for _ in range(max(1, repeat))]
+    if plan is None:
+        if not configs:
+            die("give at least one config, or --copy <campaign>")
+        plan = {"name": name, "description": (description or "").strip(),
+                "clock": planlib.DEFAULT_CLOCK,
+                "defaults": {"max_hours": DEFAULTS["budget_hours"],
+                             "max_plateau_hours": None, "reuse_known_culprits": False},
+                "items": [], "limits": {}, "watch_window": True}
+        plan["items"] = [{"config": c} for c in configs for _ in range(max(1, repeat))]
+    for c in [it["config"] for it in plan["items"]]:
+        cp = Path(c) if os.path.isabs(c) else REPO_ROOT / c
         if not cp.exists():
             die("config not found: %s" % c)
-        try:
-            rel = str(cp.resolve().relative_to(REPO_ROOT))
-        except ValueError:
-            rel = str(cp.resolve())
-        items += [{"config": rel} for _ in range(max(1, repeat))]
-    plan = {
-        "name": name,
-        # Why this campaign exists, in the operator's words. It travels with the
-        # tracked plan and seeds the campaign's README (write_readme).
-        "description": (description or "").strip(),
-        # A plan measures fuzzing by default: minimizing a bug never eats a
-        # sample's budget (the legacy definitions defaulted to wall).
-        "clock": clock or planlib.DEFAULT_CLOCK,
-        "defaults": {"max_hours": max_hours, "max_plateau_hours": max_plateau_hours,
-                     "reuse_known_culprits": bool(reuse_known_culprits)},
-        "items": items,
-        "limits": {k: v for k, v in (("max_crashes", max_crashes), ("min_free_gb", min_free_gb),
-                                     ("crashloop_limit", crashloop_limit),
-                                     ("crashloop_min_execs", crashloop_min_execs),
-                                     ("triage_max_boots", triage_max_boots))
-                   if v is not None},
-        "watch_window": watch_window,
-    }
-    PLANS_DIR.mkdir(parents=True, exist_ok=True)
-    write_json(path, plan)
-    log("wrote %s" % path)
+    # make configs repo-relative so the plan reads the same on the box
+    for it in plan["items"]:
+        cp = Path(it["config"])
+        if cp.is_absolute():
+            try:
+                it["config"] = str(cp.resolve().relative_to(REPO_ROOT))
+            except ValueError:
+                it["config"] = str(cp.resolve())
+    # a flag that was given wins over what --copy brought (and over the defaults)
+    if max_hours is not None:
+        plan["defaults"]["max_hours"] = max_hours
+    if clock:
+        plan["clock"] = clock
+    if max_plateau_hours is not None:
+        plan["defaults"]["max_plateau_hours"] = max_plateau_hours
+    if reuse_known_culprits is not None:
+        plan["defaults"]["reuse_known_culprits"] = bool(reuse_known_culprits)
+    if watch_window is not None:
+        plan["watch_window"] = bool(watch_window)
+    for k, v in (("max_crashes", max_crashes), ("min_free_gb", min_free_gb),
+                 ("crashloop_limit", crashloop_limit), ("crashloop_min_execs", crashloop_min_execs),
+                 ("triage_max_boots", triage_max_boots)):
+        if v is not None:
+            plan.setdefault("limits", {})[k] = v
+    try:
+        p = planlib.normalize(plan, REPO_ROOT)
+    except ValueError as e:
+        die("campaign %r: %s" % (name, e))
+    campaign_dir(name).mkdir(parents=True, exist_ok=True)
+    write_json(plan_path(name), plan)
+    write_json(state_path(name), init_state(name))
+    log("created %s" % campaign_dir(name))
     cmd_plan_check(name, strict=strict)
+    write_readme(name, p)
+    print("  README:      campaigns/%s/README.md (yours to edit; the block between its markers is generated)" % name)
     print("  pre-flight:  ./scripts/fuzz-campaign.py doctor %s" % name)
     print("  run it:      sudo ./scripts/fuzz-campaign.py install %s --agent --user fuzz" % name)
 
 
 def _plan_source(name):
-    """The frozen copy if the campaign exists, else the authored plan."""
     if is_plan_layout(name):
         return plan_path(name)
-    if authored_plan_path(name).exists():
-        return authored_plan_path(name)
-    die("no plan plans/%s.json and no campaign %r" % (name, name))
+    if (CAMPAIGN_DIR / ("%s.json" % name)).exists():
+        die("campaign %r is a legacy campaign (campaigns/%s.json); it has no plan to check"
+            % (name, name))
+    die("no campaign %r (campaigns/%s/plan.json)" % (name, name))
 
 
 def cmd_plan_check(name, strict=False):
@@ -2912,9 +2957,9 @@ def readme_block(name, p, box, s=None):
     rows = planlib.check_table(p, box, REPO_ROOT)
     hours = sum(float(r[2]) for r in rows)
     lines = [README_BEGIN,
-             "**Plan** `plans/%s.json`, frozen %s as `campaigns/%s/plan.json` -- %d item(s), "
+             "**Plan** `campaigns/%s/plan.json` (as of %s) -- %d item(s), "
              "%.1fh total on the `%s` clock%s." % (
-                 p.get("plan", name), timefmt.fmt(now_iso(), short=True), name, len(rows),
+                 name, timefmt.fmt(now_iso(), short=True), len(rows),
                  hours, p["clock"],
                  "; benches known culprits at first sighting" if p["defaults"].get("reuse_known_culprits") else ""),
              "", "| item | config | max h | syscalls | drift from box.json |", "|---|---|---|---|---|"]
@@ -2940,6 +2985,16 @@ def readme_block(name, p, box, s=None):
                   "", "| item | status | fuzzed | exec total | blocks | crashes | benched | bugs |",
                   "|---|---|---|---|---|---|---|---|"]
         lines += ["| %s |" % " | ".join(r) for r in out]
+        bugs = campaign_bugs(name)
+        if bugs:
+            lines += ["", "**Bugs** (the ledger is `%s`, shared by every campaign; this campaign's "
+                      "lines are in `campaigns/%s/bugs.log`):" % (BUGS_DIR, name), ""]
+            for bid in sorted(bugs):
+                b = bugs[bid]
+                lines.append("- `%s` -- %d sighting(s) in %s; %s%s" % (
+                    bid, b["sightings"], ", ".join(b["items"]) or "?",
+                    "first seen here" if b["first_here"] else "first seen in %s" % b["first_campaign"],
+                    "; %s" % b["title"] if b.get("title") else ""))
     lines.append(README_END)
     return "\n".join(lines)
 
@@ -2982,39 +3037,94 @@ def refresh_readme(s):
         log("README refresh failed: %s" % e)
 
 
+def legacy_names():
+    """Campaigns still in the old shape: campaigns/<name>.json + .state/<name>.json."""
+    return sorted(p.stem for p in CAMPAIGN_DIR.glob("*.json") if p.name != "queue.json")
+
+
+def cmd_migrate(strip_disable_syscalls=False, dry_run=False):
+    """Move finished legacy campaigns into the campaign folder layout, and the
+    bug ledger up to <tree>/bugs. Refuses while any driver runs.
+
+    A legacy campaign becomes campaigns/<name>/ with plan.json (one item per
+    config, marked legacy so `run` refuses it), its state and coordinator logs
+    moved beside it, and its old definition kept as legacy-def.json. Its
+    workdirs, quarantine files and triage jobs stay where they are -- the state
+    and the dossiers record those paths -- so nothing it produced moves.
+
+    --strip-disable-syscalls empties disable_syscalls in config/*.cfg, which the
+    old quarantine wrote into; it cannot tell a benched selector from a
+    hand-written exclusion, so it is opt-in and says what it removed."""
+    if running_processes("fuzz-campaign.py run"):
+        die("a driver is running; migrate when nothing runs")
+    moved = []
+    if (CAMPAIGN_DIR / "bugs").is_dir() and not (REPO_ROOT / "bugs").exists():
+        log("%smove campaigns/bugs -> bugs (a rename: hardlinked reports keep their inodes)"
+            % ("would " if dry_run else ""))
+        if not dry_run:
+            shutil.move(str(CAMPAIGN_DIR / "bugs"), str(REPO_ROOT / "bugs"))
+        moved.append("bugs")
+    for name in legacy_names():
+        old_def = CAMPAIGN_DIR / ("%s.json" % name)
+        d = read_json(old_def) or {}
+        st = read_json(STATE_DIR / ("%s.json" % name))
+        if st and st.get("status") == "running":
+            log("skip %s: its state says running; halt it first" % name)
+            continue
+        configs = [c if isinstance(c, str) else c["config"] for c in d.get("configs") or []]
+        plan = {"name": name, "legacy": True,
+                "description": "migrated from campaigns/%s.json on %s; read-only" % (name, now_iso()),
+                "clock": d.get("budget_clock", DEFAULTS["budget_clock"]),
+                "defaults": {"max_hours": d.get("budget_hours", DEFAULTS["budget_hours"])},
+                "items": [{"config": c} for c in configs],
+                "limits": {k: d[k] for k in ("max_crashes", "min_free_gb", "crashloop_limit",
+                                             "crashloop_min_execs", "triage_max_boots") if k in d}}
+        log("%smigrate %s: %d config(s) -> campaigns/%s/" % ("would " if dry_run else "", name,
+                                                           len(configs), name))
+        if dry_run:
+            moved.append(name)
+            continue
+        cdir = campaign_dir(name)
+        cdir.mkdir(parents=True, exist_ok=True)
+        write_json(cdir / "plan.json", plan)
+        shutil.move(str(old_def), str(cdir / "legacy-def.json"))
+        if st is not None:
+            shutil.move(str(STATE_DIR / ("%s.json" % name)), str(cdir / "state.json"))
+        for logf in STATE_DIR.glob("%s.coordinator.log*" % name):
+            shutil.move(str(logf), str(cdir / logf.name.replace("%s." % name, "")))
+        moved.append(name)
+    if strip_disable_syscalls and not dry_run:
+        for cfg in sorted((REPO_ROOT / "config").glob("*.cfg")):
+            try:
+                c = cfgutil.load(cfg)
+            except (OSError, ValueError):
+                continue
+            if c.get("disable_syscalls"):
+                log("strip %s: disable_syscalls=%s" % (cfg.name, c["disable_syscalls"]))
+                c["disable_syscalls"] = []
+                write_config(cfg, c)
+    print("migrated: %s" % (", ".join(moved) or "nothing to do"))
+    return 0
+
+
 def cmd_readme(name):
     if not is_plan_layout(name):
-        die("no campaign %r in the plan layout (install freezes a plan into one)" % name)
+        die("no campaign %r in the plan layout (`new` creates one; a legacy "
+            "campaigns/%s.json has no README)" % (name, name))
     path = write_readme(name, s=load_state(name))
     print("refreshed the generated block of %s" % path)
     return 0
 
 
-def freeze_plan(name):
-    """Make a campaign from a plan: copy plans/<name>.json to
-    campaigns/<name>/plan.json -- once; that copy is what runs, so editing the
-    tracked plan later does not change a campaign already created -- and give
-    it a state. A legacy definition is refused: it is read-only now."""
+def require_campaign(name):
+    """`install` and `run` need a campaign in the folder layout; say what to do
+    about a legacy one or a missing one."""
     if is_plan_layout(name):
-        return False
-    src = authored_plan_path(name)
-    if not src.exists():
-        if (CAMPAIGN_DIR / ("%s.json" % name)).exists():
-            die("campaign %r uses the legacy layout and is read-only; author a plan "
-                "(fuzz-campaign.py new %s <configs>) and install that" % (name, name))
-        die("no plan plans/%s.json; author it with: fuzz-campaign.py new %s <configs>"
-            % (name, name))
-    try:
-        planlib.normalize(planlib.load_plan(src), REPO_ROOT)
-    except ValueError as e:
-        die("plan %r: %s" % (name, e))
-    campaign_dir(name).mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, plan_path(name))
-    if not state_path(name).exists():
-        write_json(state_path(name), init_state(name))
-    write_readme(name)
-    log("froze %s -> %s" % (src, plan_path(name)))
-    return True
+        return
+    if (CAMPAIGN_DIR / ("%s.json" % name)).exists():
+        die("campaign %r uses the legacy layout and is read-only; create a new one "
+            "(fuzz-campaign.py new %s <configs>) or migrate" % (name, name))
+    die("no campaign %r; create it with: fuzz-campaign.py new %s <configs>" % (name, name))
 
 
 def _delta(cur, prev, fmt="%+d"):
@@ -3145,9 +3255,8 @@ def status_lines(name, prev=None):
     # The status IS the activity: "halted"/"done" are activity words and any
     # other word means running, so a separate state line would only repeat it.
     # This is the line you read between two panics.
-    out.append("  campaign (config %d/%d - %s):"
-               % (min(s["cursor"] + 1, len(d["items"])), len(d["items"]),
-                  "loops" if d["loop"] else "no loop"))
+    out.append("  campaign (item %d/%d):"
+               % (min(s["cursor"] + 1, len(d["items"])), len(d["items"])))
     row("  name", name)
     row("  status", activity_text(s, colour=True))
     # When the driver last wrote the state: everything below is read from that
@@ -3297,7 +3406,7 @@ def status_lines(name, prev=None):
                    timefmt.fmt_epoch(cf_facts["mtime"], short=True)),
                 _delta(cf_facts["bytes"], prev.get("corpus_bytes"), "%+d B"))
         else:
-            row("  corpus", "none yet -- this config starts from scratch")
+            row("  corpus", "none yet -- this item starts from scratch")
         # What the quarantine has benched: it narrows the search space while you
         # are not looking, so a run's coverage is only comparable knowing this.
         total = benchable_syscalls(cfg)
@@ -3370,7 +3479,7 @@ def incident_table(incs, colour=False):
     for inc in incs:
         what = inc.get("decision") or ""
         if what and inc.get("triage_job"):
-            what += " " + inc["triage_job"]
+            what += " " + job_label(inc["triage_job"])
         if not what and inc["kind"] == "crash" and not inc.get("panic_evidence"):
             what = "(no panic report)"
         if not what and inc.get("log_tail"):
@@ -3413,7 +3522,7 @@ def incident_line(inc, colour=False):
     if inc.get("decision"):
         line += "  -> %s" % inc["decision"]
         if inc.get("triage_job"):
-            line += " %s" % inc["triage_job"]
+            line += " %s" % job_label(inc["triage_job"])
     elif inc["kind"] == "crash" and not inc.get("panic_evidence"):
         line += "  (no panic report)"
     if inc.get("log_tail"):
@@ -3468,8 +3577,9 @@ def cmd_doctor(name):
     held = brake_held(name)
     if held:
         add("FAIL", "BRAKE SET (%s%s) -- this campaign will halt instead of running; "
-                    "clear it with `fuzz-campaign.py brake --clear`"
-            % (held[0], ": %s" % held[1] if held[1] else ""))
+                    "clear it with `fuzz-campaign.py brake %s--clear`"
+            % (held[0], ": %s" % held[1] if held[1] else "",
+               "" if Path(held[0]) == GLOBAL_BRAKE else "%s " % name))
     else:
         add("OK", "brake clear (set it with `touch %s`; from Recovery: `touch \"%s\"`)"
             % (GLOBAL_BRAKE, recovery_hint()))
@@ -3580,7 +3690,9 @@ def cmd_doctor(name):
                 if os.access(str(cfg), os.W_OK)
                 else "config %s is NOT writable by this user -- quarantine decisions "
                      "cannot be applied" % cfg.name)
-        wd = conf.get("workdir")
+        # A plan item's workdir is rendered under the campaign folder, whose
+        # writability is checked below; the authored key is ignored there.
+        wd = conf.get("workdir") if d.get("layout") != "plan" else None
         if wd:
             # fuzz-session creates the workdir on first start, so on a fresh tree
             # only its nearest existing ancestor can be tested -- that is what has
@@ -3690,7 +3802,8 @@ def cmd_doctor(name):
 
     # Everything the driver persists lives under these; unwritable means the
     # campaign cannot record a single incident.
-    for dp in (STATE_DIR, BUGS_DIR, REPO_ROOT / "triage" / ".state"):
+    for dp in (STATE_DIR, BUGS_DIR, RUN_DIR, REPO_ROOT / "triage" / ".state") + (
+            (campaign_dir(name),) if d.get("layout") == "plan" else ()):
         exists = _is_dir(dp)
         probe = dp if exists else dp.parent
         ok = _is_dir(probe) and os.access(str(probe), os.W_OK)
@@ -3954,7 +4067,7 @@ def _check_tree_reachable(user):
 
 def _chown_state_dirs(user):
     """Hand the campaign's own state dirs to the daemon/agent user."""
-    for dpath in (STATE_DIR, CAMPAIGN_DIR, BUGS_DIR):
+    for dpath in (STATE_DIR, CAMPAIGN_DIR, BUGS_DIR, RUN_DIR):
         try:
             dpath.mkdir(parents=True, exist_ok=True)
             shutil.chown(dpath, user=user)
@@ -3972,7 +4085,7 @@ def cmd_install_agent(name, user=None):
     Runnable as the user itself (no sudo) or as root (chowns to the user). Loads
     now if that user has an active GUI session; otherwise it loads at next login.
     """
-    freeze_plan(name)
+    require_campaign(name)
     load_def(name)
     user = user or os.environ.get("SUDO_USER") or getpass.getuser()
     try:
@@ -4040,7 +4153,7 @@ def startup_hint(name):
 def cmd_install(name, user=None, agent=False):
     if agent:
         return cmd_install_agent(name, user)
-    freeze_plan(name)
+    require_campaign(name)
     load_def(name)   # validate it exists
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if os.geteuid() != 0:
@@ -4793,6 +4906,60 @@ def attribute_bug(sig, culprit, job, verified):
             log("bug_registry: %s" % line.strip())
 
 
+def campaign_bugs(name):
+    """What the global ledger says this campaign found: {bug_id: {"sightings",
+    "items", "first_here", "first_campaign", "title"}}. The ledger is shared by
+    every campaign on purpose (it deduplicates across them); this is the slice
+    one campaign can read without querying it."""
+    try:
+        reg = br.load_registry(str(BUGS_DIR), must_exist=False)
+    except Exception as e:  # noqa: BLE001
+        log("ledger unreadable: %s" % e)
+        return {}
+    out = {}
+    for rec in (reg.get("bugs") or {}).values():
+        crashes = rec.get("crashes") or []
+        mine = [c for c in crashes if c.get("campaign") == name]
+        if not mine:
+            continue
+        first = min(crashes, key=lambda c: c.get("first_seen") or "") if crashes else {}
+        out[rec["id"]] = {
+            "sightings": len(mine),
+            "items": sorted({c.get("item") for c in mine if c.get("item")}),
+            "first_campaign": first.get("campaign"),
+            "first_here": first.get("campaign") == name,
+            "title": rec.get("title") or (mine[0].get("culprit") if mine else None),
+        }
+    return out
+
+
+def record_bug_line(s):
+    """Append the campaign's own line about the crash just filed to
+    campaigns/<name>/bugs.log: when, item, signature, bug id(s), whether the
+    bug is new to the ledger or was first seen by another campaign, the kext,
+    and the coordinator's decision. The ledger stays the single inventory;
+    this is the per-campaign record you can read without querying it."""
+    if not is_plan_layout(s.get("name") or ""):
+        return
+    inc = s["incidents"][-1] if s.get("incidents") else None
+    if not inc or inc.get("kind") != "crash" or not (inc.get("signature") or inc.get("bug_ids")):
+        return
+    bugs = campaign_bugs(s["name"])
+    ids = inc.get("bug_ids") or []
+    origin = "; ".join(
+        ("new here" if bugs.get(b, {}).get("first_here") else
+         "first seen in %s" % bugs[b]["first_campaign"] if b in bugs else "?") for b in ids) or "-"
+    line = "%s  %-24s sig %s  %s  (%s)  in %s  -> %s%s\n" % (
+        timefmt.stamp(), inc.get("item") or "-", inc.get("signature") or "-",
+        ",".join(ids) or "-", origin, inc.get("crashing_kext") or "?",
+        inc.get("decision") or "-", ("  %s" % inc["title"]) if inc.get("title") else "")
+    try:
+        with open(campaign_dir(s["name"]) / "bugs.log", "a") as f:
+            f.write(line)
+    except OSError as e:
+        log("bugs.log not written: %s" % e)
+
+
 def known_culprit(sig):
     """A verified reproducer's selectors for this signature from the global
     bug ledger, or None. Read directly: the ledger is ours."""
@@ -5050,25 +5217,29 @@ def main():
     p = argparse.ArgumentParser(description="autonomous campaign driver over fuzz-session.py")
     sub = p.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("new", help="author plans/<name>.json; `install` runs it")
+    sp = sub.add_parser("new", help="create campaigns/<name>/ (plan, state, README); `install` runs it")
     sp.add_argument("name")
-    sp.add_argument("configs", nargs="+", help="hand-written configs, run in this order; "
+    sp.add_argument("configs", nargs="*", help="hand-written configs, run in this order; "
                                                "list one twice to run it twice")
+    sp.add_argument("--copy", metavar="CAMPAIGN", help="start from another campaign's plan "
+                                                       "(any flag given here overrides it)")
+    # No argparse defaults on the settings: cmd_new must tell "not given" (keep
+    # what --copy brought, else the default) from "given, equal to the default".
     sp.add_argument("--max-hours", "--budget-hours", dest="max_hours", type=float,
-                    default=DEFAULTS["budget_hours"], help="per item (default %s)" % DEFAULTS["budget_hours"])
+                    help="per item (default %s)" % DEFAULTS["budget_hours"])
     sp.add_argument("--repeat", type=int, default=1, help="list every config N times")
     sp.add_argument("--clock", "--budget-clock", dest="clock", choices=BUDGET_CLOCKS,
-                    help="what --max-hours measures: 'fuzz' charges time from each run's "
-                         "first executed program (startup excluded), 'wall' also charges "
-                         "startup, minimization and reboots, 'real' is elapsed time since "
-                         "the item started and runs through halts and downtime "
-                         "(default %s)" % DEFAULTS["budget_clock"])
+                    help="what --max-hours measures: 'real' is elapsed time since the "
+                         "item started and runs through halts and downtime, 'wall' "
+                         "charges startup, fuzzing, minimization and reboots but not "
+                         "idle time, 'fuzz' charges time from each run's first executed "
+                         "program only (default %s)" % planlib.DEFAULT_CLOCK)
     sp.add_argument("--max-plateau-hours", type=float,
                     help="end an item after this long without a new basic block (phase 5; stored)")
-    sp.add_argument("--reuse-known-culprits", action="store_true",
+    sp.add_argument("--reuse-known-culprits", action="store_const", const=True,
                     help="bench a bug's verified culprit at first sighting instead of "
                          "re-minimizing it (default: every item pays its own triage)")
-    sp.add_argument("--no-watch-window", dest="watch_window", action="store_false",
+    sp.add_argument("--no-watch-window", dest="watch_window", action="store_const", const=False,
                     help="do not open a Terminal running `status -w` at each driver start")
     sp.add_argument("--strict", action="store_true", help="treat drift from box.json as an error")
     sp.add_argument("-m", "--description", help="what this campaign is for; seeds campaigns/<name>/README.md")
@@ -5089,6 +5260,12 @@ def main():
 
     sp = sub.add_parser("readme", help="refresh the generated block of campaigns/<name>/README.md")
     sp.add_argument("name")
+
+    sp = sub.add_parser("migrate", help="move finished legacy campaigns and the bug ledger into the new layout")
+    sp.add_argument("--strip-disable-syscalls", action="store_true",
+                    help="also empty disable_syscalls in config/*.cfg (the old quarantine wrote there; "
+                         "cannot tell a bench from a hand-written exclusion)")
+    sp.add_argument("--dry-run", action="store_true")
 
     sp = sub.add_parser("plan", help="plan check <name>: render every item without running")
     sp.add_argument("action", choices=["check"])
@@ -5192,9 +5369,12 @@ def main():
                 crashloop_limit=args.crashloop_limit, crashloop_min_execs=args.crashloop_min_execs,
                 triage_max_boots=args.triage_max_boots, max_plateau_hours=args.max_plateau_hours,
                 reuse_known_culprits=args.reuse_known_culprits, watch_window=args.watch_window,
-                force=args.force, strict=args.strict, description=args.description)
+                force=args.force, strict=args.strict, description=args.description,
+                copy=args.copy)
     elif args.cmd == "readme":
         sys.exit(cmd_readme(args.name))
+    elif args.cmd == "migrate":
+        sys.exit(cmd_migrate(args.strip_disable_syscalls, args.dry_run))
     elif args.cmd == "plan":
         sys.exit(cmd_plan_check(args.name, strict=args.strict))
     elif args.cmd == "stop":

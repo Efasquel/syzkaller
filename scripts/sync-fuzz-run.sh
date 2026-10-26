@@ -10,15 +10,19 @@
 # so the script set is the six drivers, and the binaries are the three the loop
 # shells out to (syz-manager, syz-executor, syz-ring-repro).
 #
-# The configs bake absolute paths; workdir + syzkaller are repointed into
-# FUZZ_ROOT. kernel_obj (/Users/wan/KernelCollections) is left as-is because it
-# is 0755/0644 and already fuzz-readable, so the 120MB BKC is not copied.
+# The model (campaign-planning.md §3-4): config/*.cfg and plans/*.json are
+# read-only INPUTS the campaign never writes back to, so they are copied verbatim
+# (comments and all). The machine's own box fields live in config/box.json, which
+# is this box's property: sync seeds it once and never overwrites it. Only a
+# legacy config that still bakes absolute paths under the build tree is rewritten,
+# to repoint those into FUZZ_ROOT; kernel_obj (/Users/wan/KernelCollections) is
+# left as-is because it is 0755/0644 and already fuzz-readable, so the 120MB BKC
+# is not copied. The bug ledger lives in bugs/ (moved up from campaigns/bugs) and
+# the ephemeral box files live in run/.
 #
-# Re-run after every rebuild. Two things make a re-sync safe mid-campaign:
-#   * every copy is atomic (temp + rename), so a running syz-manager keeps its
-#     old inode and is never truncated under it;
-#   * a destination config's "disable_syscalls" is carried across, so re-syncing
-#     does not throw away the quarantine decisions the campaign has accumulated.
+# Re-run after every rebuild. Every copy is atomic (temp + rename), so a running
+# syz-manager keeps its old inode and is never truncated under it, which is what
+# makes a re-sync safe mid-campaign.
 #
 # Output is colour-coded by phase (==> section, OK done, SKIP not done, KEPT a
 # decision made on your behalf). Colour is suppressed when stdout is not a
@@ -91,10 +95,17 @@ BINS=(bin/syz-manager
       bin/darwin_arm64/syz-ring-repro)
 # fuzz-results.py unpacks corpus.db into per-program files with syz-db.
 BINS+=(bin/syz-db)
-# Runtime state the campaign writes. config/ is here too: the quarantine rewrites
-# disable_syscalls into the live config on every decision.
-WRITABLE=(campaigns campaigns/.state campaigns/bugs sessions workdir
-          triage triage/.state config)
+# The dirs the campaign writes into at runtime, all made group-writable so the
+# fuzz user owns its state in a tree the build user created. bugs/ is the ledger's
+# new home (moved up from campaigns/bugs). run/ holds the ephemeral box files
+# (box.lock box.out requests.json watch.command brake). plans/ is an INPUT, but
+# sync copies into it so it must exist. campaigns/ and campaigns/.state stay for
+# the legacy state and the logs that still live there until the log phase.
+# config/ is NOT here: configs are read-only inputs now, so the directory needs
+# group-write only as config/box.json's parent (the box seeds and edits its own
+# box.json there) -- handled on its own below, not as a general runtime dir.
+WRITABLE=(bugs campaigns campaigns/.state run sessions workdir
+          triage triage/.state)
 
 # atomic copy: never truncate a file a running process may have mapped, and never
 # need write permission on the destination file itself (only on its directory) --
@@ -108,7 +119,7 @@ cp_atomic() {
 
 printf '%s%s%s %s\n  %s->%s %s\n' \
   "$C_BOLD" "publish" "$C_RESET" "$SRC" "$C_DIM" "$C_RESET" "$DST"
-mkdir -p "$DST"/scripts "$DST"/bin/darwin_arm64
+mkdir -p "$DST"/scripts "$DST"/bin/darwin_arm64 "$DST"/config
 for d in "${WRITABLE[@]}"; do mkdir -p "$DST/$d"; done
 
 # --- scripts + binaries (read-only artifacts) --------------------------------
@@ -136,7 +147,12 @@ for b in "${BINS[@]}"; do
 done
 ok "${#BINS[@]} binary/binaries"
 
-# --- configs (repoint paths; keep the destination's quarantine decisions) -----
+# --- configs (INPUTS: copied verbatim; legacy path-bakers repointed) ----------
+# Configs are read-only inputs now -- no campaign writes a config back -- so each
+# one is copied byte for byte, keeping the whole-line '#' comments the experiment
+# uses to record what it excluded. The only exception is a legacy config that
+# still bakes absolute paths under the build tree: those keys are repointed into
+# the fuzz tree so the config keeps resolving, and the file says so.
 step "configs"
 cfg_n=0
 for c in "$SRC"/config/*.cfg; do
@@ -145,50 +161,62 @@ for c in "$SRC"/config/*.cfg; do
   /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" "${C_CYAN:+1}" "$SRC/scripts" <<'PY'
 import json, os, sys
 src, dst, old, new = sys.argv[1:5]
-# Read configs exactly as syz-manager does: it strips whole-line '#' comments
-# (pkg/config/config.go), and the campaign configs use them to record what an
-# experiment excluded. cfgutil is the single source of that rule.
+# cfgutil reads configs exactly as syz-manager does -- stripping whole-line '#'
+# comments (pkg/config/config.go) -- so we can INSPECT a config for baked paths
+# without a '#'-commented one tripping the parse. It is used only to decide; the
+# verbatim copy below goes through the raw bytes so the comments survive.
 sys.path.insert(0, sys.argv[6])
 from lib import cfgutil
 # Colour is decided once, by the shell, from isatty + NO_COLOR. Deciding it again
 # here would emit escapes into a redirected log.
 _c = len(sys.argv) > 5 and sys.argv[5] == "1"
 YEL = "\033[33m" if _c else ""
+GRN = "\033[32m" if _c else ""
 CYN = "\033[36m" if _c else ""
 RST = "\033[0m" if _c else ""
+
+def atomic_write(text):
+    # Never truncate a config a running syz-manager has open; write a temp and
+    # rename it over the old inode.
+    tmp = dst + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)   # an input: nothing writes it at runtime (see the chmod notes)
+    os.replace(tmp, dst)
+
 try:
     cfg = cfgutil.load(src)
 except ValueError as e:
     # Genuinely malformed -- syz-manager could not load it either. Warn and skip
-    # rather than aborting the whole publish. Note this is NOT the case for a
-    # '#'-commented config: those parse fine, and used to be skipped here, which
-    # silently froze the published copy at whatever it was last time.
+    # rather than aborting the whole publish.
     sys.stderr.write("    %sSKIP%s %s: not valid JSON (%s)\n"
                      % (YEL, RST, os.path.basename(src), e))
     raise SystemExit(0)
-for k, v in list(cfg.items()):
-    if isinstance(v, str) and v.startswith(old):
-        cfg[k] = new + v[len(old):]
-# Carry the live quarantine set across a re-sync. The authored config in the repo
-# has no idea which selectors the campaign has benched since; clobbering it would
-# silently re-enable every crasher the loop already paid a reboot to find.
-try:
-    prev = cfgutil.load(dst).get("disable_syscalls")
-except (OSError, ValueError):
-    prev = None
-if prev:
-    cfg["disable_syscalls"] = prev
-    print("    %sKEPT%s %s: disable_syscalls=%s (the campaign's quarantine "
-          "decisions)" % (CYN, RST, os.path.basename(dst), ", ".join(prev)))
-tmp = dst + ".tmp.%d" % os.getpid()
-with open(tmp, "w") as f:
-    json.dump(cfg, f, indent=4); f.write("\n")
-os.chmod(tmp, 0o664)
-os.replace(tmp, dst)
+# Which keys still bake an absolute path under the build tree? Only those force a
+# rewrite; box fields belong in box.json now (campaign-planning.md §3), but a
+# legacy config that still carries them must keep running until it is stripped.
+box_paths = [k for k, v in cfg.items()
+             if isinstance(v, str) and v.startswith(old)]
+if not box_paths:
+    # A plain input: copy the raw bytes so the '#' comments reach the published
+    # tree. No rewrite, no reformat -- what you authored is what runs.
+    with open(src) as f:
+        atomic_write(f.read())
+    print("    %sOK%s %s: copied verbatim (comments kept)"
+          % (GRN, RST, os.path.basename(dst)))
+    raise SystemExit(0)
+# Legacy config: repoint the build-tree paths into the fuzz tree. This reformats
+# the file (comments are lost), which is acceptable because such a config is on
+# its way out -- strip its box keys and it becomes a verbatim input.
+for k in box_paths:
+    cfg[k] = new + cfg[k][len(old):]
+atomic_write(json.dumps(cfg, indent=4) + "\n")
+print("    %sKEPT%s %s: box keys repointed into the fuzz tree (%s)"
+      % (CYN, RST, os.path.basename(dst), ", ".join(sorted(box_paths))))
 PY
 done
 [ -f "$SRC/config/kext_ids.json" ] && cp_atomic "$SRC/config/kext_ids.json" "$DST/config/kext_ids.json"
-ok "$cfg_n config(s) repointed into $DST"
+ok "$cfg_n config(s) published to $DST/config"
 
 # --- syscall descriptions ----------------------------------------------------
 # syz-manager has the grammar compiled in, so it does not read these. fuzz-session's
@@ -218,15 +246,22 @@ ok "$camp_n legacy definition(s); campaigns/<name>/ and .state left alone (fuzz-
 
 # --- plans: the inputs of the new layout (plans reference configs by repo-relative
 # path, which resolves against the fuzz tree's own root -- no rewriting) --------
-step "plans"
-mkdir -p "$DST/plans"
-plan_n=0
-for j in "$SRC"/plans/*.json; do
-  [ -e "$j" ] || break
-  cp_atomic "$j" "$DST/plans/$(basename "$j")"
-  plan_n=$((plan_n + 1))
+step "campaigns"
+# A campaign's plan.json and README.md are tracked inputs; the rest of its
+# folder is the box's runtime. Publish only campaigns the box does not have yet
+# (the box's state, logs and README edits are never overwritten).
+camp_new=0
+for pj in "$SRC"/campaigns/*/plan.json; do
+  [ -e "$pj" ] || break
+  cname="$(basename "$(dirname "$pj")")"
+  if [ ! -e "$DST/campaigns/$cname/plan.json" ]; then
+    mkdir -p "$DST/campaigns/$cname"
+    cp_atomic "$pj" "$DST/campaigns/$cname/plan.json"
+    [ -f "$SRC/campaigns/$cname/README.md" ] && cp_atomic "$SRC/campaigns/$cname/README.md" "$DST/campaigns/$cname/README.md"
+    camp_new=$((camp_new + 1))
+  fi
 done
-ok "$plan_n plan(s)"
+ok "$camp_new new campaign(s) published; existing ones left alone"
 # config/box.json is THIS machine's: created on the box once, never overwritten
 # (sync only says when the repo's copy differs, so a drift is a decision, not an
 # accident).
@@ -247,12 +282,19 @@ step "permissions"
 # many names -- see fsutil). chgrp/chmod act on the inode, so touching a link
 # would rewrite the OS's own file in /Library/Logs/DiagnosticReports, and fails
 # anyway because those files are root-owned. Prune those paths from the walk;
-# they are evidence, and nothing needs to write them.
-# triage/*/exec is pruned for cost, not correctness: it holds one empty
+# they are evidence, and nothing needs to write them. The reports live under
+# bugs/*/reports now (the ledger moved up); campaigns/bugs/*/reports is kept so a
+# legacy, un-migrated tree is still protected.
+# The exec scratch is pruned for cost, not correctness: it holds one empty
 # syzkaller.XXXXXX per minimization probe and nothing ever reads it, but it was
 # 92% of this tree's 444k files -- three walks over it dominated every publish.
-# triage.py now clears it when a job finishes; this keeps an in-flight job cheap.
-find "$DST" \( -path "$DST/campaigns/bugs/*/reports" -o -path "$DST/triage/*/exec" \) -prune -o \
+# triage.py clears it when a job finishes; this keeps an in-flight job cheap. The
+# new layout keeps it per item (campaigns/<name>/<config>/<item>/triage/*/exec);
+# triage/*/exec is the legacy and manual-job location.
+find "$DST" \( -path "$DST/bugs/*/reports" \
+            -o -path "$DST/campaigns/bugs/*/reports" \
+            -o -path "$DST/triage/*/exec" \
+            -o -path "$DST/campaigns/*/*/*/triage/*/exec" \) -prune -o \
      -exec chgrp "$FUZZ_GROUP" {} + 2>/dev/null || true
 chmod -R g+rX "$DST"/scripts "$DST"/bin "$DST"/sys
 # 775, not 755: this is the launchd job's WorkingDirectory, so it is the cwd of
@@ -261,15 +303,25 @@ chmod -R g+rX "$DST"/scripts "$DST"/bin "$DST"/sys
 # minimization probe ("SYZFAIL: shmem open failed ... errno 13").
 chmod 775 "$DST"
 for d in "${WRITABLE[@]}"; do chmod 775 "$DST/$d"; done
-chmod g+rw "$DST"/config/*.cfg 2>/dev/null || true
+# config/ is group-writable only as config/box.json's parent: the box seeds and
+# then edits its own box.json in place, which needs write on the directory. The
+# .cfg inputs are deliberately NOT made group-writable any more -- nothing writes
+# them at runtime, so read-only is the correct, and safer, posture for an input.
+chmod 775 "$DST"/config
 
 # The state the campaign has already written belongs to whoever wrote it; keep it
-# group-writable so a later sync (or the other account) can still touch it.
-find "$DST/campaigns" "$DST/sessions" "$DST/workdir" "$DST/triage" \
-     -path "$DST/triage/*/exec" -prune -o \
+# group-writable so a later sync (or the other account) can still touch it. bugs/
+# is included: the ledger (and its dossiers) is written by the campaign and must
+# stay editable. Reports and exec scratch are pruned as above.
+find "$DST/bugs" "$DST/campaigns" "$DST/sessions" "$DST/workdir" "$DST/triage" \
+     \( -path "$DST/bugs/*/reports" -o -path "$DST/campaigns/bugs/*/reports" \
+        -o -path "$DST/triage/*/exec" \
+        -o -path "$DST/campaigns/*/*/*/triage/*/exec" \) -prune -o \
      -type d -exec chmod g+w {} + 2>/dev/null || true
-find "$DST/campaigns" "$DST/sessions" "$DST/triage" \
-     \( -path "$DST/campaigns/bugs/*/reports" -o -path "$DST/triage/*/exec" \) -prune -o \
+find "$DST/bugs" "$DST/campaigns" "$DST/sessions" "$DST/triage" \
+     \( -path "$DST/bugs/*/reports" -o -path "$DST/campaigns/bugs/*/reports" \
+        -o -path "$DST/triage/*/exec" \
+        -o -path "$DST/campaigns/*/*/*/triage/*/exec" \) -prune -o \
      -type f -exec chmod g+rw {} + 2>/dev/null || true
 
 ok "tree root 775 (it is the launchd job's cwd), state dirs group-writable"
