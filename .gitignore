@@ -40,8 +40,16 @@ gha-creds-*.json
 # fuzz-session.py registry
 /sessions/
 
-# fuzz-campaign.py runs (plans live in plans/, tracked)
-/campaigns/
+# fuzz-campaign.py runs. A campaign's plan and README are tracked -- the
+# experiment and its write-up -- everything else in its folder is runtime
+# (corpora, logs, cores). git cannot re-include a file under an excluded dir,
+# so exclude contents, re-include the subdirs, exclude their contents, then
+# re-include the two files.
+/campaigns/*
+!/campaigns/*/
+/campaigns/*/*
+!/campaigns/*/plan.json
+!/campaigns/*/README.md
 /bugs/
 /run/
 /STOP

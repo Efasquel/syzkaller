@@ -29,7 +29,7 @@ Two properties of that tree that are load-bearing:
   shmem file and tmpdir *relative to cwd*; a read-only root makes every probe die
   with `SYZFAIL: shmem open failed ... errno 13`, and minimization then reports
   that nothing reproduces having never executed a program.
-- **Hardlinked panic evidence under `campaigns/bugs/*/reports/` is never
+- **Hardlinked panic evidence under `bugs/*/reports/` is never
   chmod'd or chgrp'd.** Those are second names for the OS's own files; changing
   a link's mode rewrites the original in `/Library/Logs/DiagnosticReports`.
 
@@ -48,18 +48,20 @@ run as. Run as yourself they are noise — it says so in its own output.
 
 ```sh
 /usr/bin/python3 scripts/fuzz-campaign.py new <name> config/<x>.cfg [config/<y>.cfg] \
-    --repeat 3 --max-hours 6 --clock fuzz          # writes plans/<name>.json + checks it
+    --repeat 3 --max-hours 6 -m "why"       # creates campaigns/<name>/ (plan.json, state, README) + checks it
+/usr/bin/python3 scripts/fuzz-campaign.py new <name2> --copy <name>    # same experiment, new name; flags given alongside override
 /usr/bin/python3 scripts/fuzz-campaign.py plan check <name> [--strict]
-sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz   # freezes campaigns/<name>/plan.json, installs
+sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz
 ```
 
-A plan references hand-written configs; listing a config N times (or
-`--repeat N`) runs it N times from scratch as items `<config-id>-1..N`.
+A campaign's plan references hand-written configs; listing a config N times
+(or `--repeat N`) runs it N times from scratch as items `<config-id>-1..N`.
 `config/box.json` holds the machine's keys once and is never overwritten by
 sync; a config's own box key wins and shows as drift in `plan check`. The
 runner renders each item's effective config under
-`campaigns/<name>/<config-id>/<item-id>/` and never writes `config/`.
-Campaigns authored as `campaigns/<name>.json` are read-only now.
+`campaigns/<name>/<config-id>/<item-id>/` and never writes `config/`. The
+plan and README of each campaign are tracked in git; the rest of its folder
+is runtime. Campaigns authored as `campaigns/<name>.json` are read-only now.
 
 `--agent` (a LaunchAgent in `gui/502`), never a LaunchDaemon: the driver needs
 the login session. `RunAtLoad` gives exactly one relaunch per panic-reboot, and
@@ -83,8 +85,13 @@ tail -f campaigns/.state/<name>.coordinator.log   # decisions only — use this
 tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
 /usr/bin/python3 scripts/fuzz-campaign.py status <name> -w
 /usr/bin/python3 scripts/fuzz-campaign.py quarantine <name> [--all]   # what is benched, and why
-/usr/bin/python3 scripts/runstats.py curve <Driver>/<variant> --field blocks|exec   # over fuzz-hours
+/usr/bin/python3 scripts/runstats.py curve <campaign>/<config-id>/<item-id> --field blocks|exec   # over fuzz-hours
+/usr/bin/python3 scripts/runstats.py compare --by config                            # mean ± spread over a config's items
 ```
+
+`runstats` addresses one sample as `<campaign>/<config-id>/<item-id>`; the
+legacy `<Driver>/<variant>` form still names a run under the top-level
+`workdir/`.
 
 `status -w` annotates what moved since the last refresh. A blank delta column
 means nothing moved, which is the signal you are watching for — an absolute
@@ -97,7 +104,7 @@ finer than the phase and stamped with its duration — `HALTED`/`DONE` are
 activity words, any other word means running: `BOOTING` → `PREPARING` →
 `FUZZING` → `COLLECTING` → `TRIAGING bug …` (job, stage, advance N/M and progress in the `triage` block) →
 `HALTED/<kind>` (`BRAKE`, `USER`, `CRASH-LOOP`, `DISK`, `STARTUP`, `TRIAGE`,
-`ABANDONED`, `ERROR`) or `DONE`, plus `WAITING` after a `resume` until the
+`MAX_CRASHES`, `ERROR`) or `DONE`, plus `WAITING` after a `resume` until the
 agent relaunches. It
 is what tells "fuzzing restarted" from "still minimizing" between two panics.
 The driver opens a Terminal running `status -w` at every start (so it is on
@@ -108,10 +115,11 @@ crash, and halt. `FUZZ_NO_GUI=1` silences both, e.g. from an ssh shell.
 Four clocks are reported separately: **preparing** (snapshot, grammar compile,
 until the first exec), **fuzzing** (first exec to the run's last sign of life),
 **minimizing** (triage), **rebooting** (panic to back up, and dead time).
-`--budget-clock` picks what `--budget-hours` measures: the default `wall` charges
-all four, `fuzz` only fuzzing (so neither startup nor minimizing a bug eats the
-budget), `real` the elapsed time since the config started. Never quote wall time
-as fuzzing time.
+`--clock` picks what `--max-hours` measures: the default `real` is the elapsed
+time since the item started, through halts and reboots, so an item asked for 6h
+ends 6h after it started and you know when the box frees up; `wall` charges the
+four clocks above but not idle time; `fuzz` only fuzzing (so neither startup
+nor minimizing a bug eats the budget). Never quote wall time as fuzzing time.
 
 ## Stopping a box that will not stay up
 
@@ -119,7 +127,7 @@ Four rungs. Each works when the one above it does not.
 
 | situation | action |
 |---|---|
-| end only the current config, keep the campaign going | `fuzz-campaign.py next <name>`; `skip <name> <item>` leaves a pending item out (requests, applied at the driver's next poll) |
+| end only the current item, keep the campaign going | `fuzz-campaign.py next <name>`; `skip <name> <item>` leaves a pending item out (requests, applied at the driver's next poll) |
 | running, box usable | `fuzz-campaign.py halt <name>` |
 | stop it *before* it fuzzes again after the next reboot | `fuzz-campaign.py brake <name> --reason "why"` |
 | panics through login, no usable session | Recovery (⌘R) → Terminal → `touch "/Volumes/Macintosh HD - Data/Users/Shared/fuzz-run/STOP"` |
@@ -141,10 +149,14 @@ before any session starts. Anything written into it becomes the halt reason.
   `make ring-repro REV=<rev>`; a plain `go build` drops
   `-ldflags -X prog.GitRevision` and the revision reads `unknown`. If
   `sys/darwin/*.txt` has uncommitted changes, the descriptions hash moves too.
-- **Budget seems not to advance** — the per-config clock resets on a config
-  advance by design; the lifetime totals in `status` are the ones that never do.
-- **A config was skipped** — `status` lists it under `abandoned`: it reached
-  `max_crashes` incidents (per config) and the campaign moved on.
+- **Budget seems not to advance** — the per-item clock resets when the campaign
+  moves to the next item by design; the lifetime totals in `status` are the
+  ones that never do.
+- **An item ended early as `abandoned`** — it reached `max_crashes` incidents
+  (the limit is per item) and the campaign moved on to the next item; one
+  abandoned item is still a sample. `skipped` is different: that is the status
+  the `skip` verb sets. When *every* item ended abandoned the campaign halts
+  as `HALTED/MAX_CRASHES` ("every item reached max_crashes").
 - **Halted with "... hung and the box must be rebooted"** — a triage probe
   wedged the executor (it holds `/dev/pishi`) and `sudo -n /sbin/shutdown -r
   now` was refused. Reboot by hand, `resume`, and add the sudoers rule from

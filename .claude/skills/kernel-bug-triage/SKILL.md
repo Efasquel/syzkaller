@@ -61,7 +61,10 @@ as the current job ends.
 ```
 
 `triage.py status <job>` also prints where the job came from (campaign, config,
-fuzzed kext) and, while it runs, its progress read from the checkpoint.
+fuzzed kext) and, while it runs, its progress read from the checkpoint. A
+campaign-born job lives at `campaigns/<name>/<config-id>/<item-id>/triage/t<N>/`
+and is addressed by that directory; `status` and the notifications call it by
+its short name, `t1`.
 
 Stages: `MERGE` → `MINIMIZE_CONN` → `MINIMIZE_CALLS` → `DONE`, or terminal
 `STUCK`. Each crashing subset panics the box, so the job advances one **boot**
@@ -103,8 +106,13 @@ subset happened to tip the kernel over. Never present one as a reproducer.
 ## What the quarantine decided
 
 ```sh
-/usr/bin/python3 scripts/quarantine.py --state campaigns/.state/quarantine_<config-id>.json status
+/usr/bin/python3 scripts/quarantine.py --state campaigns/<name>/<config-id>/<item-id>/quarantine.json status
 ```
+
+The quarantine is per item, next to the corpus it filters. Only an un-migrated
+legacy campaign still keeps it at `campaigns/.state/quarantine_<config-id>.json`
+(keyed by config, shared across campaigns). `fuzz-campaign.py quarantine <name>`
+finds the right one for you.
 
 - A signature seen **once** is recorded but never benched (the SUSPECT gate) — a
   one-off crash must not cost a selector its coverage.
@@ -133,10 +141,10 @@ usually cannot supply it.
 
 ## The dossier
 
-`campaigns/bugs/BUG-000N-<slug>.md`. The prose sections (Summary, Root cause,
+`bugs/BUG-000N-<slug>.md`. The prose sections (Summary, Root cause,
 Reproduce, Impact, Apple report) are **yours** and are never rewritten. Only the
 delimited `AUTO-EVIDENCE` block is regenerated — reproducer first, then the
-evidence log. Panic reports are hardlinked under `campaigns/bugs/<BUG-id>/reports/`
+evidence log. Panic reports are hardlinked under `bugs/<BUG-id>/reports/`
 so the evidence survives macOS rotating `DiagnosticReports`; never chmod or
 annotate them in place, since that would rewrite every snapshot linking the same
 inode. Notes go in a sidecar.

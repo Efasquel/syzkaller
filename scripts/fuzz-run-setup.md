@@ -9,8 +9,9 @@ dedicated `fuzz` user, surviving panic-reboots and logouts.
   Both users are in group `staff`.
 
 One launchd job drives everything: `fuzz-campaign.py run <name>`. It shells out to
-`fuzz-session.py`, `triage.py` and `bug_registry.py`, and imports
-`crash_fingerprint.py` and `quarantine.py`. **Do not also install `triage.py`'s own
+`fuzz-session.py`, `triage.py`, `bug_registry.py` and `fuzz-results.py`, and
+imports `crash_fingerprint.py`, `quarantine.py`, `triage.py`, `bug_registry.py`
+and the `scripts/lib/` package. **Do not also install `triage.py`'s own
 agent** — two drivers would fight over the box.
 
 ---
@@ -20,8 +21,8 @@ agent** — two drivers would fight over the box.
 The repo lives at `/Users/wan/Documents/syzkaller`, but **`/Users/wan/Documents` is
 `0700`** — `fuzz` cannot traverse into it at all, so it can't read the scripts or
 binaries. Symlinks don't help (the block is on traversal). Every script also anchors
-its paths to `SCRIPT_DIR.parent` (`config/`, `campaigns/.state`, `sessions/`,
-`workdir/`, `triage/`), so `fuzz` needs its own writable repo root.
+its paths to `SCRIPT_DIR.parent` (`config/`, `campaigns/`, `bugs/`, `run/`,
+`sessions/`, `workdir/`, `triage/`), so `fuzz` needs its own writable repo root.
 
 Solution: a fuzz-accessible runtime root at **`/Users/Shared/fuzz-run`**
 (`/Users/Shared` is world-traversable; both users share `staff`).
@@ -30,10 +31,13 @@ Solution: a fuzz-accessible runtime root at **`/Users/Shared/fuzz-run`**
 
 | Item | Handling | Why |
 |------|----------|-----|
-| `scripts/{fuzz-campaign,fuzz-session,triage,quarantine,crash_fingerprint,bug_registry}.py` | **copied** (ro) | the full coordinator, not just the two drivers |
-| `bin/syz-manager`, `bin/darwin_arm64/{syz-executor,syz-ring-repro}` | **copied** (ro) | a headless agent has a minimal PATH and cannot fall back to `go run` |
-| `config/*.cfg`, `config/kext_ids.json` | **copied + rewritten, group-writable** | `workdir`+`syzkaller` repointed into the tree; the quarantine *writes* `disable_syscalls` back into the live config |
-| `campaigns/*.json` | **copied** (defs only) | `.state/` is fuzz-owned runtime |
+| `scripts/{fuzz-campaign,fuzz-session,triage,quarantine,crash_fingerprint,bug_registry,fuzz-results}.py`, `scripts/lib/*.py` | **copied** (ro) | the full coordinator, not just the two drivers |
+| `bin/syz-manager`, `bin/darwin_arm64/{syz-executor,syz-execprog,syz-ring-repro,syz-db}` | **copied** (ro) | a headless agent has a minimal PATH and cannot fall back to `go run` |
+| `sys/darwin/*.txt` | **copied** (ro) | the syscall descriptions the grammar tools read |
+| `config/*.cfg`, `config/kext_ids.json` | **copied verbatim** (ro) | inputs: nothing writes them at runtime. A legacy config that still bakes an absolute path under the build tree has only those keys repointed |
+| `config/box.json` | **seeded once**, never overwritten | this machine's keys (§Authoring); the box edits its own |
+| `campaigns/<name>/{plan.json,README.md}` | **published once** per campaign the box does not have yet | the experiment and its write-up; the rest of the folder is the box's runtime |
+| `campaigns/*.json` | **copied** (legacy defs only) | read-only on the box; `migrate` turns them into folders |
 | `kernel_obj` = `/Users/wan/KernelCollections/` | **left in place** | already `0755`/`0644`, fuzz-readable — avoids a 120 MB copy |
 | `bluetoothd` (repo root) | **not copied** | a renamed `syz-executor`; `executor_binary()` derives it at runtime |
 
@@ -67,8 +71,8 @@ the fuzzing account still has no privilege escalation path.
 
 `fuzz-campaign.py doctor` warns that `fuzz` cannot prune the `*.kernel.core.gz`
 cores in `/private/var/tmp/kernel_panics` (`0755 root:wheel` — unlinking needs write
-on the *directory*). **Do not fix that by making the directory group-writable.** Four
-reasons:
+on the *directory*; a leftover `*.kernel.core.log` counts as a core too). **Do not
+fix that by making the directory group-writable.** Four reasons:
 
 - On macOS `staff` (gid 20) is the default primary group of *every* local account, so
   `chgrp staff` shares the directory with every user who can log in, not just `fuzz`.
@@ -90,7 +94,7 @@ frozen July files. Reclaim them once, by hand, and the warning stops firing (doc
 only warns when cores are actually present):
 
 ```sh
-sudo rm /private/var/tmp/kernel_panics/*.kernel.core.gz     # ~664MB, all from July
+sudo rm /private/var/tmp/kernel_panics/*.kernel.core.gz /private/var/tmp/kernel_panics/*.kernel.core.log   # ~664MB, all from July
 ```
 
 The panics that *are* being written go to `/Library/Logs/DiagnosticReports` — ~2 MB
@@ -135,55 +139,53 @@ Safe to re-run mid-campaign:
 
 - every copy is **atomic** (temp + rename), so a running `syz-manager` keeps its old
   inode and is never truncated under it;
-- a destination config's **`disable_syscalls` is carried across**, so a re-sync does
-  not throw away the quarantine decisions the campaign has accumulated;
+- configs are copied **verbatim**: nothing on the box writes them. The quarantine's
+  decisions live in each item's `quarantine.json` under the campaign folder, so a
+  re-sync cannot throw them away;
 - the tree's group is forced to `staff` every sync (under `/Users/Shared` the default
   is `wheel`, which would leave `fuzz` with `r-x` and no way to write state);
 - a config that no longer parses as JSON is skipped with a warning rather than
-  aborting the publish.
+  aborting the publish;
+- `config/box.json` and a campaign's `plan.json` + `README.md` are published only
+  when the box does not have them: the box's copies are the ones that ran.
 
-### Seeding the campaign's memory (first publish only)
+### Seeding the bug ledger (first publish only)
 
-`.state/` is runtime and deliberately **not** synced. To carry the manual campaign's
-knowledge over — so already-known bugs are not re-discovered and re-triaged from
-scratch — copy the quarantine ledger and the bug registry once, repointing the
-ledger's `config` at the published copy:
+Campaign state is runtime and deliberately **not** synced; every item starts with
+an empty quarantine by design. The bug ledger is the one piece of memory worth
+carrying over — `--reuse-known-culprits` and the dedup across campaigns read it —
+and the box writes it afterwards, so copy it by hand, once, before the first run:
 
 ```sh
 DST=/Users/Shared/fuzz-run
-for q in campaigns/.state/quarantine_*.json; do
-  /usr/bin/python3 - "$q" "$DST/campaigns/.state/$(basename "$q")" "$DST" <<'PY'
-import json, os, sys
-src, dst, root = sys.argv[1:4]
-q = json.load(open(src))
-if q.get("config"):
-    q["config"] = os.path.join(root, "config", os.path.basename(q["config"]))
-json.dump(q, open(dst, "w"), indent=2); open(dst, "a").write("\n")
-PY
-done
-cp -R campaigns/bugs/. "$DST/campaigns/bugs/"
-chgrp -R staff "$DST/campaigns" && chmod -R g+rw "$DST/campaigns/.state" "$DST/campaigns/bugs"
+cp -R bugs/. "$DST/bugs/"
+chgrp -R staff "$DST/bugs" && chmod -R g+rw "$DST/bugs"
 ```
+
+The ledger is `bugs/` at the tree root. A tree published before `migrate` moved it
+still has `campaigns/bugs/`; the driver falls back to that only while `bugs/` does
+not exist, and sync creates `bugs/`, so copy to the new path.
 
 ---
 
 ## Authoring the campaign
 
-A campaign is a **plan** that references hand-written configs; it does not run
-them itself. `new` writes `plans/<name>.json` (tracked in git, like the configs
-it names) and checks it; `install` freezes a copy under `campaigns/<name>/` and
-runs that copy, so editing the tracked plan later does not change a campaign
-already created.
+A campaign is `campaigns/<name>/`: a **plan** (`plan.json`, which hand-written
+configs to run and for how long), its state, and a README. `new` creates it;
+`install` runs it. The plan and the README are tracked in git with the configs
+they name -- the experiment and its write-up -- while the rest of the folder
+(corpora, logs, cores) is the box's runtime and ignored.
 
 ```sh
 ./scripts/fuzz-campaign.py new fde_eval config/AppleFDEKeyStore_gram.cfg \
-    config/AppleFDEKeyStore_gramsel.cfg --repeat 3 --max-hours 6 --clock fuzz
+    config/AppleFDEKeyStore_gramsel.cfg --repeat 3 --max-hours 6 -m "Does grammar X beat Y on FDE?"
 ./scripts/fuzz-campaign.py plan check fde_eval          # again, any time
+./scripts/fuzz-campaign.py new fde_eval_2 --copy fde_eval   # the same experiment again, new name
 ```
 
 - **Say what the campaign is for**: `new -m "Does grammar X beat Y on FDE?" …`.
-  The description is stored in the plan and seeds `campaigns/<name>/README.md`
-  at install, together with the item table and where everything lives. The
+  The description is stored in the plan and seeds `campaigns/<name>/README.md`,
+  together with the item table and where everything lives. The
   README is yours: add notes and results; the tool only ever rewrites the block
   between its two markers -- when each item ends and when the campaign ends, it
   gains an **Outcome** table (per item: status and reason, fuzzing time, programs,
@@ -194,9 +196,12 @@ already created.
   config three times. Items are named `<config-id>-1`, `-2`, `-3` and that is
   what `status`, `skip` and the folders use.
 - **`--max-hours` is PER ITEM.** Six configs at 6h is 36h; `plan check` prints
-  the total so you see it before the box does.
+  the total so you see it before the box does. The hours are measured on the
+  **real** clock unless `--clock` says otherwise: an item asked for 6h ends 6h
+  after it started, reboots and triage included, so you know when the box frees
+  up. See *Reading the clocks* for `wall` and `fuzz`.
 - **`config/box.json` holds this machine's keys once** (`target`, `syzkaller`,
-  `http`, `procs`, `type`, `sandbox`, `reproduce`, `kernel_obj*`,
+  `http`, `procs`, `type`, `log_file`, `sandbox`, `reproduce`, `kernel_obj*`,
   `kext_coverage.kcov_device`). A config may still carry them; its value wins
   and `plan check` lists the difference as **drift** (`--strict` makes drift an
   error -- use it for evaluation plans, where everything but the varied factor
@@ -206,23 +211,39 @@ already created.
   `--sandbox`, `--executor`): triage reads them from the item's effective
   config, which has them from `box.json` and the config.
 - **`--reuse-known-culprits`** (off by default): when a crash's signature maps to
-  a bug whose reproducer is already verified in `campaigns/bugs/`, the item
+  a bug whose reproducer is already verified in `bugs/`, the item
   benches that culprit at the first sighting and spends no triage on it. Off, every
   item pays its own minimization -- the strict choice for time-to-reproducer.
+- **`--copy <campaign>`** copies another campaign's plan into a new one; any
+  flag given alongside overrides what it brought, even a flag set to its
+  default. That is how a plan is reused.
+- **`--max-crashes` is PER ITEM** (20): an item that reaches it is **abandoned**
+  and the campaign moves on to the next one. Only when every item ended
+  abandoned does the campaign halt (`HALTED/MAX_CRASHES`). For a crash-heavy
+  driver, raise it at `new` time.
 - **The effective config is the record.** What syz-manager actually ran is
   `campaigns/<name>/<config-id>/<item-id>/<name>.<item-id>.cfg`, rendered as
   `box.json ⊕ config ⊕ runtime` with the quarantine's benched selectors unioned
   into the authored `disable_syscalls` (they are never lost). `config/` is never
   written.
 - A campaign authored before plans (`campaigns/<name>.json`) is **read-only**:
-  `status`, `list`, `replay` still work; `run` and `install` refuse until it is
-  migrated.
+  `status`, `list`, `replay` still work; `run` and `install` refuse.
+  `fuzz-campaign.py migrate` (when nothing runs) moves each finished one into
+  `campaigns/<name>/` -- plan, state and coordinator log; its workdir, triage
+  jobs and quarantine stay where they were -- and moves the bug ledger from
+  `campaigns/bugs/` up to `bugs/`. `--strip-disable-syscalls` also empties
+  `disable_syscalls` in `config/*.cfg` (the old quarantine wrote there; it cannot
+  tell a bench from a hand-written exclusion, so it is opt-in). The brake,
+  lock, requests and watch command now live under `run/`, which can be wiped
+  whenever nothing runs.
 
 ## Pre-flight — as `fuzz`, not as you
 
 `doctor` checks binaries, scripts, panic-dir **readability**, core **prunability**,
-config and workdir **writability**, and the state dirs. Permissions are checked as
-whoever runs it, so run it as the user launchd will use:
+that every config of the plan **loads**, and that the campaign folder and the state
+dirs are **writable** (the effective config and the workdir are rendered there
+per item; `config/` is never written). Permissions are checked as whoever runs it,
+so run it as the user launchd will use:
 
 ```sh
 cd /Users/Shared/fuzz-run
@@ -290,14 +311,15 @@ cd /Users/Shared/fuzz-run && /usr/bin/python3 scripts/fuzz-campaign.py status jp
 # config of the campaign. `status` carries a one-line summary of the same.
 /usr/bin/python3 scripts/fuzz-campaign.py quarantine jpeg
 
-# the reportable bug inventory
-cat campaigns/bugs/INDEX.md
+# the reportable bug inventory (shared by every campaign; one line per filed
+# crash also lands in campaigns/jpeg/bugs.log)
+cat bugs/INDEX.md
 /usr/bin/python3 scripts/fuzz-campaign.py replay jpeg
 
-# end the running config now and move to the next one; leave a pending one out.
-# These are REQUESTS: they are appended to campaigns/.state/<name>.requests.json
-# and applied by the driver at its next poll (within 5s while fuzzing, at the
-# next relaunch otherwise) -- so the state file keeps one writer. `status`
+# end the running item now and move to the next one; leave a pending one out.
+# These are REQUESTS: they are appended to run/<name>.requests.json and applied
+# by the driver at its next poll (within 5s while fuzzing, at the next triage
+# advance or relaunch otherwise) -- so the state file keeps one writer. `status`
 # shows them under `requests` until they are applied. Items are named
 # <config-id>-1, -2 ... as `status` shows them.
 /usr/bin/python3 scripts/fuzz-campaign.py next jpeg
@@ -361,11 +383,12 @@ and a healthy run with a quick real bug read as a crash loop. Only fuzzing runs
 count: panics caused on purpose during minimization never do. A halt is a safe stop, not a
 failure — `resume` clears it.
 
-`max_crashes` (20) is **per config** and does not halt: a config that reaches
-it is **abandoned** — recorded in `status`, skipped if the campaign loops — and
-the campaign moves on to the next one. Only when every config is abandoned does
-it halt. For a multi-day unattended run on a crash-heavy driver, raise
-`max_crashes` in the campaign definition.
+`max_crashes` (20) is **per item** and does not halt: an item that reaches
+it is **abandoned** — recorded in `status` and in the README's Outcome table as
+a sample that ended that way — and the campaign moves on to the next one. Only
+when every item ended abandoned does it halt (`HALTED/MAX_CRASHES`). For a
+multi-day unattended run on a crash-heavy driver, raise it with
+`new --max-crashes`.
 
 A manager that dies before its first exec without a panic (a held http port, a
 bad config, a missing binary) is a **startup failure**: noticed within
@@ -373,34 +396,25 @@ bad config, a missing binary) is a **startup failure**: noticed within
 retried after 30s, and the third in a row halts with the run log's last
 `FATAL` line as the reason.
 
-### A config **is** a workdir
+### An item **is** a workdir
 
-`workdir` is a key in the `.cfg`, so re-running a config resumes **that
-workdir's** `corpus.db`, ring buffer and coverage — it continues the previous
-experiment rather than starting a new one. That is why a resumed run logs:
+The runner ignores any `workdir` in the authored config and renders one per
+item, `campaigns/<name>/<config-id>/<item-id>/workdir/`. So every item starts
+from scratch — empty corpus, fresh quarantine, its own triage jobs — and the
+only thing that resumes a corpus is the **same item** starting again after a
+panic-reboot or a `halt`/`resume`, which logs:
 
 ```
 corpus : resuming from existing corpus.db
 ```
 
-Which you want depends on the question you are asking:
-
-| you want | do this |
-|---|---|
-| keep making progress on a target | re-use the config — inherited corpus is the point |
-| measure "coverage reached from scratch in 24h" | **new config with a new `workdir` path** |
-
-There is no flag for this and deliberately so: the workdir path in the config is
-the single source of truth. But it does mean the classic mistake is copying a
-config, changing `disable_syscalls`, and forgetting `workdir` — the "new"
-experiment then silently inherits the old corpus and its coverage baseline.
-
-`status` now says which it is, so you never have to infer it from a log line that
-scrolled past hours ago:
+To keep making progress on a target, give one item a long `--max-hours`. To
+measure "coverage reached from scratch in 24h" three times, list the config
+three times. `status` says which it is:
 
 ```
   corpus      : 26 KB, last grew 01/09 14:55:31
-  corpus      : none yet -- this config starts from scratch
+  corpus      : none yet -- this item starts from scratch
 ```
 
 ### Watching a campaign
@@ -410,71 +424,73 @@ scrolled past hours ago:
 /usr/bin/python3 scripts/fuzz-campaign.py status jpeg -w --interval 30
 ```
 
-A full `status`, here mid-minimization (the figures are from a demo state):
+A full `status`, here mid-minimization (the figures are from a demo state, on a
+plan that chose `--clock fuzz`):
 
 ```
-campaign (config 1/1 - no loop):
+campaign (item 1/1):
   name        : demo_triaging
   status      : TRIAGING bug 3f2a9c01  for 0h14m
   updated     : 19/10/2026 15:15:36  (0h02m ago)
+  crashes     : 4
+  hangs       : 0
+  benched     : 2  (77ab10c3, 3f2a9c01)
+  triage queue: 1 second bug(s) waiting: 9c1e55d2
+  disk free   : 572.7 GB
+  time breakdown:
+    preparing : 0h12m  (until first exec)
+    fuzzing   : 6h41m  (first exec -> end of run)
+    minimizing: 1h03m  (triage)
+    rebooting : 0h44m  (panic -> back up)
+    total     : 8h41m
 
-triage (job demo_triaging_t1, boot 7 / 40):
+triage (job t1, boot 7 / 40):
   stage       : MINIMIZE_CALLS
   progress    : 12 subsets tested for 40 calls, 3 crashing
 
 config:
   name        : AppleSMC_demo_cov
+  item        : AppleSMC_demo_cov-1  (running)
   stop        : 17h18m / 24h00m (fuzzing)
   fuzzed      : 6h41m  (prep 0h12m, triage 1h03m, reboots 0h44m)
   manager     : down
   started     : 19/10/2026 06:34:36
-  corpus      : workdir  (412 KB, last grew 19/10 15:15:36)
+  corpus      : 412 KB, last grew 19/10 15:15:36
   quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
-
-time breakdown (whole campaign):
-  preparing   : 0h12m  (until first exec)
-  fuzzing     : 6h41m  (first exec -> end of run)
-  minimizing  : 1h03m  (triage)
-  rebooting   : 0h44m  (panic -> back up)
-  total       : 8h41m
-
-stats:
   exec total  : 214,880 (total: 1,878,396)
   exec rate   : 78/s average
   basic blocks: 317 (total: 1,304)
-  disk free   : 574.6 GB
-
-incidents (this config: 2 / 20):
-  crashes     : 4
-  hangs       : 0
-  benched     : 2  (77ab10c3, 3f2a9c01)
-  triage queue: 1 second bug(s) waiting: 9c1e55d2
+  incidents   : 2 / 20
 
 last 4 incident(s):
   when            kind   ran  sig       bug       kext                    decision
   19/10 10:15:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
-  19/10 12:05:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
+  19/10 12:05:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage t0
   19/10 13:40:36  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
-  19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
+  19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage t1
 ```
 
 Two blocks, one scope each. `campaign`: what the box is doing and for how long,
 how fresh this screen is, the campaign's incident counters, disk, and its time
-split four ways. `config`: the one being fuzzed -- how much of its budget is
+split four ways. `config`: the item being fuzzed -- how much of its budget is
 left on which clock, its own clocks, the manager, its corpus, what the
 quarantine has benched, what it executed and covered, its incident count
-against the per-config limit. `triage` appears while a job runs; the recent
-incidents close the screen.
+against the per-item limit. `triage` appears while a job runs; the recent
+incidents close the screen. Each incident says what the crash turned out to be:
+its signature, its BUG id in the registry, the kext the backtrace blames, and
+what the coordinator decided. A crash in a kext other than the fuzzed one is
+called out (`IOSurface (NOT fuzzed)` above) — the config names no kext, so
+"fuzzed" means the workdir's kext directory and the services the config opens.
 
 Redraws in place until Ctrl-C, annotating what moved since the last refresh:
 
 ```
 config:
-  exec total  : 214,880 (total: 1,878,396)  +281,340 / 1h00m   +4,213
+  exec total  : 214,880 (total: 1,878,396)  +281340 / 1h00m   +4213
   exec rate   : 78/s now, 78/s average
   basic blocks: 317 (total: 1,304)  +12 / 1h00m                   +2
   corpus      : 26 KB, last grew 01/09 14:55:31                +1408 B
-campaign (config 1/1 - no loop):
+campaign (item 1/1):
   crashes     : 4   +1
 ```
 
@@ -504,9 +520,9 @@ long it has been going. It is also the campaign's state: `HALTED`/`DONE` are
 activity words, and any other word means running, so nothing else repeats it:
 
 ```
-campaign (config 1/1 - no loop):
+campaign (item 1/3):
   name        : jpeg
-  status      : TRIAGING bug 3f2a  for 0h12m
+  status      : TRIAGING bug 3f2a9c01  for 0h12m
 
   status      : HALTED/CRASH-LOOP crash loop (15 crashes in a row before 50 programs executed)  for 2h03m
 ```
@@ -519,21 +535,20 @@ campaign (config 1/1 - no loop):
 | `COLLECTING` | a crash/hang is being recorded and bundled |
 | `TRIAGING` | a bug is being minimized; the `triage` block has the job and its boot count in the header, then the stage and how far its search has got |
 | `WAITING` | `resume` was issued; nothing runs until the agent relaunches the driver |
-| `HALTED/<kind>` / `DONE` | the driver exited; the kind says who stopped it — `BRAKE`, `USER`, `CRASH-LOOP`, `DISK`, `STARTUP` (the breaker's three), `TRIAGE` (stuck or unrebootable hang), `ABANDONED` (every config gave up), `ERROR` — and the reason follows |
+| `HALTED/<kind>` / `DONE` | the driver exited; the kind says who stopped it — `BRAKE`, `USER`, `CRASH-LOOP`, `DISK`, `STARTUP` (the breaker's three), `TRIAGE` (stuck or unrebootable hang), `MAX_CRASHES` (every item gave up), `ERROR` — and the reason follows |
 
-The word is green for fuzzing, red for halted, yellow for everything in between,
-and only on a tty. The `STATUS` column of `list` is the same word with its
-duration.
+The word is green for fuzzing, red for halted, grey for done, yellow for
+everything in between, and only on a tty. The `STATUS` column of `list` is the
+same word with its duration.
 
-The `stop` row in the config block is what is left of the current config's
-budget -- not the campaign's end; the campaign header says whether more
-configs or a loop follow -- shown
-as left / budget with its clock: `17h18m / 24h00m (fuzzing)`, `3h00m / 8h00m
-(total)`, or `at 19/10 16:00 (2h00m, real)` (the real clock is the only one
-that names a moment). `list` has the same in its
-`STOP` column. A fuzz-clock budget does not move while triaging, so that row
-can read the same for the whole of a minimization; that is the budget working
-as designed, not a stuck counter.
+The `stop` row in the config block is what is left of the current item's
+budget -- not the campaign's end; the campaign header says how many items
+follow -- shown as left / budget with its clock: `at 19/10 16:00 (2h00m, real)`
+(the default clock, the only one that names a moment), `17h18m / 24h00m
+(fuzzing)`, or `3h00m / 8h00m (total)`. `list` has the same in its `STOP`
+column. A fuzz-clock budget does not move while triaging, so that row can read
+the same for the whole of a minimization; that is the budget working as
+designed, not a stuck counter.
 
 Two things bring it to you with no command typed, because on this box there is
 often no time for one between two panics:
@@ -553,46 +568,9 @@ Both are skipped off macOS and under `FUZZ_NO_GUI=1` (set it when driving a
 campaign from an ssh shell you do not want windows popping out of). Only the
 driver's own `cmd_run` opens the window; `status` run by hand never does.
 
-Each recent incident says what the crash turned out to be: its signature, its
-BUG id in the registry, the kext the backtrace blames, and what the coordinator
-decided. A crash in a kext other than the fuzzed one is called out — the config
-names no kext, so "fuzzed" means the workdir's kext directory and the services
-the config opens:
-
-```
-last grew 19/10 15:15:36)
-  quarantine  : 2 / 10 disabled (1 hard, 1 soft), 1 suspect
-
-time breakdown (whole campaign):
-  preparing   : 0h12m  (until first exec)
-  fuzzing     : 6h41m  (first exec -> end of run)
-  minimizing  : 1h03m  (triage)
-  rebooting   : 0h44m  (panic -> back up)
-  total       : 8h41m
-
-stats:
-  exec total  : 214,880 (total: 1,878,396)
-  exec rate   : 78/s average
-  basic blocks: 317 (total: 1,304)
-  disk free   : 574.6 GB
-
-incidents (this config: 2 / 20):
-  crashes     : 4
-  hangs       : 0
-  benched     : 2  (77ab10c3, 3f2a9c01)
-  triage queue: 1 second bug(s) waiting: 9c1e55d2
-
-last 4 incident(s):
-  when            kind   ran  sig       bug       kext                    decision
-  19/10 10:15:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                suspect
-  19/10 12:05:36  crash  84s  77ab10c3  BUG-0004  AppleSMC                triage demo_triaging_t0
-  19/10 13:40:36  crash  84s  1c2e8800  BUG-0009  IOSurface (NOT fuzzed)  suspect
-  19/10 15:01:36  crash  84s  3f2a9c01  BUG-0007  AppleSMC                triage demo_triaging_t1
-```
-
 While triaging, the `triage` block reads the job's checkpoint: subsets tested and
-crashed, the subset under test, panics from other bugs, hangs — or, during the
-ring replay, the pass and slot.
+crashed, panics from other bugs, hangs — or, during the ring replay, the pass
+and slot. The subset under test is detail for `triage.py status <job dir>`.
 
 ### Dates
 
@@ -615,15 +593,15 @@ reinterpreted — it simply now *displays* as the hour it actually happened.
 `status` reports four disjoint clocks plus their sum, for the whole campaign:
 
 ```
-  time breakdown (whole campaign):
-    preparing   : 0h06m  (until first exec)
-    fuzzing     : 4h12m  (first exec -> end of run)
-    minimizing  : 0h51m  (triage)
-    rebooting   : 0h23m  (panic -> back up)
-    total       : 5h32m
+  time breakdown:
+    preparing : 0h06m  (until first exec)
+    fuzzing   : 4h12m  (first exec -> end of run)
+    minimizing: 0h51m  (triage)
+    rebooting : 0h23m  (panic -> back up)
+    total     : 5h32m
 ```
 
-`total` is what `--budget-clock wall` measures; `fuzzing` is what the `fuzz`
+`total` is what the `wall` clock measures; `fuzzing` is what the `fuzz`
 clock measures, and is still not pure execution time — `runstats.py show` reads
 syz-manager's own counter for that.
 
@@ -636,13 +614,19 @@ crash is noticed on the next boot, and measuring to then charged the reboot as
 fuzzing. A triage advance cut short by its own crashing probe is split the same
 way: minimizing up to the last probe, rebooting after it.
 
-`--budget-hours` measures **wall** by default: preparing plus fuzzing plus
-minimization plus reboot overhead. That is "give this config 24 hours of machine
-time", which is what comparing one configuration against another needs.
-`--budget-clock fuzz` charges the fuzzing line only, so neither startup nor a
-stubborn bug's minimization can eat the budget. `--budget-clock real` is elapsed
-time since the config started, startup included: ask for 1h and it stops 1h
-later. `wall >= fuzz` always, so the default can only end a campaign sooner.
+`--max-hours` is measured on the **real** clock by default: elapsed time since
+the item started, through startup, minimization, reboots and even the box
+sitting idle. Ask for 6h and the item ends 6h later, so the end of every item
+is a moment you can plan around, and `status` names it (`stop : at 19/10 16:00
+(6h00m, real)`). The clock survives panic-reboots: the start stamp is
+persisted, not re-taken on relaunch. `--clock wall` charges preparing plus
+fuzzing plus minimization plus reboot overhead, idle time excluded: "give this
+config 24 hours of machine time", which is what comparing one configuration
+against another on equal machine time needs. `--clock fuzz` charges the
+fuzzing line only, so neither startup nor a stubborn bug's minimization can
+eat the budget; it is the clock for "24h of actual fuzzing". `real >= wall >=
+fuzz` always, so the default ends an item soonest. The clock is one per plan;
+the hours are per item.
 
 > **`fuzzing` in `status` is still not time executing programs.** The manager
 > also re-triages its corpus and waits on RPC; on a measured run only **56%** of
@@ -650,13 +634,14 @@ later. `wall >= fuzz` always, so the default can only end a campaign sooner.
 > `runstats.py show <run>` reads syz-manager's own counter and prints an
 > `efficiency` line.
 
-Budget in wall hours, report in fuzzing hours. Both totals are always kept, so a writeup can
-say "24h fuzzing, 31h wall, of which 4h minimization" rather than picking one
-number and hiding the rest. Nothing accrues while the campaign is halted or idle,
-and a reboot gap is charged at most `max_boot_gap_seconds` (15 min), of which at
-most `max_relaunch_seconds` (5 min) for boot-to-relaunch; the rest is treated as
-idle rather than overhead — otherwise the wall clock would measure your sleep
-schedule.
+Whichever clock budgets, the report keeps every total, so a writeup can say
+"24h fuzzing, 31h wall, of which 4h minimization" rather than picking one
+number and hiding the rest. The wall and fuzz clocks accrue nothing while the
+campaign is halted or idle, and a reboot gap is charged at most
+`max_boot_gap_seconds` (15 min), of which at most `max_relaunch_seconds` (5 min)
+for boot-to-relaunch; the rest is treated as idle rather than overhead —
+otherwise the wall clock would measure your sleep schedule. The real clock
+keeps running through all of it; that is its point.
 
 ### When triage gets STUCK
 
@@ -668,8 +653,8 @@ failure, and re-running will not improve it. The job's `stuck_kind` says which:
 | `unverified` | a connection subset crashed during the search but not when re-run on its own: the bug needs state an earlier program left behind | benches the selectors anyway; the dossier records an *unverified lead* |
 | `no-repro` | no subset reproduced, **and** the ring replayed exactly as fuzzed did not crash either | benches nothing; the signature is *exhausted* |
 | `ring-only` | no subset of the merged program reproduced, but the ring replayed as fuzzed crashed twice: merging loses what the bug needs. The ring is kept in the job as `ring/` | benches nothing; *exhausted* |
-| `ring-unverified` / `ring-other` | the ring crashed once only / panicked with a different bug | benches nothing; *exhausted* |
-| `hang` | the job hung 3 times (each hang costs a reboot) | benches the hung program under its own quarantine key `hang:<job>`; the target is *exhausted* |
+| `ring-unverified` / `ring-other` | the ring crashed once only (kept as `ring/` too) / panicked with a different bug | benches nothing; *exhausted* |
+| `hang` | the job hung 3 times (each hang costs a reboot) | benches the hung program under its own quarantine key `hang:<job>` (`hang:t1`); the target is *exhausted* |
 
 When the connection culprit was verified but the call stage cannot reduce it, the job
 still ends `DONE`, with the connection culprit as the reproducer.
@@ -677,11 +662,11 @@ still ends `DONE`, with the connection culprit as the reproducer.
 An **exhausted** signature is not triaged again (that would repeat the same answer).
 Its recurrences are counted in the quarantine, and after `tolerate_budget` (4) of them
 the newest program in the ring buffer is benched as an *unverified lead* so it stops
-costing a reboot each time. `fuzz-campaign.py forget-exhausted <campaign> [sig]`
+costing a reboot each time. `fuzz-campaign.py forget-exhausted <campaign> [--sig SIG]`
 allows a new triage once the cause is fixed.
 
 If the budget runs out while a job is in progress, the job is finished first, its
-result benched, and then the campaign moves to the next config.
+result benched, and then the campaign moves to the next item.
 
 ### A second bug during triage
 
@@ -691,11 +676,14 @@ coordinator log says `SECOND BUG during triage`, the panic is filed in the bug
 registry as `fuzz-during-triage` (a genuine sighting), the quarantine records it as
 SUSPECT, and the subset that crashed is saved as `other_<sig>.syz` in the job. A
 triage for it is queued (`status` shows `triage queue`) and starts when the current
-job ends, from that one program. The queue is dropped when the config's budget is
-spent or the campaign moves to another config; the bug stays SUSPECT, so its next
+job ends, from that one program. The queue is dropped when the item's budget is
+spent or the campaign moves to another item; the bug stays SUSPECT, so its next
 recurrence while fuzzing is triaged as usual.
 
 ### Switching which campaign runs
 
-Author another def, then install its own agent (each campaign gets its own label).
-Only ever run **one** at a time — they share `/dev/pishi`.
+`new` another campaign, then install its own agent (each campaign gets its own
+label). Only ever run **one** at a time — they share `/dev/pishi`. A campaign
+`migrate` moved from the legacy layout carries its old coordinator log inside
+`campaigns/<name>/`; a campaign that runs today still logs to
+`campaigns/.state/<name>.coordinator.log`, until the log phase moves it.
