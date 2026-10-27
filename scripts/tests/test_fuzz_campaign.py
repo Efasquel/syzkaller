@@ -488,7 +488,7 @@ class SecondBugTest(unittest.TestCase):
         self.s = fc.init_state("camp")
         self.s.update({"phase": "triaging", "triage_job": "camp_t1",
                        "triage_bug_sig": "TARGET", "current_config": str(self.cfg)})
-        self.d = dict(fc.DEFAULTS, items=[{"config": str(self.cfg), "budget_seconds": 7200}])
+        self.d = dict(fc.DEFAULTS, items=[{"config": str(self.cfg), "max_hours": 2}])
         self.routed = []
         for p in (mock.patch.object(fc, "STATE_DIR", self.dir / "state"),
                   mock.patch.object(fc, "PANIC_DIRS", [self.panics]),
@@ -560,7 +560,7 @@ class SecondBugTest(unittest.TestCase):
         self.assertGreaterEqual(self.s["panic_sig_watermark"], before + 100)
 
     def test_a_spent_budget_drops_the_queue(self):
-        self.d["budget_clock"] = "wall"      # the clock that charges triage_seconds
+        self.d["clock"] = "wall"      # the clock that charges triage_seconds
         self.assertEqual(self.finish_job(spent=7200.0), [])
         self.assertEqual(self.s["triage_queue"], [])
 
@@ -791,25 +791,25 @@ class ClockTest(unittest.TestCase):
 
     def test_budget_clock_fuzz_ignores_triage_and_reboots(self):
         s = {"active_seconds": 100.0, "triage_seconds": 900.0, "overhead_seconds": 900.0}
-        self.assertEqual(fc.budget_spent(s, {"budget_clock": "fuzz"}), 100.0)
+        self.assertEqual(fc.budget_spent(s, {"clock": "fuzz"}), 100.0)
 
     def test_budget_clock_wall_charges_everything(self):
         s = {"active_seconds": 100.0, "triage_seconds": 900.0, "overhead_seconds": 900.0}
-        self.assertEqual(fc.budget_spent(s, {"budget_clock": "wall"}), 1900.0)
+        self.assertEqual(fc.budget_spent(s, {"clock": "wall"}), 1900.0)
 
     def test_default_budget_clock_is_real(self):
         """An item asked for 6h ends 6h after it started, whatever happened in
         between: the operator can say when the box frees up. One default for
         plans and for a legacy definition that says nothing."""
-        self.assertEqual(fc.DEFAULTS["budget_clock"], "real")
+        self.assertEqual(fc.budget_clock({}), "real")
         self.assertEqual(fc.planlib.DEFAULT_CLOCK, "real")
 
     def test_wall_is_never_less_than_fuzz(self):
         """So the default can only ever end a campaign sooner, never overrun."""
         s = {"active_seconds": 100.0, "triage_seconds": 50.0,
              "overhead_seconds": 25.0}
-        self.assertGreaterEqual(fc.budget_spent(s, {"budget_clock": "wall"}),
-                                fc.budget_spent(s, {"budget_clock": "fuzz"}))
+        self.assertGreaterEqual(fc.budget_spent(s, {"clock": "wall"}),
+                                fc.budget_spent(s, {"clock": "fuzz"}))
 
     def test_budget_spent_while_triaging_finishes_the_job_then_advances(self):
         """A job is not abandoned half-way when the budget runs out (that used to
@@ -819,8 +819,8 @@ class ClockTest(unittest.TestCase):
         s.update({"phase": "triaging", "triage_job": "camp_t1",
                   "triage_bug_sig": "S", "active_seconds": 3600.0,
                   "triage_seconds": 3600.0})
-        d = dict(fc.DEFAULTS, budget_clock="wall", loop=False,
-                 items=[{"config": "/x.cfg", "budget_seconds": 7200}], name="camp")
+        d = dict(fc.DEFAULTS, clock="wall", loop=False,
+                 items=[{"config": "/x.cfg", "max_hours": 2}], name="camp")
         advanced, commits = [], []
 
         def finish(st, dd):
@@ -854,8 +854,8 @@ class ClockTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update({"phase": "triaging", "triage_job": "camp_t1",
                   "triage_bug_sig": "S", "active_seconds": 60.0})
-        d = dict(fc.DEFAULTS, budget_clock="wall",
-                 items=[{"config": "/x.cfg", "budget_seconds": 7200}], name="camp")
+        d = dict(fc.DEFAULTS, clock="wall",
+                 items=[{"config": "/x.cfg", "max_hours": 2}], name="camp")
         advanced = []
 
         def stop_after_one(st, dd):
@@ -1038,7 +1038,7 @@ class ClockTest(unittest.TestCase):
         s = {"prep_seconds": 7.0, "active_seconds": 100.0, "triage_seconds": 20.0,
              "overhead_seconds": 5.0}
         self.assertEqual(fc.wall_seconds(s), 132.0)
-        self.assertEqual(fc.budget_spent(s, {"budget_clock": "fuzz"}), 100.0)
+        self.assertEqual(fc.budget_spent(s, {"clock": "fuzz"}), 100.0)
 
     def test_triage_advance_cut_by_a_panic_is_split_at_the_last_probe(self):
         """Up to the crashing probe is minimization; after it, rebooting."""
@@ -1461,7 +1461,7 @@ class BreakerTest(unittest.TestCase):
 
     def _run(self, s, items):
         d = dict(fc.DEFAULTS, name="camp",
-                 items=[{"config": c, "budget_seconds": 3600} for c in items])
+                 items=[{"config": c, "max_hours": 1} for c in items])
         started = []
 
         def fake_ensure(st, cfg, dd=None):
@@ -1515,7 +1515,7 @@ class BreakerTest(unittest.TestCase):
                        "127.0.0.1:56741: bind: address already in use\n")
         s = fc.init_state("camp")
         d = dict(fc.DEFAULTS, name="camp",
-                 items=[{"config": "/a.cfg", "budget_seconds": 3600}])
+                 items=[{"config": "/a.cfg", "max_hours": 1}])
         dead = {"found": True, "pid_alive": False, "run_log": str(log),
                 "run_started_epoch": 100.0, "last_activity_epoch": 102.0,
                 "boot_epoch": 1}
@@ -1752,7 +1752,7 @@ class StatusWatchTest(unittest.TestCase):
         with mock.patch.object(fc, "STATE_DIR", self.dir / "state"), \
              mock.patch.object(fc, "load_def",
                                lambda n: dict(fc.DEFAULTS, items=[
-                                   {"config": str(cfg), "budget_seconds": 3600}],
+                                   {"config": str(cfg), "max_hours": 1}],
                                    name=n)), \
              mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
              mock.patch.object(fc, "free_gb", lambda: 100.0):
@@ -1772,7 +1772,7 @@ class StatusWatchTest(unittest.TestCase):
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "load_def",
                                lambda n: dict(fc.DEFAULTS, items=[
-                                   {"config": str(cfg), "budget_seconds": 3600}],
+                                   {"config": str(cfg), "max_hours": 1}],
                                    name=n)), \
              mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
              mock.patch.object(fc, "free_gb", lambda: 100.0):
@@ -1874,7 +1874,9 @@ class NewPlanTest(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self._tmp.name)
+        # resolved: on macOS the temp dir is a /var -> /private/var symlink, and
+        # `new` stores resolved config paths
+        self.dir = Path(self._tmp.name).resolve()
         (self.dir / "campaigns").mkdir()
         self._patches = [mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"),
                          mock.patch.object(fc, "STATE_DIR", self.dir / "state"),
@@ -1901,7 +1903,7 @@ class NewPlanTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_new("c", [cfg], 1.5, repeat=2, max_crashes=7)
         cdir = self.dir / "campaigns" / "c"
-        plan = json.loads((cdir / "plan.json").read_text())
+        plan = json.loads((cdir / "campaign.json").read_text())
         self.assertEqual([it["config"] for it in plan["items"]], [cfg, cfg])
         self.assertEqual(json.loads((cdir / "state.json").read_text())["status"], "new")
         self.assertTrue((cdir / "README.md").exists())
@@ -1911,6 +1913,55 @@ class NewPlanTest(unittest.TestCase):
         self.assertEqual(plan["limits"], {"max_crashes": 7})     # only what was given
         self.assertNotIn("triage", plan)
         self.assertFalse(plan["defaults"]["reuse_known_culprits"])
+
+    def test_load_def_is_the_campaign_itself_with_the_runner_settings_resolved(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.5, clock="wall", max_crashes=7,
+                       reuse_known_culprits=True)
+        d = fc.load_def("c")
+        # one shape: what campaign.json says stays where it says it
+        self.assertEqual(d["clock"], "wall")
+        self.assertEqual(fc.budget_clock(d), "wall")
+        self.assertEqual(d["items"][0]["max_hours"], 1.5)
+        self.assertNotIn("budget_seconds", d["items"][0])
+        self.assertEqual(fc.budget_seconds(d["items"][0]), 5400.0)
+        self.assertIs(d["defaults"]["reuse_known_culprits"], True)
+        self.assertNotIn("budget_clock", d)
+        # the runner's settings: DEFAULTS, overridden by the campaign's limits
+        self.assertEqual(d["max_crashes"], 7)
+        self.assertEqual(d["poll_seconds"], fc.DEFAULTS["poll_seconds"])
+
+    def test_a_campaign_from_before_the_rename_is_read_from_plan_json(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 2.0)
+        cdir = self.dir / "campaigns" / "c"
+        (cdir / "campaign.json").rename(cdir / "plan.json")
+        self.assertEqual(fc.campaign_path("c"), cdir / "plan.json")
+        self.assertEqual(fc.load_def("c")["layout"], "plan")
+        self.assertEqual(fc.load_def("c")["items"][0]["max_hours"], 2.0)
+        # both present (should not happen): campaign.json is the one read
+        (cdir / "campaign.json").write_text((cdir / "plan.json").read_text())
+        self.assertEqual(fc.campaign_path("c"), cdir / "campaign.json")
+
+    def test_a_legacy_definition_is_read_in_the_campaign_shape(self):
+        cfg = self._cfg("AppleX_gram")
+        cfg2 = self._cfg("AppleX_sel")
+        (self.dir / "campaigns" / "old.json").write_text(json.dumps(
+            {"configs": [cfg, {"config": cfg2, "budget_hours": 3}], "budget_hours": 2,
+             "budget_clock": "fuzz", "max_crashes": 5, "poll_seconds": 60,
+             "triage": {"kext_id": 2}, "loop": True}))
+        d = fc.load_def("old")
+        self.assertEqual(d["layout"], "legacy")
+        self.assertEqual(d["clock"], "fuzz")
+        self.assertEqual([it["max_hours"] for it in d["items"]], [2, 3])
+        self.assertEqual([it["id"] for it in d["items"]], ["AppleX_gram-1", "AppleX_sel-1"])
+        # its runner overrides are limits now, and resolved like any campaign's
+        self.assertEqual(d["limits"]["poll_seconds"], 60)
+        self.assertEqual((d["max_crashes"], d["poll_seconds"]), (5, 60))
+        self.assertEqual(d["triage"], {"kext_id": 2})
+        self.assertNotIn("loop", d["limits"])
 
     def test_plan_check_shows_drift_and_strict_fails_on_it(self):
         (self.dir / "box.json").write_text(json.dumps({"procs": 1, "target": "darwin/arm64"}))
@@ -1931,15 +1982,15 @@ class NewPlanTest(unittest.TestCase):
                 fc.cmd_new("c", [cfg], 1.0)                 # exists: refused
             fc.cmd_new("c2", [], copy="c", repeat=1)         # same experiment, new name
             # a flag given alongside --copy wins, even one equal to its default
-            fc.cmd_new("c3", [], copy="c", max_hours=fc.DEFAULTS["budget_hours"])
-        plan2 = json.loads((self.dir / "campaigns" / "c2" / "plan.json").read_text())
+            fc.cmd_new("c3", [], copy="c", max_hours=fc.planlib.DEFAULTS["max_hours"])
+        plan2 = json.loads((self.dir / "campaigns" / "c2" / "campaign.json").read_text())
         self.assertEqual([it["config"] for it in plan2["items"]], [cfg])
         self.assertEqual(plan2["name"], "c2")
         self.assertEqual(plan2["description"], "copy of c: first run")
         self.assertEqual(plan2["defaults"]["max_hours"], 12.0)    # --copy keeps the original's
         self.assertIs(plan2["watch_window"], False)              # ... all of it
-        plan3 = json.loads((self.dir / "campaigns" / "c3" / "plan.json").read_text())
-        self.assertEqual(plan3["defaults"]["max_hours"], fc.DEFAULTS["budget_hours"])
+        plan3 = json.loads((self.dir / "campaigns" / "c3" / "campaign.json").read_text())
+        self.assertEqual(plan3["defaults"]["max_hours"], fc.planlib.DEFAULTS["max_hours"])
         self.assertIs(plan3["watch_window"], False)
         # legacy campaigns are read-only: install refuses, status still reads them
         (self.dir / "campaigns" / "old.json").write_text(json.dumps({"configs": [cfg]}))
@@ -1951,7 +2002,7 @@ class NewPlanTest(unittest.TestCase):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_new("c", [cfg], 1.0, description="Does grammar X beat Y on FDE?")
-        self.assertEqual(json.loads((self.dir / "campaigns" / "c" / "plan.json").read_text())["description"],
+        self.assertEqual(json.loads((self.dir / "campaigns" / "c" / "campaign.json").read_text())["description"],
                          "Does grammar X beat Y on FDE?")
         readme = self.dir / "campaigns" / "c" / "README.md"
         text = readme.read_text()
@@ -2069,8 +2120,8 @@ class PlanLayoutTest(unittest.TestCase):
 
     def _def(self):
         return dict(fc.DEFAULTS, layout="plan", name="camp",
-                    items=[{"id": "AppleSMC_gram-1", "config": str(self.cfg), "budget_seconds": 3600},
-                           {"id": "AppleSMC_gram-2", "config": str(self.cfg), "budget_seconds": 3600}])
+                    items=[{"id": "AppleSMC_gram-1", "config": str(self.cfg), "max_hours": 1},
+                           {"id": "AppleSMC_gram-2", "config": str(self.cfg), "max_hours": 1}])
 
     def _item(self, n=1):
         return {"id": "AppleSMC_gram-%d" % n, "config": str(self.cfg)}
@@ -2127,7 +2178,7 @@ class PlanLayoutTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update(current_config=str(eff), current_item="AppleSMC_gram-1",
                  incidents=[{"kind": "crash", "config": str(eff)}])
-        d = dict(self._def(), reuse_known_culprits=True)
+        d = dict(self._def(), defaults={"reuse_known_culprits": True})
         with mock.patch.object(fc, "route_bug_registry", lambda *a, **k: ["BUG-0001"]), \
              mock.patch.object(fc, "latest_panic_signature", lambda st: "S1"), \
              mock.patch.object(fc, "known_culprit", lambda sig: {"bug_id": "BUG-0001", "job": "j",
@@ -2186,7 +2237,7 @@ class PlanLayoutTest(unittest.TestCase):
         s = fc.init_state("camp")
         started = []
         with mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, layout="legacy", name="camp",
-                                                                 items=[{"config": str(self.cfg), "budget_seconds": 1}])), \
+                                                                 items=[{"config": str(self.cfg), "max_hours": 1 / 3600}])), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "ensure_running", lambda *a, **k: started.append(a)):
             fc.cmd_run("camp")
@@ -2253,15 +2304,15 @@ class RealClock(unittest.TestCase):
         stamp = datetime.fromtimestamp(
             time.time() - 5400, timezone.utc).astimezone().isoformat()
         s = self._state(stamp, active_seconds=60.0)
-        d = {"budget_clock": "real"}
+        d = {"clock": "real"}
         self.assertAlmostEqual(fc.budget_spent(s, d), 5400, delta=5)
         # the other clocks see only the minute that was actually spent
-        self.assertEqual(fc.budget_spent(s, {"budget_clock": "fuzz"}), 60.0)
-        self.assertEqual(fc.budget_spent(s, {"budget_clock": "wall"}), 60.0)
+        self.assertEqual(fc.budget_spent(s, {"clock": "fuzz"}), 60.0)
+        self.assertEqual(fc.budget_spent(s, {"clock": "wall"}), 60.0)
 
     def test_missing_stamp_is_zero_not_a_crash(self):
-        self.assertEqual(fc.budget_spent(self._state(None), {"budget_clock": "real"}), 0.0)
-        self.assertEqual(fc.budget_spent(self._state("garbage"), {"budget_clock": "real"}), 0.0)
+        self.assertEqual(fc.budget_spent(self._state(None), {"clock": "real"}), 0.0)
+        self.assertEqual(fc.budget_spent(self._state("garbage"), {"clock": "real"}), 0.0)
 
     def test_advancing_config_clears_the_origin(self):
         # Each config gets its own window; roll_budget_clocks drops the stamp so
@@ -2343,7 +2394,7 @@ class ActivityTest(unittest.TestCase):
         with mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "load_def",
                                lambda n: dict(fc.DEFAULTS, items=[
-                                   {"config": str(cfg), "budget_seconds": 3600}],
+                                   {"config": str(cfg), "max_hours": 1}],
                                    name=n)), \
              mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
              mock.patch.object(fc, "free_gb", lambda: 100.0), \
@@ -2419,7 +2470,7 @@ class ActivityTest(unittest.TestCase):
     def test_a_campaign_is_new_until_the_driver_first_runs_it(self):
         s = fc.init_state("camp")
         self.assertEqual((s["status"], s["phase"]), ("new", None))
-        d = dict(fc.DEFAULTS, name="camp", items=[{"config": "/a.cfg", "budget_seconds": 1}])
+        d = dict(fc.DEFAULTS, name="camp", items=[{"config": "/a.cfg", "max_hours": 1 / 3600}])
         with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
              mock.patch.object(fc, "RUN_DIR", self.state_dir), \
              mock.patch.object(fc, "load_def", lambda n: d), \
@@ -2572,7 +2623,7 @@ class HaltedHeadlineTest(unittest.TestCase):
             with mock.patch.object(fc, "STATE_DIR", d / "state"), \
                  mock.patch.object(fc, "load_state", lambda n: s), \
                  mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                     {"config": str(cfg), "max_hours": 1}], name=n)), \
                  mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(False)):
@@ -2607,8 +2658,8 @@ class StopPlanTest(unittest.TestCase):
     """What is left of the current config's budget, named by its clock."""
 
     def _d(self, clock="fuzz", hours=24):
-        return dict(fc.DEFAULTS, budget_clock=clock,
-                    items=[{"config": "/c/cfg.cfg", "budget_seconds": hours * 3600}])
+        return dict(fc.DEFAULTS, clock=clock,
+                    items=[{"config": "/c/cfg.cfg", "max_hours": hours}])
 
     def test_fuzz_clock_counts_fuzzing_left(self):
         s = fc.init_state("camp")
@@ -2647,8 +2698,8 @@ class StopPlanTest(unittest.TestCase):
                  mock.patch.object(fc, "CAMPAIGN_DIR", camps), \
                  mock.patch.object(fc, "load_state", lambda n: s), \
                  mock.patch.object(fc, "load_def", lambda n: dict(
-                     fc.DEFAULTS, budget_clock="fuzz", items=[
-                         {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                     fc.DEFAULTS, clock="fuzz", items=[
+                         {"config": str(cfg), "max_hours": 1}], name=n)), \
                  mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(False)), \
@@ -2687,7 +2738,7 @@ class BasicBlocksTest(unittest.TestCase):
         with mock.patch.object(fc, "STATE_DIR", cfg.parent / "state"), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                 {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 {"config": str(cfg), "max_hours": 1}], name=n)), \
              mock.patch.object(fc, "inspect", lambda sid: live), \
              mock.patch.object(fc, "free_gb", lambda: 100.0), \
              mock.patch.object(fc, "style", type(fc.style)(False)):
@@ -2782,7 +2833,7 @@ class AnomalyColourTest(unittest.TestCase):
             with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
                  mock.patch.object(fc, "load_state", lambda n: s), \
                  mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                     {"config": str(cfg), "max_hours": 1}], name=n)), \
                  mock.patch.object(fc, "inspect", lambda sid: live), \
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(True)):
@@ -2882,7 +2933,7 @@ class ManagerRowTest(unittest.TestCase):
             with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
                  mock.patch.object(fc, "load_state", lambda n: s), \
                  mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                     {"config": str(cfg), "max_hours": 1}], name=n)), \
                  mock.patch.object(fc, "inspect", lambda sid: live), \
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(False)):
@@ -3015,7 +3066,7 @@ class ProgressSeriesTest(unittest.TestCase):
             with mock.patch.object(fc, "STATE_DIR", Path(tmp) / "state"), \
                  mock.patch.object(fc, "load_state", lambda n: s), \
                  mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                     {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                     {"config": str(cfg), "max_hours": 1}], name=n)), \
                  mock.patch.object(fc, "inspect", lambda sid: live), \
                  mock.patch.object(fc, "free_gb", lambda: 100.0), \
                  mock.patch.object(fc, "style", type(fc.style)(False)):
@@ -3043,7 +3094,7 @@ class SchedulerLoopTest(unittest.TestCase):
 
     def _run(self, s, configs, supervise=None, calls=None):
         d = dict(fc.DEFAULTS, name="camp",
-                 items=[{"config": c, "budget_seconds": 3600} for c in configs])
+                 items=[{"config": c, "max_hours": 1} for c in configs])
         started = []
         calls = calls if calls is not None else []
         n = {"ensure": 0}
@@ -3141,7 +3192,7 @@ class SchedulerLoopTest(unittest.TestCase):
         s = fc.init_state("camp")
         s.update(cursor=1, current_config="/b.cfg", status="running",
                  abandoned=[{"config": "/c.cfg", "reason": "max", "at": None}])
-        d = dict(fc.DEFAULTS, items=[{"config": c, "budget_seconds": 1}
+        d = dict(fc.DEFAULTS, items=[{"config": c, "max_hours": 1 / 3600}
                                      for c in ("/a.cfg", "/b.cfg", "/c.cfg")])
         order = fc.ensure_items(s, d)
         self.assertEqual(order, ["a-1", "b-1", "c-1"])
@@ -3175,7 +3226,7 @@ class SchedulerLoopTest(unittest.TestCase):
         self.assertLess(time.time() - t0, 1)
 
     def test_cmd_request_validates_the_item_and_queues(self):
-        d = dict(fc.DEFAULTS, items=[{"config": "/a.cfg", "budget_seconds": 1}], name="camp")
+        d = dict(fc.DEFAULTS, items=[{"config": "/a.cfg", "max_hours": 1 / 3600}], name="camp")
         with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
              mock.patch.object(fc, "load_def", lambda n: d), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -3195,7 +3246,7 @@ class SchedulerLoopTest(unittest.TestCase):
         with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
              mock.patch.object(fc, "load_state", lambda n: s), \
              mock.patch.object(fc, "load_def", lambda n: dict(fc.DEFAULTS, items=[
-                 {"config": str(cfg), "budget_seconds": 3600}], name=n)), \
+                 {"config": str(cfg), "max_hours": 1}], name=n)), \
              mock.patch.object(fc, "inspect", lambda sid: {"found": False}), \
              mock.patch.object(fc, "free_gb", lambda: 100.0), \
              mock.patch.object(fc, "style", type(fc.style)(False)):
@@ -3243,7 +3294,7 @@ class MigrateTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             fc.cmd_migrate()
         cdir = self.root / "campaigns" / "old"
-        plan = json.loads((cdir / "plan.json").read_text())
+        plan = json.loads((cdir / "campaign.json").read_text())
         self.assertTrue(plan["legacy"])
         self.assertEqual([it["config"] for it in plan["items"]], ["config/X_v.cfg"])
         self.assertEqual(plan["limits"], {"max_crashes": 5})

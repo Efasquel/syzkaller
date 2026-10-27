@@ -247,16 +247,18 @@ ok "$camp_n legacy definition(s); campaigns/<name>/ and .state left alone (fuzz-
 # --- plans: the inputs of the new layout (plans reference configs by repo-relative
 # path, which resolves against the fuzz tree's own root -- no rewriting) --------
 step "campaigns"
-# A campaign's plan.json and README.md are tracked inputs; the rest of its
+# A campaign's campaign.json and README.md are tracked inputs; the rest of its
 # folder is the box's runtime. Publish only campaigns the box does not have yet
-# (the box's state, logs and README edits are never overwritten).
+# (the box's state, logs and README edits are never overwritten). plan.json is
+# the name before the rename: a box campaign that has one already exists, so a
+# campaign.json beside it -- which the driver would prefer -- is never added.
 camp_new=0
-for pj in "$SRC"/campaigns/*/plan.json; do
-  [ -e "$pj" ] || break
+for pj in "$SRC"/campaigns/*/campaign.json "$SRC"/campaigns/*/plan.json; do
+  [ -e "$pj" ] || continue
   cname="$(basename "$(dirname "$pj")")"
-  if [ ! -e "$DST/campaigns/$cname/plan.json" ]; then
+  if [ ! -e "$DST/campaigns/$cname/campaign.json" ] && [ ! -e "$DST/campaigns/$cname/plan.json" ]; then
     mkdir -p "$DST/campaigns/$cname"
-    cp_atomic "$pj" "$DST/campaigns/$cname/plan.json"
+    cp_atomic "$pj" "$DST/campaigns/$cname/$(basename "$pj")"
     [ -f "$SRC/campaigns/$cname/README.md" ] && cp_atomic "$SRC/campaigns/$cname/README.md" "$DST/campaigns/$cname/README.md"
     camp_new=$((camp_new + 1))
   fi

@@ -132,9 +132,9 @@ So:
   `config new` before this carried them, so rejecting them would reject all of
   them.
 
-- **`config/*.cfg` and `campaigns/<name>/plan.json` are tracked in git.** Once
-  nothing writes into configs they stop churning, so an experiment (plan +
-  configs) is reproducible from a commit. The box's copies are produced by sync and stay
+- **`config/*.cfg` and `campaigns/<name>/campaign.json` are tracked in git.**
+  Once nothing writes into configs they stop churning, so an experiment
+  (campaign + configs) is reproducible from a commit. The box's copies are produced by sync and stay
   untracked there.
 
 ### Format
@@ -194,16 +194,23 @@ So:
 
 ### One kind of thing: the campaign
 
-`new <name> <configs…>` creates `campaigns/<name>/` with `plan.json`,
+`new <name> <configs…>` creates `campaigns/<name>/` with `campaign.json`,
 `state.json` (status `new`) and `README.md`; `install <name>` runs it. There is
-no separate plans directory: the plan lives where it runs, and `plan.json` and
-`README.md` are the two tracked files of a campaign folder (the experiment and
-its write-up), everything else in it being runtime. `new <name2> --copy
-<name>` copies another campaign's plan into a new one, with any flag given
-alongside overriding -- that is how an experiment is run again. The runner
-re-reads `plan.json` at every scheduling step, so it can be edited live:
-append or remove pending items, change their limits. Removing a running item
-is rejected; use `next`.
+no separate plan object: a campaign's definition lives where it runs, and
+`campaign.json` and `README.md` are the two tracked files of a campaign folder
+(the experiment and its write-up), everything else in it being runtime. The
+driver reads the normalized `campaign.json` as it is -- there is no second,
+flat shape of it. `new <name2> --copy <name>` copies another campaign's
+definition into a new one, with any flag given alongside overriding -- that is
+how an experiment is run again. (A campaign created before the rename has
+`plan.json`, which is read in its place.)
+
+The runner reads `campaign.json` when it starts, so today an edit takes effect
+at the next driver start (on this box, the next panic-reboot). Re-reading it at
+every scheduling step is the intent -- append or remove pending items, change
+their limits -- and is not implemented yet; it must keep the last good
+definition when an edit does not parse. Removing a running item is rejected;
+use `next`.
 
 ### State
 
@@ -236,10 +243,10 @@ visible), `max_crashes` (`abandoned`), or `skip`.
   config/kext_ids.json                     INPUT
   config/<id>.cfg                          INPUT, tracked: the experiments
 
-  campaigns/                               runs; only plan.json and README.md are tracked
+  campaigns/                               runs; only campaign.json and README.md are tracked
     queue.json                             what the box runs (§7) -- phase 3, not yet present
     <name>/                                created by `new`; `install` runs it
-      plan.json                            INPUT, tracked in git (§3)
+      campaign.json                        INPUT, tracked in git (§3)
       README.md                            tracked: the write-up
       state.json
       campaign.log                         the one log to read (§6) -- phase 4; until then
@@ -446,7 +453,8 @@ Only finished campaigns need to survive.
 
 - `fuzz-campaign.py migrate` moves each finished legacy campaign into
   `campaigns/<name>/`:
-  - its definition becomes `plan.json`, one item per config;
+  - its definition becomes `campaign.json`, one item per config, and every
+    runner setting it overrode becomes a `limits` override;
   - its state and coordinator log are moved there;
   - it is marked `legacy: true`, so `run` refuses to resume it.
 - Its `workdir/`, `triage/` jobs and quarantine file stay where they are, and
@@ -469,8 +477,8 @@ Each phase ships alone and leaves the box working.
 2. **Plan, box.json, layout and repeats:**
    - (2a, done 2026-10-23) the plan format, `box.json` as an overlay with
      drift reporting, rendering effective configs, `plan check`, `config lint
-     --strip-box`, and tracking `campaigns/<name>/plan.json` and
-     `config/*.cfg` in git;
+     --strip-box`, and tracking `campaigns/<name>/campaign.json` (named
+     `plan.json` until 2026-10-27) and `config/*.cfg` in git;
    - (2a) the campaign directory grouped by config, items from scratch,
      per-item quarantine and triage, `reuse_known_culprits`;
    - (2b, done 2026-10-26) `bugs/` moved up, `run/`, and `migrate`;

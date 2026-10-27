@@ -36,7 +36,7 @@ Solution: a fuzz-accessible runtime root at **`/Users/Shared/fuzz-run`**
 | `sys/darwin/*.txt` | **copied** (ro) | the syscall descriptions the grammar tools read |
 | `config/*.cfg`, `config/kext_ids.json` | **copied verbatim** (ro) | inputs: nothing writes them at runtime. A legacy config that still bakes an absolute path under the build tree has only those keys repointed |
 | `config/box.json` | **seeded once**, never overwritten | this machine's keys (§Authoring); the box edits its own |
-| `campaigns/<name>/{plan.json,README.md}` | **published once** per campaign the box does not have yet | the experiment and its write-up; the rest of the folder is the box's runtime |
+| `campaigns/<name>/{campaign.json,README.md}` | **published once** per campaign the box does not have yet | the experiment and its write-up; the rest of the folder is the box's runtime |
 | `campaigns/*.json` | **copied** (legacy defs only) | read-only on the box; `migrate` turns them into folders |
 | `kernel_obj` = `/Users/wan/KernelCollections/` | **left in place** | already `0755`/`0644`, fuzz-readable — avoids a 120 MB copy |
 | `bluetoothd` (repo root) | **not copied** | a renamed `syz-executor`; `executor_binary()` derives it at runtime |
@@ -146,8 +146,9 @@ Safe to re-run mid-campaign:
   is `wheel`, which would leave `fuzz` with `r-x` and no way to write state);
 - a config that no longer parses as JSON is skipped with a warning rather than
   aborting the publish;
-- `config/box.json` and a campaign's `plan.json` + `README.md` are published only
-  when the box does not have them: the box's copies are the ones that ran.
+- `config/box.json` and a campaign's `campaign.json` + `README.md` are published
+  only when the box does not have them: the box's copies are the ones that ran.
+  A box campaign that still has the old `plan.json` counts as present.
 
 ### Seeding the bug ledger (first publish only)
 
@@ -170,9 +171,9 @@ not exist, and sync creates `bugs/`, so copy to the new path.
 
 ## Authoring the campaign
 
-A campaign is `campaigns/<name>/`: a **plan** (`plan.json`, which hand-written
-configs to run and for how long), its state, and a README. `new` creates it;
-`install` runs it. The plan and the README are tracked in git with the configs
+A campaign is `campaigns/<name>/`: its definition (`campaign.json`, which
+hand-written configs to run and for how long), its state, and a README. `new`
+creates it; `install` runs it. The definition and the README are tracked in git with the configs
 they name -- the experiment and its write-up -- while the rest of the folder
 (corpora, logs, cores) is the box's runtime and ignored.
 

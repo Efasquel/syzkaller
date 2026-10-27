@@ -113,9 +113,11 @@ PANIC_DIRS = [
 ]
 CORE_GLOBS = ("*.kernel.core.gz", "*.kernel.core.log")
 
+# The runner's settings. A campaign overrides any of them in its `limits`; what
+# a campaign itself says (clock, max_hours, items) is lib/plan's format, with its
+# defaults there.
 DEFAULTS = {
-    "budget_hours": 6.0,
-    "poll_seconds": 600,       # how often to check exec total (10 min)
+    "poll_seconds": 600,      # how often to check exec total (10 min)
     "hang_after_seconds": 1800,  # frozen this long with manager alive => hang
     # Incidents (crash + hang) on ONE config before that config is abandoned and
     # the campaign moves to the next. It used to count the whole campaign and
@@ -151,8 +153,8 @@ DEFAULTS = {
     # on an error; this is a breather, not a wait for anything. It used to be
     # poll_seconds (10 min), uninterruptible, and on no clock at all.
     "triage_retry_seconds": 30,
-    # Which clock --max-hours measures. The default is lib/plan.DEFAULT_CLOCK;
-    # this copy is what a legacy campaigns/<name>.json gets when it says nothing.
+    # The clocks a campaign's `clock` can name (the default is
+    # lib/plan.DEFAULT_CLOCK); budget_spent reads them:
     #   "real"  -- elapsed time since the item started, counting EVERYTHING:
     #              halts, reboots, the machine being off. The only clock that
     #              answers "start at 2pm, stop at 4pm", because it is the only
@@ -169,7 +171,6 @@ DEFAULTS = {
     #              waits on RPC. For that figure use `runstats.py show`, which
     #              reads syz-manager's own counter.
     # real >= wall >= fuzz always.
-    "budget_clock": planlib.DEFAULT_CLOCK,
     # Cap on the launchd-captured log. One real campaign produced 7.0MB across
     # 119,299 lines, of which 33,267 were per-probe minimizer chatter -- the
     # coordinator's own decisions were unreadable inside it, and `tail -f` on the
@@ -355,9 +356,14 @@ def real_seconds(s):
     return max(0.0, time.time() - t0)
 
 
+def budget_clock(d):
+    """The clock the campaign's budgets are on (see the note in DEFAULTS)."""
+    return d.get("clock") or planlib.DEFAULT_CLOCK
+
+
 def budget_spent(s, d):
-    """The clock --budget is measured against (see DEFAULTS["budget_clock"])."""
-    clock = d.get("budget_clock")
+    """How much of the current item's budget is spent, on budget_clock(d)."""
+    clock = budget_clock(d)
     if clock == "real":
         return real_seconds(s)
     return wall_seconds(s) if clock == "wall" else s.get("active_seconds", 0.0)
@@ -491,10 +497,10 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
-# A campaign is campaigns/<name>/: plan.json (what to run; tracked in git with
-# the README, the rest of the folder is runtime), state.json, README.md, then
-# one folder per config and one per item. `new` creates it, `new --copy`
-# copies another campaign's plan into a new one, `install` runs it. A legacy
+# A campaign is campaigns/<name>/: campaign.json (what to run; tracked in git
+# with the README, the rest of the folder is runtime), state.json, README.md,
+# then one folder per config and one per item. `new` creates it, `new --copy`
+# copies another campaign's definition into a new one, `install` runs it. A legacy
 # campaign is campaigns/<name>.json plus .state/<name>.json; it is read-only
 # now -- status, list, replay work, run and install refuse -- until `migrate`.
 BOX_PATH = REPO_ROOT / "config" / "box.json"
@@ -504,18 +510,21 @@ def campaign_dir(name):
     return CAMPAIGN_DIR / name
 
 
-def plan_path(name):
-    """The campaign's plan: what it runs. The tool never rewrites it; you may
-    (append or change pending items), and the runner re-reads it every pass."""
-    return campaign_dir(name) / "plan.json"
+def campaign_path(name):
+    """The campaign's definition, campaign.json: what it runs. The tool never
+    rewrites it; you may (append or change pending items). A campaign created
+    before the rename still has plan.json, which is read in its place."""
+    path = campaign_dir(name) / "campaign.json"
+    old = campaign_dir(name) / "plan.json"
+    return old if (old.exists() and not path.exists()) else path
 
 
 def is_plan_layout(name):
-    return plan_path(name).exists()
+    return campaign_path(name).exists()
 
 
 def def_path(name):
-    return plan_path(name) if is_plan_layout(name) else CAMPAIGN_DIR / ("%s.json" % name)
+    return campaign_path(name) if is_plan_layout(name) else CAMPAIGN_DIR / ("%s.json" % name)
 
 
 def state_path(name):
@@ -602,42 +611,64 @@ def inspect(sid):
 
 
 # --- campaign definition + state ---------------------------------------------
+def legacy_campaign(name, d):
+    """A legacy campaigns/<name>.json in the campaign.json format, marked legacy.
+
+    `migrate` writes this out; load_def reads an un-migrated campaign through it,
+    so the rest of the driver only ever sees one shape. Every legacy top-level
+    key that overrode a runner setting (poll_seconds, results_repo ...) becomes
+    a `limits` override, which is what limits are; per-config budget_hours
+    becomes the item's max_hours."""
+    items = []
+    for c in d.get("configs") or []:
+        if isinstance(c, str):
+            items.append({"config": c})
+        else:
+            it = {"config": c["config"]}
+            if "budget_hours" in c:
+                it["max_hours"] = c["budget_hours"]
+            items.append(it)
+    camp = {"name": name, "legacy": True,
+            "clock": d.get("budget_clock", planlib.DEFAULT_CLOCK),
+            "defaults": {"max_hours": d.get("budget_hours", planlib.DEFAULTS["max_hours"])},
+            "items": items,
+            "limits": {k: v for k, v in d.items() if k in DEFAULTS},
+            "watch_window": d.get("watch_window", True)}
+    if d.get("triage"):
+        camp["triage"] = d["triage"]
+    return camp
+
+
 def load_def(name):
+    """The campaign as the driver reads it: campaign.json normalized by
+    lib/plan (defaults filled, ids assigned, configs resolved), with the runner's
+    settings resolved at the top level -- DEFAULTS overridden by the campaign's
+    `limits`. There is one shape: items keep `max_hours` (budget_seconds()
+    converts), the clock stays `clock`, the defaults stay under `defaults`."""
     if is_plan_layout(name):
         try:
-            p = planlib.normalize(planlib.load_plan(plan_path(name)), REPO_ROOT)
+            raw = planlib.load_plan(campaign_path(name))
         except ValueError as e:
             die("campaign %r: %s" % (name, e))
-        merged = dict(DEFAULTS)
-        merged.update(planlib.plan_to_def(p))
-        merged["layout"] = "legacy" if p.get("legacy") else "plan"
-        merged["plan"] = p
-        merged["name"] = name
-        return merged
-    d = read_json(def_path(name))
-    if d is None:
-        die("no campaign %r (looked in %s)" % (name, def_path(name)))
-    merged = dict(DEFAULTS)
-    merged.update(d)
-    merged["layout"] = "legacy"
-    # Normalise configs to [{config, budget_seconds}] with per-item override.
-    items = []
-    for c in merged["configs"]:
-        if isinstance(c, str):
-            cfg, hours = c, merged["budget_hours"]
-        else:
-            cfg, hours = c["config"], c.get("budget_hours", merged["budget_hours"])
-        cfg_abs = cfg if os.path.isabs(cfg) else str(REPO_ROOT / cfg)
-        if not Path(cfg_abs).exists():
-            die("campaign %r references missing config: %s" % (name, cfg_abs))
-        items.append({"config": cfg_abs, "budget_seconds": float(hours) * 3600})
-    # Items have a stable identity: <config-id>-1, -2 ... per distinct config, so
-    # state is keyed by id and not by position in this list.
-    for it, iid in zip(items, schedule.item_ids([it["config"] for it in items])):
-        it["id"] = iid
-    merged["items"] = items
-    merged["name"] = name
-    return merged
+    else:
+        old = read_json(CAMPAIGN_DIR / ("%s.json" % name))
+        if old is None:
+            die("no campaign %r (looked in %s)" % (name, campaign_path(name)))
+        raw = legacy_campaign(name, old)
+    try:
+        camp = planlib.normalize(raw, REPO_ROOT)
+    except ValueError as e:
+        die("campaign %r: %s" % (name, e))
+    d = dict(DEFAULTS)
+    d.update(camp["limits"])
+    d.update(camp)
+    d["layout"] = "legacy" if camp.get("legacy") else "plan"
+    return d
+
+
+def budget_seconds(item):
+    """An item's budget on the campaign's clock, in seconds."""
+    return float(item["max_hours"]) * 3600
 
 
 def init_state(name):
@@ -1000,8 +1031,8 @@ def stop_plan(s, d):
     if s.get("status") in ("halted", "done") or not d["items"]:
         return None
     item = d["items"][min(s["cursor"], len(d["items"]) - 1)]
-    clock = d.get("budget_clock", DEFAULTS["budget_clock"])
-    budget = item["budget_seconds"]
+    clock = budget_clock(d)
+    budget = budget_seconds(item)
     left = max(0.0, budget - budget_spent(s, d))
     if clock == "real":
         # The only clock that names a moment: it runs through halts and reboots.
@@ -1757,7 +1788,7 @@ def start_queued_triage(s, d):
         if item.get("config") != s.get("current_config"):
             log("dropping queued triage of %s: queued under another config" % sig)
             continue
-        budget = d["items"][min(s["cursor"], len(d["items"]) - 1)]["budget_seconds"]
+        budget = budget_seconds(d["items"][min(s["cursor"], len(d["items"]) - 1)])
         if budget_spent(s, d) >= budget:
             log("dropping queued triage of %s: the budget is spent (program %s; it is "
                 "SUSPECT, so a recurrence will still be triaged)" % (sig, item["program"]))
@@ -2046,7 +2077,7 @@ def handle_crash(s, d, info):
         inc["decision"] = "exhausted (%s)" % ((s.get("exhausted_why") or {}).get(sig)
                                               or "no-repro")
         return False
-    if d.get("reuse_known_culprits") and s.get("current_config"):
+    if (d.get("defaults") or {}).get("reuse_known_culprits") and s.get("current_config"):
         known = known_culprit(sig)
         if known:
             # The one-off rule guards against a crash that would not reproduce;
@@ -2534,8 +2565,8 @@ def cmd_run(name):
     set_activity(s, "booting", "reconciling the last boot")
     log("campaign %r starting: %d item(s), %s of %s clock, phase=%s"
         % (name, len(d["items"]),
-           "/".join(sorted({fmt_hms(it["budget_seconds"]) for it in d["items"]})),
-           d.get("budget_clock", DEFAULTS["budget_clock"]), s["phase"]))
+           "/".join(sorted({fmt_hms(budget_seconds(it)) for it in d["items"]})),
+           budget_clock(d), s["phase"]))
     # Where the ledgers live. The bug inventory is shared by every campaign on
     # purpose -- see the note on BUGS_DIR; the rest is per item.
     log("  bug inventory : %s" % BUGS_DIR)
@@ -2617,9 +2648,9 @@ def cmd_run(name):
             # A job is not abandoned half-way when the budget runs out: it is
             # finished (still bounded by triage_max_boots), its result benched,
             # and the item ended after -- see the budget check below.
-            if item and budget_spent(s, d) >= item["budget_seconds"]:
+            if item and budget_spent(s, d) >= budget_seconds(item):
                 log("budget spent (%s clock) while triaging %s; finishing the job, "
-                    "then moving on" % (d.get("budget_clock"), s.get("triage_job")))
+                    "then moving on" % (budget_clock(d), s.get("triage_job")))
             advance_triage(s, d)
             if s["status"] == "halted":
                 return
@@ -2655,7 +2686,7 @@ def cmd_run(name):
             continue
 
         item = next(it for it in def_items(d) if it["id"] == step.item)
-        budget = item["budget_seconds"]
+        budget = budget_seconds(item)
         rec = s["items"][item["id"]]
         was_running = rec["status"] == "running"
         s["current_item"] = item["id"]
@@ -2688,7 +2719,7 @@ def cmd_run(name):
         log("item %s: %s (%.0f min left of %.1fh %s budget; so far: prep %s, fuzz %s, "
             "triage %s, reboots %s)"
             % (item["id"], config_id(cfg), (budget - budget_spent(s, d)) / 60, budget / 3600,
-               d.get("budget_clock", DEFAULTS["budget_clock"]),
+               budget_clock(d),
                fmt_hms(s.get("prep_seconds")), fmt_hms(s.get("active_seconds")),
                fmt_hms(s.get("triage_seconds")), fmt_hms(s.get("overhead_seconds"))))
         try:
@@ -2795,9 +2826,9 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
             min_free_gb=None, crashloop_limit=None, crashloop_min_execs=None,
             triage_max_boots=None, max_plateau_hours=None, reuse_known_culprits=None,
             watch_window=None, force=False, strict=False, description=None, copy=None):
-    """Create campaigns/<name>/: plan.json, state.json (new), README.md.
+    """Create campaigns/<name>/: campaign.json, state.json (new), README.md.
 
-    The plan references hand-written configs; it does not run them -- `install`
+    The campaign references hand-written configs; it does not run them -- `install`
     does. Listing a config several times (or --repeat) is how a config is run
     several times, each from scratch; ids are derived when the plan is read
     (<config>-1, -2). --copy <campaign> starts from another campaign's plan
@@ -2816,7 +2847,7 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
     if copy:
         if not is_plan_layout(copy):
             die("no campaign %r to copy from" % copy)
-        plan = planlib.load_plan(plan_path(copy))
+        plan = planlib.load_plan(campaign_path(copy))
         plan.pop("legacy", None)
         plan["name"] = name
         plan["description"] = (description or "").strip() or \
@@ -2828,8 +2859,7 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
             die("give at least one config, or --copy <campaign>")
         plan = {"name": name, "description": (description or "").strip(),
                 "clock": planlib.DEFAULT_CLOCK,
-                "defaults": {"max_hours": DEFAULTS["budget_hours"],
-                             "max_plateau_hours": None, "reuse_known_culprits": False},
+                "defaults": dict(planlib.DEFAULTS),
                 "items": [], "limits": {}, "watch_window": True}
         plan["items"] = [{"config": c} for c in configs for _ in range(max(1, repeat))]
     for c in [it["config"] for it in plan["items"]]:
@@ -2865,7 +2895,7 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
     except ValueError as e:
         die("campaign %r: %s" % (name, e))
     campaign_dir(name).mkdir(parents=True, exist_ok=True)
-    write_json(plan_path(name), plan)
+    write_json(campaign_path(name), plan)
     write_json(state_path(name), init_state(name))
     log("created %s" % campaign_dir(name))
     cmd_plan_check(name, strict=strict)
@@ -2877,11 +2907,11 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
 
 def _plan_source(name):
     if is_plan_layout(name):
-        return plan_path(name)
+        return campaign_path(name)
     if (CAMPAIGN_DIR / ("%s.json" % name)).exists():
-        die("campaign %r is a legacy campaign (campaigns/%s.json); it has no plan to check"
+        die("campaign %r is a legacy campaign (campaigns/%s.json); `migrate` it first"
             % (name, name))
-    die("no campaign %r (campaigns/%s/plan.json)" % (name, name))
+    die("no campaign %r (campaigns/%s/campaign.json)" % (name, name))
 
 
 def cmd_plan_check(name, strict=False):
@@ -2957,7 +2987,7 @@ def readme_block(name, p, box, s=None):
     rows = planlib.check_table(p, box, REPO_ROOT)
     hours = sum(float(r[2]) for r in rows)
     lines = [README_BEGIN,
-             "**Plan** `campaigns/%s/plan.json` (as of %s) -- %d item(s), "
+             "**Campaign** `campaigns/%s/campaign.json` (as of %s) -- %d item(s), "
              "%.1fh total on the `%s` clock%s." % (
                  name, timefmt.fmt(now_iso(), short=True), len(rows),
                  hours, p["clock"],
@@ -3008,7 +3038,7 @@ def write_readme(name, p=None, s=None):
     regeneration (`readme <name>`, or the report later) cannot eat what you
     wrote. Returns the path."""
     if p is None:
-        p = planlib.normalize(planlib.load_plan(plan_path(name)), REPO_ROOT)
+        p = planlib.normalize(planlib.load_plan(campaign_path(name)), REPO_ROOT)
     box = planlib.load_box(BOX_PATH)
     block = readme_block(name, p, box, s)
     path = campaign_dir(name) / "README.md"
@@ -3046,7 +3076,7 @@ def cmd_migrate(strip_disable_syscalls=False, dry_run=False):
     """Move finished legacy campaigns into the campaign folder layout, and the
     bug ledger up to <tree>/bugs. Refuses while any driver runs.
 
-    A legacy campaign becomes campaigns/<name>/ with plan.json (one item per
+    A legacy campaign becomes campaigns/<name>/ with campaign.json (one item per
     config, marked legacy so `run` refuses it), its state and coordinator logs
     moved beside it, and its old definition kept as legacy-def.json. Its
     workdirs, quarantine files and triage jobs stay where they are -- the state
@@ -3071,22 +3101,16 @@ def cmd_migrate(strip_disable_syscalls=False, dry_run=False):
         if st and st.get("status") == "running":
             log("skip %s: its state says running; halt it first" % name)
             continue
-        configs = [c if isinstance(c, str) else c["config"] for c in d.get("configs") or []]
-        plan = {"name": name, "legacy": True,
-                "description": "migrated from campaigns/%s.json on %s; read-only" % (name, now_iso()),
-                "clock": d.get("budget_clock", DEFAULTS["budget_clock"]),
-                "defaults": {"max_hours": d.get("budget_hours", DEFAULTS["budget_hours"])},
-                "items": [{"config": c} for c in configs],
-                "limits": {k: d[k] for k in ("max_crashes", "min_free_gb", "crashloop_limit",
-                                             "crashloop_min_execs", "triage_max_boots") if k in d}}
+        camp = legacy_campaign(name, d)
+        camp["description"] = "migrated from campaigns/%s.json on %s; read-only" % (name, now_iso())
         log("%smigrate %s: %d config(s) -> campaigns/%s/" % ("would " if dry_run else "", name,
-                                                           len(configs), name))
+                                                           len(camp["items"]), name))
         if dry_run:
             moved.append(name)
             continue
         cdir = campaign_dir(name)
         cdir.mkdir(parents=True, exist_ok=True)
-        write_json(cdir / "plan.json", plan)
+        write_json(cdir / "campaign.json", camp)
         shutil.move(str(old_def), str(cdir / "legacy-def.json"))
         if st is not None:
             shutil.move(str(STATE_DIR / ("%s.json" % name)), str(cdir / "state.json"))
@@ -3864,7 +3888,8 @@ def can_reboot():
 
 def cmd_list():
     CAMPAIGN_DIR.mkdir(parents=True, exist_ok=True)
-    names = sorted({p.parent.name for p in CAMPAIGN_DIR.glob("*/plan.json")}
+    names = sorted({p.parent.name for p in CAMPAIGN_DIR.glob("*/campaign.json")}
+                   | {p.parent.name for p in CAMPAIGN_DIR.glob("*/plan.json")}
                    | {p.stem for p in CAMPAIGN_DIR.glob("*.json") if p.name != "queue.json"})
     if not names:
         print("no campaigns in %s" % CAMPAIGN_DIR)
@@ -5226,7 +5251,7 @@ def main():
     # No argparse defaults on the settings: cmd_new must tell "not given" (keep
     # what --copy brought, else the default) from "given, equal to the default".
     sp.add_argument("--max-hours", "--budget-hours", dest="max_hours", type=float,
-                    help="per item (default %s)" % DEFAULTS["budget_hours"])
+                    help="per item (default %s)" % planlib.DEFAULTS["max_hours"])
     sp.add_argument("--repeat", type=int, default=1, help="list every config N times")
     sp.add_argument("--clock", "--budget-clock", dest="clock", choices=BUDGET_CLOCKS,
                     help="what --max-hours measures: 'real' is elapsed time since the "

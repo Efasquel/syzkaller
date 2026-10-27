@@ -48,7 +48,7 @@ run as. Run as yourself they are noise — it says so in its own output.
 
 ```sh
 /usr/bin/python3 scripts/fuzz-campaign.py new <name> config/<x>.cfg [config/<y>.cfg] \
-    --repeat 3 --max-hours 6 -m "why"       # creates campaigns/<name>/ (plan.json, state, README) + checks it
+    --repeat 3 --max-hours 6 -m "why"       # creates campaigns/<name>/ (campaign.json, state, README) + checks it
 /usr/bin/python3 scripts/fuzz-campaign.py new <name2> --copy <name>    # same experiment, new name; flags given alongside override
 /usr/bin/python3 scripts/fuzz-campaign.py plan check <name> [--strict]
 sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz

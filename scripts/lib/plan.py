@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Plans, and the effective config each of their items runs with.
+"""Campaign definitions, and the effective config each of their items runs with.
 
-A plan (plans/<name>.json, campaign-planning.md §3) is a list of items, each one
-run of one hand-written config/<id>.cfg. The config holds the experiment: the
+A campaign (campaigns/<name>/campaign.json, campaign-planning.md §3) is a list of
+items, each one run of one hand-written config/<id>.cfg. The config holds the experiment: the
 syscall lists, the kext under coverage, the ring buffer. Two other kinds of field
 end up in the file syz-manager actually reads, and they have other owners:
 
@@ -15,8 +15,9 @@ This module is where those three are put together:
 
     effective = box.json ⊕ config ⊕ runtime
 
-and where a plan is turned from what the operator wrote into what the driver
-runs: defaults filled, item ids derived, config paths resolved and checked. It
+and where a campaign.json is turned from what the operator wrote into what the
+driver runs: defaults filled, item ids derived, config paths resolved and
+checked -- `normalize`, whose result the driver reads as it is. It
 is pure over the dicts and paths it is handed. The only file reads are the two
 loaders, `load_plan` and `load_box` (plus `cfgutil.load` for the configs that
 `check_table` has to open to count their syscalls), so everything else can be
@@ -144,8 +145,8 @@ def normalize(plan, root):
     """Return a new plan with defaults filled, ids assigned and configs resolved.
 
     This is the one place the plan format's implicit parts become explicit, so
-    that everything downstream (`plan_to_def`, `item_dir`, `check_table`) reads
-    a complete plan and never defaults anything itself. Relative config paths
+    that everything downstream (the driver's load_def, `item_dir`,
+    `check_table`) reads a complete campaign and never defaults anything itself. Relative config paths
     are relative to `root`, the tree the plan lives in, and are made absolute
     here so the driver can hand them to syz-manager from any directory.
 
@@ -370,37 +371,6 @@ def drift(cfg, box):
 
 
 # --- for the driver and for `plan check` ----------------------------------------
-
-def plan_to_def(plan):
-    """The driver's definition dict from a normalized plan.
-
-    The driver's breaker and budget code reads a flat dict (`d["max_crashes"]`,
-    `d["budget_clock"]`, `item["budget_seconds"]`) and the plan format nests
-    the same values under defaults/limits in hours. This is the adapter, so
-    that code reads a plan without changing. There is no `loop`: a hunt is a
-    long max_hours or the plan queued again.
-    """
-    defaults = plan["defaults"]
-    d = {
-        "name": plan["name"],
-        "items": [
-            {
-                "id": item["id"],
-                "config": item["config"],
-                "budget_seconds": float(item["max_hours"]) * 3600,
-                "max_plateau_hours": item["max_plateau_hours"],
-            }
-            for item in plan["items"]
-        ],
-        "budget_clock": plan["clock"],
-        "watch_window": plan.get("watch_window", True),
-        "reuse_known_culprits": defaults["reuse_known_culprits"],
-        "max_hours": defaults["max_hours"],
-        "max_plateau_hours": defaults["max_plateau_hours"],
-    }
-    d.update(plan["limits"])
-    return d
-
 
 def _hours_text(hours):
     """6 rather than 6.0 in a table column, 1.5 when it is not whole."""

@@ -331,34 +331,34 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(box, box_before)
 
 
-class DefTest(TreeTest):
-    def test_plan_to_def_shape(self):
+class NormalizedShapeTest(TreeTest):
+    def test_the_driver_reads_this_shape_as_it_is(self):
+        # No adapter sits between normalize and the driver any more, so this is
+        # the shape the runner reads: hours stay hours, the clock stays `clock`.
         p = self.plan(clock="wall",
                       defaults={"max_hours": 2, "reuse_known_culprits": True},
                       limits={"max_crashes": 7},
                       items=[{"config": "config/a.cfg"},
                              {"config": "config/b.cfg", "max_hours": 1.5, "max_plateau_hours": 1}])
-        d = pl.plan_to_def(pl.normalize(p, self.root))
-        self.assertEqual(d["name"], "eval")
-        self.assertEqual(d["budget_clock"], "wall")
-        self.assertNotIn("loop", d)
-        self.assertIs(d["watch_window"], True)
-        # `new --no-watch-window` is stored in the plan and reaches the driver
-        off = pl.plan_to_def(pl.normalize(dict(p, watch_window=False), self.root))
+        n = pl.normalize(p, self.root)
+        self.assertEqual(n["name"], "eval")
+        self.assertEqual(n["clock"], "wall")
+        self.assertNotIn("loop", n)
+        self.assertIs(n["watch_window"], True)
+        # `new --no-watch-window` is stored in the campaign and reaches the driver
+        off = pl.normalize(dict(p, watch_window=False), self.root)
         self.assertIs(off["watch_window"], False)
         with self.assertRaises(ValueError):
             pl.normalize(dict(p, watch_window="no"), self.root)
-        self.assertIs(d["reuse_known_culprits"], True)
-        self.assertEqual(d["max_hours"], 2)
-        # Limits sit at top level, where the breaker code already reads them.
-        self.assertEqual(d["max_crashes"], 7)
-        self.assertEqual(d["min_free_gb"], 20.0)
-        self.assertEqual(d["crashloop_limit"], 15)
-        self.assertEqual(d["items"], [
+        self.assertEqual(n["defaults"], {"max_hours": 2, "max_plateau_hours": None,
+                                         "reuse_known_culprits": True})
+        self.assertEqual(n["limits"], {"max_crashes": 7, "min_free_gb": 20.0,
+                                       "crashloop_limit": 15})
+        self.assertEqual(n["items"], [
             {"id": "a-1", "config": str(self.root / "config" / "a.cfg"),
-             "budget_seconds": 7200.0, "max_plateau_hours": None},
+             "max_hours": 2, "max_plateau_hours": None},
             {"id": "b-1", "config": str(self.root / "config" / "b.cfg"),
-             "budget_seconds": 5400.0, "max_plateau_hours": 1},
+             "max_hours": 1.5, "max_plateau_hours": 1},
         ])
 
 
