@@ -587,6 +587,18 @@ def config_id(cfg):
     return Path(cfg).stem
 
 
+def read_cfg(path):
+    """A syz-manager config read as syz-manager reads it -- whole-line `#`
+    comments allowed (cfgutil) -- or None when it cannot be read or parsed.
+    read_json rejects the comments, which made `doctor` call every commented
+    config unreadable. The paths that write a config back (exclude, include)
+    keep read_json: loading the comments away and saving would delete them."""
+    try:
+        return cfgutil.load(path)
+    except (OSError, ValueError):
+        return None
+
+
 # --- driving fuzz-session.py -------------------------------------------------
 def session(*args, capture=False):
     """Run fuzz-session.py <args>. capture=True returns (rc, stdout)."""
@@ -1500,7 +1512,7 @@ def config_triage_flags(cfg):
     Empty when the config has no such settings, so the campaign-level triage
     defaults still apply.
     """
-    conf = read_json(cfg) if cfg else None
+    conf = read_cfg(cfg) if cfg else None
     kc = (conf or {}).get("kext_coverage") or {}
     out = {}
     if kc.get("kext_id") is not None:
@@ -1551,7 +1563,7 @@ def begin_triage(s, d, sig, ring=None):
     # config cannot be read we would silently fall back to the campaign defaults
     # and minimize in the wrong environment -- which produces a confident "nothing
     # reproduces" from a search that never reached the driver. Refuse instead.
-    if cfg_path and read_json(cfg_path) is None:
+    if cfg_path and read_cfg(cfg_path) is None:
         log("cannot triage %s: config %s is unreadable, so triage would run with "
             "unknown device settings (kext_id / executor_name); resuming fuzzing"
             % (sig, cfg_path))
@@ -3183,7 +3195,7 @@ def corpus_facts(cfg):
     to infer from a log line that scrolled past hours ago.
     """
     try:
-        conf = read_json(cfg)
+        conf = read_cfg(cfg)
         wd = (conf or {}).get("workdir")
         if not wd:
             return None
@@ -3688,16 +3700,28 @@ def cmd_doctor(name):
                      "(~220MB each) until the low-disk breaker halts the campaign" % dp)
 
     # Each config in the campaign.
+    box = {}
+    if d.get("layout") == "plan":
+        try:
+            box = planlib.load_box(BOX_PATH)
+        except ValueError as e:
+            add("FAIL", str(e))
     for item in d["items"]:
         cfg = Path(item["config"])
-        conf = read_json(cfg)
+        conf = read_cfg(cfg)
         if conf is None:
-            add("FAIL", "config %s unreadable" % cfg.name)
+            add("FAIL", "config %s unreadable or not valid JSON" % cfg.name)
             continue
         add("OK", "config %s loads" % cfg.name)
-        if not conf.get("target"):
-            add("WARN", "config %s has no \"target\"" % cfg.name)
-        if not conf.get("enable_syscalls"):
+        # A plan item runs box.json ⊕ the config, so judge what syz-manager will
+        # read: `target` normally comes from the box, not the config.
+        view = conf
+        if d.get("layout") == "plan":
+            view = planlib.render(conf, box, "-")[0]
+        if not view.get("target"):
+            add("WARN", "config %s has no \"target\"%s" % (
+                cfg.name, " (neither does box.json)" if view is not conf else ""))
+        if not view.get("enable_syscalls"):
             add("WARN", "config %s has empty enable_syscalls" % cfg.name)
         if d.get("layout") == "plan":
             # Inputs are read-only: the quarantine goes into the rendered copy.
@@ -3731,10 +3755,12 @@ def cmd_doctor(name):
                 else "workdir %s is NOT writable by this user%s" % (probe, here))
 
     # Triage device flags (optional; else triage uses its defaults).
-    tri = d.get("triage") or {}
-    if tri:
-        add("OK", "triage flags: %s" % ", ".join("%s=%s" % kv for kv in tri.items()))
-        kd = tri.get("kcov_device")
+    # Not `tri`: assigning that name here would make it local to the whole
+    # function and hide the triage module (tri.REBOOT_CMD) below.
+    triage_flags = d.get("triage") or {}
+    if triage_flags:
+        add("OK", "triage flags: %s" % ", ".join("%s=%s" % kv for kv in triage_flags.items()))
+        kd = triage_flags.get("kcov_device")
         if kd and not Path(kd).exists():
             add("WARN", "triage.kcov_device %s not present" % kd)
     else:
@@ -4161,7 +4187,7 @@ def startup_hint(name):
         return
     counts = []
     for it in d["items"]:
-        conf = read_json(it["config"]) or {}
+        conf = read_cfg(it["config"]) or {}
         counts.append((config_id(it["config"]),
                        len(conf.get("enable_syscalls") or [])))
     big = max((n for _, n in counts), default=0)

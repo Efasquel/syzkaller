@@ -1932,6 +1932,19 @@ class NewPlanTest(unittest.TestCase):
         self.assertEqual(d["max_crashes"], 7)
         self.assertEqual(d["poll_seconds"], fc.DEFAULTS["poll_seconds"])
 
+    def test_a_commented_config_is_readable_and_keeps_its_triage_flags(self):
+        # syz-manager allows whole-line # comments; read_json does not, and
+        # doctor called every commented config "unreadable".
+        p = self.dir / "Fake_c.cfg"
+        p.write_text('# why this config exists\n{"enable_syscalls": ["getpid"],\n'
+                     '# the kext\n "kext_coverage": {"kext_id": 4}, "executor_name": "x"}\n')
+        self.assertIsNone(fc.read_json(p))
+        self.assertEqual(fc.read_cfg(p)["enable_syscalls"], ["getpid"])
+        self.assertEqual(fc.config_triage_flags(str(p)), {"kext_id": 4, "executor_name": "x"})
+        self.assertIsNone(fc.read_cfg(self.dir / "missing.cfg"))
+        (self.dir / "bad.cfg").write_text("{not json")
+        self.assertIsNone(fc.read_cfg(self.dir / "bad.cfg"))
+
     def test_a_campaign_from_before_the_rename_is_read_from_plan_json(self):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
