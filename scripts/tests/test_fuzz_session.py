@@ -185,6 +185,21 @@ class RpcPortTest(unittest.TestCase):
         with mock.patch.object(fs, "pid_alive", lambda *a, **k: False):
             self.assertIsNone(fs.wait_for_rpc_port(self.log, timeout=30, pid=999))
 
+    def test_gives_up_early_on_a_dead_child_that_is_still_a_zombie(self):
+        """The real case, unmocked: `start` launches the manager as its child,
+        and a child that dies after the first second is a zombie that
+        kill(pid, 0) -- pid_alive -- still calls alive. The wait used to sit
+        out the whole timeout on it (5 minutes for a manager dead at 7s)."""
+        import subprocess
+        import time
+        self.log.write_text("starting\n")
+        child = subprocess.Popen(["/usr/bin/true"])
+        time.sleep(0.3)                          # exited, not yet reaped
+        self.assertTrue(fs.pid_alive(child.pid))  # what fooled the wait
+        t0 = time.time()
+        self.assertIsNone(fs.wait_for_rpc_port(self.log, timeout=60, pid=child.pid))
+        self.assertLess(time.time() - t0, 15)    # the 5s grace, not the 60s timeout
+
     def test_timeout_is_generous_enough_for_a_large_grammar(self):
         """A 91-syscall config took 96s to serve; a 60s cap cost it an hour of
         budget sitting idle with no executor."""

@@ -855,6 +855,21 @@ def fmt_row(cols, widths):
 _RPC_RE = re.compile(r"serving rpc on tcp://(\d+)")
 
 
+def _reaped(pid):
+    """Reap `pid` if it is a child of ours that has exited; True when it had.
+
+    A manager `start` launched is our child until we exit, and a dead child is
+    a zombie: kill(pid, 0) still succeeds on it, so pid_alive called it alive
+    and the wait below sat out the whole RPC_PORT_TIMEOUT on a manager that
+    had died 7s in. A pid that is not our child raises ChildProcessError and
+    is left to pid_alive."""
+    try:
+        done, _ = os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError, ValueError):
+        return False
+    return done == int(pid)
+
+
 def wait_for_rpc_port(logf, timeout=RPC_PORT_TIMEOUT, pid=None):
     """Poll a manager run log for 'serving rpc on tcp://<port>'.
 
@@ -873,7 +888,7 @@ def wait_for_rpc_port(logf, timeout=RPC_PORT_TIMEOUT, pid=None):
                     return int(m.group(1))
         except OSError:
             pass
-        if pid is not None and waited > 5 and not pid_alive(pid):
+        if pid is not None and waited > 5 and (_reaped(pid) or not pid_alive(pid)):
             warn("manager pid %s exited before serving rpc; see the run log" % pid)
             return None
         # A heartbeat, so a long compile reads as progress rather than a stall.
@@ -1767,7 +1782,7 @@ def cmd_start(cfg_arg, executors=None, allow_concurrent=False, force=False):
         start_executors(state, exec_count)
     else:
         # No auto executor: surface the rpc port + a copy-paste runner command.
-        port = wait_for_rpc_port(logf)
+        port = wait_for_rpc_port(logf, pid=proc.pid)
         if port:
             state["rpc_port"] = port
             save_state(state)
