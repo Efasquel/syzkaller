@@ -156,6 +156,7 @@ ok "${#BINS[@]} binary/binaries"
 step "configs"
 cfg_n=0
 for c in "$SRC"/config/*.cfg; do
+  [ -e "$c" ] || break        # no configs: the glob stays literal
   cfg_n=$((cfg_n + 1))
   base="$(basename "$c")"
   /usr/bin/python3 - "$c" "$DST/config/$base" "$OLD_PREFIX" "$NEW_PREFIX" "${C_CYAN:+1}" "$SRC/scripts" <<'PY'
