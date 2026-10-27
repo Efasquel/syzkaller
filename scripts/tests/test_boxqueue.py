@@ -43,6 +43,24 @@ class BoxQueueTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             bq.move(self.path, "zz", 0)
 
+    def test_the_files_are_group_writable_whoever_creates_them(self):
+        """The operator and `fuzz` both write these. mkstemp made the queue
+        0600 and a 022 umask made the lock 0644, so the first writer fenced
+        the other out (and the runner read the operator's requests as [])."""
+        import os
+        import stat
+        from lib import requests as rq
+        old = os.umask(0o022)
+        try:
+            bq.add(self.path, "a")
+            rq.append(Path(self._tmp.name) / "c.requests.json", "next")
+        finally:
+            os.umask(old)
+        for p in (self.path, Path(str(self.path) + ".lock"),
+                  Path(self._tmp.name) / "c.requests.json",
+                  Path(self._tmp.name) / "c.requests.json.lock"):
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o664, p)
+
     def test_finish_moves_the_campaign_to_history(self):
         bq.add(self.path, "a")
         bq.add(self.path, "b")

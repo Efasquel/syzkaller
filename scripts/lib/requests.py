@@ -44,6 +44,23 @@ def _lock_path(path):
     return str(path) + ".lock"
 
 
+# Two accounts write these files: the operator's (the verbs, `queue add`) and
+# `fuzz` (the runner). Both are in the tree's group, so the files are made
+# group-read/writable whoever creates them. mkstemp creates 0600 and a umask of
+# 022 turns 0664 into 0644, and either way the first writer fenced the other
+# out: the runner then read the operator's requests as an empty list.
+SHARED_MODE = 0o664
+
+
+def _share(fd):
+    """Make a file we just opened group-read/writable. Only its owner may change
+    the mode; for anyone else it is already what its creator made it."""
+    try:
+        os.fchmod(fd, SHARED_MODE)
+    except OSError:
+        pass
+
+
 class _locked:
     """Hold an exclusive advisory lock across a read-modify-write of path.
 
@@ -57,7 +74,8 @@ class _locked:
         self._fd = None
 
     def __enter__(self):
-        self._fd = os.open(self._lockfile, os.O_RDWR | os.O_CREAT, 0o644)
+        self._fd = os.open(self._lockfile, os.O_RDWR | os.O_CREAT, SHARED_MODE)
+        _share(self._fd)
         fcntl.flock(self._fd, fcntl.LOCK_EX)
         return self
 
@@ -94,6 +112,7 @@ def _write_atomic(path, records):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
                                prefix=".requests-", suffix=".tmp")
+    _share(fd)
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(records, f, indent=2)
