@@ -83,6 +83,12 @@ BUGS_DIR = bugs_dir()
 # nothing is running; nothing in here is a record.
 RUN_DIR = REPO_ROOT / "run"
 
+
+def queue_path():
+    """The box's campaign queue (lib/boxqueue). A function, not a constant, so
+    it follows CAMPAIGN_DIR wherever that points."""
+    return CAMPAIGN_DIR / "queue.json"
+
 sys.path.insert(0, str(SCRIPT_DIR))
 import crash_fingerprint as cf  # noqa: E402
 import quarantine as qm  # noqa: E402
@@ -91,6 +97,7 @@ from lib import bootinfo  # noqa: E402
 from lib import cfgutil  # noqa: E402
 from lib import plan as planlib  # noqa: E402
 from lib import requests as req  # noqa: E402
+from lib import boxqueue  # noqa: E402
 from lib import schedule  # noqa: E402
 import bug_registry as br  # noqa: E402  (known_culprit; routing still shells out)
 from lib import timefmt  # noqa: E402
@@ -2898,6 +2905,147 @@ def cmd_run(name):
         # policy: restart same item -- loop re-enters ensure_running (resume)
 
 
+# --- the box runner: campaigns from the queue, one after another ----------------
+# How a campaign's halt reads to the box (halt_kind). A halt the CAMPAIGN caused
+# -- the operator's `halt`, every item past max_crashes, a triage that could not
+# finish -- ends that campaign and the box starts the next. A halt that says
+# something about the BOX -- a brake, low disk, a crash loop, managers that will
+# not start, anything unclassified -- would hit the next campaign too, so the
+# box stops there and waits for someone to look.
+BOX_MOVES_ON = ("user", "max_crashes", "triage")
+
+
+def box_next_move(status, halt_reason):
+    """What the box does once a campaign's driver returned: ("next", status)
+    to record it and start the next campaign, or ("stop", why)."""
+    if status == "done":
+        return "next", "done"
+    if status == "halted":
+        kind = halt_kind(halt_reason)
+        if kind in BOX_MOVES_ON:
+            return "next", "halted"
+        return "stop", "halted (%s): %s" % (kind, halt_reason)
+    # Still running or new: the driver returned without ending the campaign --
+    # another driver holds its lock, or it is legacy. Running it again would spin.
+    return "stop", "its driver returned while it was %s (another driver for it?)" % status
+
+
+def cmd_run_box(idle_seconds=10):
+    """The box agent's loop: run the head of the queue to its end, record it,
+    take the next. With the queue empty it waits, so `queue add` starts a
+    campaign at once. It returns -- exit 0, which the agent's KeepAlive leaves
+    down -- only when the box must stop: the global brake, or a campaign that
+    ended in a way the next one would repeat (box_next_move)."""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(RUN_DIR / "box.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another box runner is already running; exiting")
+        return
+    qp = queue_path()
+    log("box runner starting; queue: %s" % (", ".join(boxqueue.load(qp)["queue"]) or "empty"))
+    waiting = False
+    while True:
+        if GLOBAL_BRAKE.exists():
+            log("BRAKE: %s; the box stops (remove it, then restart the agent)" % GLOBAL_BRAKE)
+            return
+        name = boxqueue.head(qp)
+        if name is None:
+            if not waiting:
+                log("queue empty; waiting for `fuzz-campaign.py queue add <name>`")
+                waiting = True
+            time.sleep(idle_seconds)
+            continue
+        waiting = False
+        try:
+            _load_def(name)
+        except ValueError as e:
+            log("queue: %s cannot be read, dropped from the queue: %s" % (name, e))
+            boxqueue.finish(qp, name, "error", str(e), now_iso())
+            continue
+        st = load_state(name)
+        if st.get("status") == "halted":
+            # The box stopped on this one and nobody resumed it: starting it
+            # again would only re-halt. `resume` or `queue rm` decides.
+            log("box stops: %s is halted (%s); `resume %s` or `queue rm %s`"
+                % (name, st.get("halt_reason"), name, name))
+            return
+        log("box: running %s" % name)
+        try:
+            cmd_run(name)
+        except SystemExit as e:
+            log("box stops: the driver for %s exited (%s)" % (name, e))
+            return
+        finally:
+            _close_coord_log()              # the box's own lines are not that campaign's
+        st = load_state(name)
+        move, what = box_next_move(st.get("status"), st.get("halt_reason"))
+        if move == "stop":
+            log("box stops on %s: %s" % (name, what))
+            return
+        boxqueue.finish(qp, name, what, st.get("halt_reason"), now_iso())
+        log("box: %s ended %s; next: %s" % (name, what, boxqueue.head(qp) or "nothing queued"))
+
+
+def cmd_queue(action, name=None, at=None):
+    """queue ls | add <name> [--at N] | rm <name> | mv <name> N."""
+    qp = queue_path()
+    # The head is the campaign the box is on while it runs: nothing goes in
+    # front of it, or `queue ls` would name the wrong one as running.
+    first = boxqueue.head(qp)
+    if (at is not None and int(at) < 1 and first and first != name
+            and load_state(first).get("status") == "running"):
+        at = 1
+    if action == "ls":
+        q = boxqueue.load(qp)
+        rows = []
+        for i, n in enumerate(q["queue"]):
+            st = load_state(n) if (is_plan_layout(n) or (CAMPAIGN_DIR / ("%s.json" % n)).exists()) else {}
+            rows.append((str(i), n, st.get("status", "?"), "running now" if i == 0 else ""))
+        if rows:
+            tabulate(rows, ("#", "CAMPAIGN", "STATUS", ""))
+        else:
+            print("queue empty")
+        for h in q["history"][-5:]:
+            print("  ended %s  %-24s %s%s" % (timefmt.fmt(h.get("ended"), short=True) if h.get("ended") else "?",
+                                             h.get("name"), h.get("status"),
+                                             " -- %s" % h["reason"] if h.get("reason") else ""))
+        return 0
+    if action == "add":
+        if not is_plan_layout(name):
+            die("no campaign %r (campaigns/%s/campaign.json); create it with `new`" % (name, name))
+        d = load_def(name)
+        if d.get("layout") == "legacy":
+            die("campaign %r is legacy and read-only; it cannot run" % name)
+        st = load_state(name).get("status")
+        if st == "done":
+            die("campaign %r is done; `new <name2> --copy %s` runs it again" % (name, name))
+        try:
+            pos = boxqueue.add(qp, name, at)
+        except ValueError as e:
+            die(str(e))
+        print("queued %s at position %d%s" % (name, pos, " (next to run)" if pos == 0 else ""))
+        return 0
+    if action == "rm":
+        if boxqueue.head(qp) == name and load_state(name).get("status") == "running":
+            die("%s is the campaign the box is running; `halt %s` ends it" % (name, name))
+        if not boxqueue.remove(qp, name):
+            die("%s is not queued" % name)
+        print("removed %s from the queue" % name)
+        return 0
+    if action == "mv":
+        if boxqueue.head(qp) == name and load_state(name).get("status") == "running":
+            die("%s is running; it stays at the head until it ends" % name)
+        try:
+            pos = boxqueue.move(qp, name, at)
+        except ValueError as e:
+            die(str(e))
+        print("moved %s to position %d" % (name, pos))
+        return 0
+    die("unknown queue action %r" % action)
+
+
 # --- authoring + control -----------------------------------------------------
 def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=None,
             min_free_gb=None, crashloop_limit=None, crashloop_min_execs=None,
@@ -3649,6 +3797,25 @@ def _int(v):
         return None
 
 
+def box_status_lines(name, prev=None):
+    """status_lines for `name`; with no name, the box: its queue, then the
+    dashboard of the campaign it is on."""
+    if name:
+        return status_lines(name, prev)
+    q = boxqueue.load(queue_path())
+    lines = ["box:", "  queue       : %s" % (" -> ".join(
+        "%s (%s)" % (n, load_state(n).get("status", "?")) if i == 0 else n
+        for i, n in enumerate(q["queue"])) or "empty")]
+    if q["history"]:
+        h = q["history"][-1]
+        lines.append("  last ended  : %s %s%s" % (h.get("name"), h.get("status"),
+                                                 " -- %s" % h["reason"] if h.get("reason") else ""))
+    if not q["queue"]:
+        return lines, None
+    more, sample = status_lines(q["queue"][0], prev)
+    return lines + [""] + more, sample
+
+
 def cmd_status(name, watch=False, interval=10):
     """Campaign dashboard: printed once, or redrawn until Ctrl-C with --watch.
 
@@ -3657,13 +3824,13 @@ def cmd_status(name, watch=False, interval=10):
     remember the previous number.
     """
     if not watch:
-        lines, _ = status_lines(name)
+        lines, _ = box_status_lines(name)
         print("\n".join(lines))
         return
     prev = None
     try:
         while True:
-            lines, sample = status_lines(name, prev)
+            lines, sample = box_status_lines(name, prev)
             head = ("fuzz-campaign status --watch  (every %ds, Ctrl-C to quit)  %s"
                     % (interval, timefmt.stamp()))
             # Clear + home, then repaint, so the block does not scroll away.
@@ -4079,7 +4246,18 @@ def cmd_resume(name):
                "" if held[0].endswith("STOP") else "%s " % name)
             + ("--global " if held[0].endswith("STOP") else ""))
     _set_status(name, "running")
-    print("marked running; (re)start the driver: sudo ./scripts/fuzz-campaign.py run %s" % name)
+    # Back to the front of the queue: right after the campaign the box is on,
+    # or the head itself when nothing runs (a box stopped on this one keeps it
+    # at the head already).
+    qp = queue_path()
+    if name not in boxqueue.load(qp)["queue"]:
+        first = boxqueue.head(qp)
+        busy = first is not None and load_state(first).get("status") == "running"
+        boxqueue.add(qp, name, 1 if busy else 0)
+    print("marked running and queued next. If the box runner stopped, restart it:\n"
+          "  sudo launchctl kickstart -k gui/$(id -u fuzz)/%s\n"
+          "(a campaign with its own agent: sudo launchctl kickstart -k gui/$(id -u fuzz)/%s)"
+          % (BOX_LABEL, plist_label(name)))
 
 
 # --- launchd -----------------------------------------------------------------
@@ -4103,6 +4281,11 @@ def plist_label(name):
     return "com.fuzz-campaign.%s" % name
 
 
+# The box runner's agent. Campaign names cannot contain a dot (plan.ID_RE), so
+# no campaign's label can be this one.
+BOX_LABEL = "com.fuzz-campaign.box.runner"
+
+
 def plist_path(name):
     return LAUNCHD_DIR / ("%s.plist" % plist_label(name))
 
@@ -4117,11 +4300,14 @@ def _daemon_env():
 
 
 def _plist_xml(name, user=None):
-    logf = STATE_DIR / ("%s.launchd.log" % name)
+    """The job for one campaign, or with name None for the box runner (`run`
+    with no campaign: the queue)."""
+    label = plist_label(name) if name else BOX_LABEL
+    logf = STATE_DIR / ("%s.launchd.log" % (name or "box"))
     # Prefer Apple's stable system python3 for a long-lived daemon; env python3
     # (e.g. Xcode's) can move or vanish across an Xcode update.
     py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
-    args = [py, str(SESSION.parent / "fuzz-campaign.py"), "run", name]
+    args = [py, str(SESSION.parent / "fuzz-campaign.py"), "run"] + ([name] if name else [])
     arg_xml = "\n".join("    <string>%s</string>" % a for a in args)
     env_xml = "\n".join("    <key>%s</key><string>%s</string>" % (k, v)
                         for k, v in _daemon_env().items())
@@ -4156,7 +4342,7 @@ def _plist_xml(name, user=None):
         '  <key>StandardOutPath</key><string>%s</string>\n'
         '  <key>StandardErrorPath</key><string>%s</string>\n'
         '</dict>\n</plist>\n'
-        % (plist_label(name), arg_xml, env_xml, user_xml, REPO_ROOT, logf, logf)
+        % (label, arg_xml, env_xml, user_xml, REPO_ROOT, logf, logf)
     )
 
 
@@ -4224,8 +4410,9 @@ def cmd_install_agent(name, user=None):
     Runnable as the user itself (no sudo) or as root (chowns to the user). Loads
     now if that user has an active GUI session; otherwise it loads at next login.
     """
-    require_campaign(name)
-    load_def(name)
+    if name:
+        require_campaign(name)
+        load_def(name)
     user = user or os.environ.get("SUDO_USER") or getpass.getuser()
     try:
         pw = pwd.getpwnam(user)
@@ -4238,7 +4425,15 @@ def cmd_install_agent(name, user=None):
     agents = Path(pw.pw_dir) / "Library" / "LaunchAgents"
     agents.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = agents / ("%s.plist" % plist_label(name))
+    label = plist_label(name) if name else BOX_LABEL
+    # The box runner and per-campaign agents both drive the box: two loaded at
+    # once fight over /dev/pishi. Say which other one is installed.
+    others = sorted(p.stem for p in agents.glob("com.fuzz-campaign.*.plist") if p.stem != label)
+    if others and (not name or BOX_LABEL in others):
+        log("WARNING: other campaign agents are installed for %s: %s -- uninstall them "
+            "(`uninstall <name> --agent --user %s`, or `uninstall --box`) so only one "
+            "job drives the box" % (user, ", ".join(others), user))
+    path = agents / ("%s.plist" % label)
     path.write_text(_plist_xml(name, user=None))   # agent runs as the session user
     os.chmod(path, 0o644)
     if os.geteuid() == 0:                           # installed via sudo -> fix ownership
@@ -4258,7 +4453,11 @@ def cmd_install_agent(name, user=None):
             % (user, dom, rc, user))
     else:
         log("loaded LaunchAgent for %s in %s -- RunAtLoad + KeepAlive" % (user, dom))
-        startup_hint(name)
+        if name:
+            startup_hint(name)
+        else:
+            log("box runner: it runs campaigns/queue.json in order; "
+                "`fuzz-campaign.py queue add <name>` to give it one")
 
 
 def startup_hint(name):
@@ -4289,7 +4488,16 @@ def startup_hint(name):
     log("  that; check with: /bin/ps -Ao command | grep syz-executor")
 
 
-def cmd_install(name, user=None, agent=False):
+def cmd_install(name, user=None, agent=False, box=False):
+    if box:
+        if name:
+            die("--box installs the box runner, which takes no campaign: "
+                "`install --box --agent --user fuzz`, then `queue add %s`" % name)
+        if not agent:
+            die("the box runner is installed as an agent: add --agent")
+        return cmd_install_agent(None, user)
+    if not name:
+        die("install <name>, or --box for the box runner")
     if agent:
         return cmd_install_agent(name, user)
     require_campaign(name)
@@ -4557,7 +4765,7 @@ def cmd_stop(name, grace=30, keep_agent=False):
     return 0
 
 
-def cmd_uninstall(name, user=None, agent=False):
+def cmd_uninstall(name, user=None, agent=False, box=False):
     """Stop the daemon/agent now and prevent it from ever restarting.
 
     bootout unloads the job and kills its running instance; removing the plist
@@ -4571,8 +4779,20 @@ def cmd_uninstall(name, user=None, agent=False):
     "running" -- nothing is left to update its state -- while the orphan holds
     /dev/pishi and blocks the next campaign.
     """
-    stop_campaign_session(name)
-    label = plist_label(name)
+    if box:
+        # The box runner's session is its current campaign's: the head of the
+        # queue. It keeps its state, so a later install resumes it.
+        if name:
+            die("--box takes no campaign name")
+        agent = True
+        name = boxqueue.head(queue_path())
+        label = BOX_LABEL
+    else:
+        if not name:
+            die("uninstall <name>, or --box for the box runner")
+        label = plist_label(name)
+    if name:
+        stop_campaign_session(name)
     if agent:
         user = user or os.environ.get("SUDO_USER") or getpass.getuser()
         try:
@@ -5441,16 +5661,27 @@ def main():
     sp.add_argument("--where", action="store_true",
                     help="print the brake paths (including the Recovery form) and exit")
 
-    sp = sub.add_parser("status", help="show campaign runtime state")
-    sp.add_argument("name")
+    sp = sub.add_parser("status", help="show campaign runtime state; with no name, the "
+                                       "box: its queue and the campaign it is on")
+    sp.add_argument("name", nargs="?")
     sp.add_argument("-w", "--watch", action="store_true",
                     help="redraw until Ctrl-C, annotating what changed since the "
                          "last refresh")
     sp.add_argument("--interval", type=int, default=10,
                     help="seconds between redraws with --watch (default 10)")
 
-    for _n, _h in (("run", "supervision loop (launchd entry point)"),
-                   ("doctor", "pre-flight checks before a run"),
+    sp = sub.add_parser("run", help="supervision loop (launchd entry point); with no "
+                                    "name, the box runner: campaigns/queue.json in order")
+    sp.add_argument("name", nargs="?")
+
+    sp = sub.add_parser("queue", help="what the box runs: ls | add <name> [--at N] | "
+                                      "rm <name> | mv <name> N")
+    sp.add_argument("action", choices=["ls", "add", "rm", "mv"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("position", nargs="?", type=int, help="mv: the new position (0 is the head)")
+    sp.add_argument("--at", type=int, help="add: the position (default: the end)")
+
+    for _n, _h in (("doctor", "pre-flight checks before a run"),
                    ("halt", "soft-pause the campaign (leaves the daemon installed)"),
                    ("resume", "clear halt and mark running"),
                    ("next", "end the running item now and move to the next (request)")):
@@ -5465,7 +5696,10 @@ def main():
     for _n, _h in (("install", "generate + load a launchd job that resumes across reboots"),
                    ("uninstall", "stop the daemon/agent now + prevent restart (removes the plist)")):
         sp = sub.add_parser(_n, help=_h)
-        sp.add_argument("name")
+        sp.add_argument("name", nargs="?", help="the campaign; omit with --box")
+        sp.add_argument("--box", action="store_true",
+                        help="the box runner's agent, which runs campaigns/queue.json in order "
+                             "(with --agent)")
         sp.add_argument("--user", help="the user the job runs as (e.g. fuzz, the auto-login user)")
         sp.add_argument("--agent", action="store_true",
                         help="per-user LaunchAgent (runs in the login/GUI session) instead of a "
@@ -5521,7 +5755,17 @@ def main():
     elif args.cmd == "brake":
         sys.exit(cmd_brake(args.name, args.global_, args.reason, args.clear, args.where))
     elif args.cmd == "run":
-        cmd_run(args.name)
+        if args.name:
+            cmd_run(args.name)
+        else:
+            cmd_run_box()
+    elif args.cmd == "queue":
+        if args.action != "ls" and not args.name:
+            p.error("queue %s needs a campaign name" % args.action)
+        if args.action == "mv" and args.position is None:
+            p.error("queue mv <name> <position>")
+        sys.exit(cmd_queue(args.action, args.name,
+                           args.position if args.action == "mv" else args.at))
     elif args.cmd == "status":
         cmd_status(args.name, args.watch, args.interval)
     elif args.cmd == "doctor":
@@ -5543,9 +5787,9 @@ def main():
     elif args.cmd == "forget-exhausted":
         sys.exit(cmd_forget_exhausted(args.name, args.sig))
     elif args.cmd == "install":
-        cmd_install(args.name, args.user, args.agent)
+        cmd_install(args.name, args.user, args.agent, args.box)
     elif args.cmd == "uninstall":
-        cmd_uninstall(args.name, args.user, args.agent)
+        cmd_uninstall(args.name, args.user, args.agent, args.box)
     elif args.cmd == "exclude":
         sys.exit(cmd_exclude(args.name, args.culprit, args.config, args.dry_run))
     elif args.cmd == "include":

@@ -1892,6 +1892,114 @@ class ExhaustedSignatureTest(unittest.TestCase):
                     self.assertEqual(s["exhausted_sigs"], [])
 
 
+class BoxRunnerTest(unittest.TestCase):
+    """The box runner runs the queue's head to its end, records it, takes the
+    next; it stops the box only on a halt the next campaign would repeat."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name).resolve()
+        (self.dir / "campaigns").mkdir()
+        self.states = {}
+        self.ran = []
+        self._patches = [mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"),
+                         mock.patch.object(fc, "RUN_DIR", self.dir / "run"),
+                         mock.patch.object(fc, "GLOBAL_BRAKE", self.dir / "STOP"),
+                         mock.patch.object(fc, "_load_def", lambda n: {"items": []}),
+                         mock.patch.object(fc, "load_state",
+                                           lambda n: dict(self.states.get(n, {"status": "new"}))),
+                         mock.patch.object(fc, "log", lambda m: None)]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def _queue(self, *names):
+        for n in names:
+            fc.boxqueue.add(fc.queue_path(), n)
+
+    def _ends(self, outcomes):
+        """A cmd_run that ends each campaign as `outcomes` says."""
+        def run(name):
+            self.ran.append(name)
+            self.states[name] = outcomes[name]
+        return run
+
+    def test_the_box_moves_on_after_done_and_operator_halts_and_stops_on_a_box_fault(self):
+        self._queue("a", "b", "c", "d")
+        outcomes = {"a": {"status": "done"},
+                    "b": {"status": "halted", "halt_reason": "halted by user"},
+                    "c": {"status": "halted", "halt_reason": "low disk (3.0GB free < 20.0GB)"},
+                    "d": {"status": "done"}}
+        with mock.patch.object(fc, "cmd_run", self._ends(outcomes)):
+            fc.cmd_run_box()
+        self.assertEqual(self.ran, ["a", "b", "c"])          # stopped before d
+        q = fc.boxqueue.load(fc.queue_path())
+        self.assertEqual(q["queue"], ["c", "d"])              # c stays at the head
+        self.assertEqual([(h["name"], h["status"]) for h in q["history"]],
+                         [("a", "done"), ("b", "halted")])
+
+    def test_a_halted_head_stops_the_box_without_running_it(self):
+        self._queue("a", "b")
+        self.states["a"] = {"status": "halted", "halt_reason": "crash loop (15 crashes ...)"}
+        with mock.patch.object(fc, "cmd_run", self._ends({})):
+            fc.cmd_run_box()
+        self.assertEqual(self.ran, [])
+
+    def test_a_campaign_that_cannot_be_read_is_dropped_and_the_next_runs(self):
+        self._queue("gone", "a")
+
+        def load(n):
+            if n == "gone":
+                raise ValueError("no campaign 'gone'")
+            return {"items": []}
+        with mock.patch.object(fc, "_load_def", load), \
+             mock.patch.object(fc, "cmd_run", self._ends({"a": {"status": "done"}})), \
+             mock.patch.object(fc.time, "sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):            # queue empty: it waits
+                fc.cmd_run_box()
+        self.assertEqual(self.ran, ["a"])
+        self.assertEqual([(h["name"], h["status"]) for h in
+                          fc.boxqueue.load(fc.queue_path())["history"]],
+                         [("gone", "error"), ("a", "done")])
+
+    def test_a_driver_that_returns_without_ending_its_campaign_stops_the_box(self):
+        self._queue("a", "b")
+        with mock.patch.object(fc, "cmd_run", self._ends({"a": {"status": "running"}})):
+            fc.cmd_run_box()
+        self.assertEqual(self.ran, ["a"])                     # no spin on a
+
+    def test_the_global_brake_stops_the_box_before_anything_runs(self):
+        self._queue("a")
+        (self.dir / "STOP").write_text("")
+        with mock.patch.object(fc, "cmd_run", self._ends({})):
+            fc.cmd_run_box()
+        self.assertEqual(self.ran, [])
+
+    def test_resume_queues_the_campaign_right_after_the_running_one(self):
+        self._queue("a", "b")
+        self.states["a"] = {"status": "running"}
+        with mock.patch.object(fc, "brake_held", lambda n: None), \
+             mock.patch.object(fc, "_set_status", lambda *a, **k: None), \
+             contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_resume("c")
+        self.assertEqual(fc.boxqueue.load(fc.queue_path())["queue"], ["a", "c", "b"])
+
+    def test_nothing_goes_in_front_of_the_running_campaign(self):
+        self._queue("a", "b")
+        self.states["a"] = {"status": "running"}
+        (self.dir / "campaigns" / "c").mkdir()
+        (self.dir / "campaigns" / "c" / "campaign.json").write_text("{}")
+        with mock.patch.object(fc, "load_def", lambda n: {"layout": "plan"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_queue("add", "c", 0)
+            fc.cmd_queue("mv", "b", 0)
+        self.assertEqual(fc.boxqueue.load(fc.queue_path())["queue"], ["a", "b", "c"])
+
+
 class NewPlanTest(unittest.TestCase):
     """`new` writes a plan that references hand-written configs; `plan check`
     renders it; `install` freezes it. Device flags for triage are gone: the

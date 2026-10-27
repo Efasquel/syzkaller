@@ -1,7 +1,7 @@
 # Campaign planning — redesign
 
-Status: revision 5, 2026-10-22, being implemented. Phases 1, 2a and 2b are in
-the code (2026-10-23/26); phases 3, 4 and 5 are not -- see §11 for what each
+Status: revision 5, 2026-10-22, being implemented. Phases 1, 2a, 2b and 3 are
+in the code (2026-10-23/27); phases 4 and 5 are not -- see §11 for what each
 covers and §12 for the decisions taken on the way. A simulator of the whole
 model lives in `playground/` (§13).
 
@@ -390,29 +390,45 @@ syz-manager's format is left alone.
 
 ## 7. Campaign queue
 
-- One launchd agent for the box (`install --box --user fuzz`). It runs
-  `fuzz-campaign.py run` with no name, which drains `campaigns/queue.json`.
-  The per-campaign agent goes away.
+Implemented 2026-10-27 (`lib/boxqueue.py`, `cmd_run_box`).
+
+- One launchd agent for the box: `install --box --agent --user fuzz`, label
+  `com.fuzz-campaign.box.runner` (campaign names cannot hold a dot, so no
+  campaign label collides). It runs `fuzz-campaign.py run` with no name, which
+  runs `campaigns/queue.json` in order. With the queue empty it waits, so
+  `queue add` starts a campaign at once. The per-campaign agent still works;
+  installing either one warns when the other kind is installed, since two jobs
+  driving the box fight over `/dev/pishi`.
 
   ```json
   {"queue": ["fde_eval", "bt_sweep"],
-   "history": [{"name": "drivers_260902", "ended": "…", "status": "done"}]}
+   "history": [{"name": "smoke", "ended": "…", "status": "done", "reason": null}]}
   ```
 
-- When the head campaign ends, it moves to `history` and the next one starts,
-  with no login or reboot needed.
-- Commands: `queue add <plan> [--as <name>] [--at N]`, `queue rm`, `queue mv
-  <name> N`, `queue ls`. The runner re-reads the queue only between campaigns.
-- How a campaign's end affects the box:
+- The head of `queue` is the campaign the box is on. When it ends, it moves to
+  `history` with how it ended, and the next one starts with no login or reboot
+  needed. After a panic-reboot the agent finds the same head and resumes it.
+- Commands: `queue add <name> [--at N]`, `queue rm <name>`, `queue mv <name>
+  N`, `queue ls`. `add` refuses a missing, legacy or `done` campaign and one
+  already queued; nothing goes in front of a running head (`--at 0` becomes
+  1); `rm`/`mv` refuse the running head (`halt` ends it). The runner reads the
+  queue only between campaigns. Changes are locked and atomic, like the
+  request file.
+- How a campaign's end affects the box (from the halt reason, `halt_kind`):
 
   | campaign ends because | box |
   |---|---|
-  | done, every item abandoned or skipped, `halt <name>` | next campaign |
-  | low disk, crash loop, repeated startup failures | **stops**: the fault is the box, and the next campaign would hit it too |
-  | `stop`, `STOP`, brake | stops |
+  | done (every item ended, whatever the reasons), `halt <name>`, every item `max_crashes`, a triage halt | next campaign; recorded in `history` |
+  | brake (`STOP` or per campaign), low disk, crash loop, repeated startup failures, an unclassified error | **stops**, the campaign left at the head: the next one would hit it too |
+  | a campaign that cannot be read | dropped to `history` as `error`; next |
 
-- `status` with no name shows the box: the running campaign and its item, the
-  pending requests, and what is queued next.
+  A box that stopped stays down (exit 0). `resume <name>` clears the halt and
+  puts the campaign back at the front -- right after the running one, or at the
+  head when nothing runs -- then the agent is restarted with
+  `launchctl kickstart`; `queue rm` drops it instead. A halted head is never
+  re-run on its own.
+- `status` with no name shows the box: the queue (the head with its status),
+  the last campaign that ended, then the head's dashboard.
 
 ---
 
@@ -495,10 +511,10 @@ Each phase ships alone and leaves the box working.
    - (2b) `sync-fuzz-run.sh` simplified (verbatim configs, `box.json` left
      alone);
    - (2b) `runstats.py` / `fuzz-results.py` grouping samples by config.
-3. **Queue** -- pending: the box agent, `queue add --as`, the `queue` verbs,
-   `halt` meaning "the box moves on", and box-level `status`. The idle box is
-   driver #1, and phase 2 already puts new files in their final place, so this
-   does not wait for the log work.
+3. **Queue** -- done 2026-10-27: the box agent, the `queue` verbs, `halt`
+   meaning "the box moves on", `resume` re-queueing, and box-level `status`.
+   (No `queue add --as`: a campaign is created by `new`, and run again with
+   `new --copy`.)
 4. **Logs** -- pending: subprocess output redirected to the per-run and
    per-job files, `campaign.log`, the `log` command, per-run executor logs,
    and the capped `probes.log`.

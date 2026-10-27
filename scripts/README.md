@@ -55,19 +55,33 @@ of every script and library in this directory, see [docs/OVERVIEW.md](docs/OVERV
         $ cd /Users/Shared/fuzz-run
         $ sudo -u fuzz /usr/bin/python3 scripts/fuzz-campaign.py doctor fde_2h
 
-4. Start it. The agent has `RunAtLoad`, so the campaign resumes by itself after
-   each panic-reboot.
+4. Queue it. The box runs one campaign at a time, from `campaigns/queue.json`,
+   driven by one agent for the whole box. Install that agent once; it has
+   `RunAtLoad`, so the box resumes by itself after each panic-reboot (with
+   auto-login as `fuzz`), and it starts the next queued campaign when one ends.
 
-        $ sudo python3 scripts/fuzz-campaign.py install fde_2h --agent --user fuzz
+        $ sudo /usr/bin/python3 scripts/fuzz-campaign.py install --box --agent --user fuzz   # once
+        $ /usr/bin/python3 scripts/fuzz-campaign.py queue add fde_2h
+        $ /usr/bin/python3 scripts/fuzz-campaign.py queue ls
+
+   `halt <name>` ends a campaign and the box moves on; `resume <name>` puts it
+   back at the front. The box stops instead -- and waits for you -- on a brake,
+   low disk, a crash loop or managers that will not start, since the next
+   campaign would hit those too; after fixing it, `resume <name>` and restart
+   the agent: `sudo launchctl kickstart -k gui/$(id -u fuzz)/com.fuzz-campaign.box.runner`.
 
 5. Watch it.
 
-        $ python3 scripts/fuzz-campaign.py status fde_2h
-        $ python3 scripts/fuzz-campaign.py list
+        $ /usr/bin/python3 scripts/fuzz-campaign.py status          # the box: queue + current campaign
+        $ /usr/bin/python3 scripts/fuzz-campaign.py status fde_2h
+        $ /usr/bin/python3 scripts/fuzz-campaign.py list
 
-   When it is done, remove the agent:
+   To take the box out of service, remove its agent:
 
-        $ sudo python3 scripts/fuzz-campaign.py uninstall fde_2h
+        $ sudo /usr/bin/python3 scripts/fuzz-campaign.py uninstall --box --user fuzz
+
+   (A campaign can still get an agent of its own, `install <name> --agent --user
+   fuzz`, but never alongside the box agent: two jobs fight over `/dev/pishi`.)
 
 ## Worth knowing
 

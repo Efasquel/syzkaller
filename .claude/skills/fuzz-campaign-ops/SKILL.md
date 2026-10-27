@@ -51,8 +51,19 @@ run as. Run as yourself they are noise — it says so in its own output.
     --repeat 3 --max-hours 6 -m "why"       # creates campaigns/<name>/ (campaign.json, state, README) + checks it
 /usr/bin/python3 scripts/fuzz-campaign.py new <name2> --copy <name>    # same experiment, new name; flags given alongside override
 /usr/bin/python3 scripts/fuzz-campaign.py plan check <name> [--strict]
-sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz
+sudo /usr/bin/python3 scripts/fuzz-campaign.py install --box --agent --user fuzz   # once per box
+/usr/bin/python3 scripts/fuzz-campaign.py queue add <name> [--at N]               # the box runs the queue in order
+/usr/bin/python3 scripts/fuzz-campaign.py queue ls | rm <name> | mv <name> N
 ```
+
+The box agent runs `campaigns/queue.json` head first and starts the next
+campaign when one ends; with the queue empty it waits. `halt <name>` ends a
+campaign and the box moves on. A brake, low disk, a crash loop, managers that
+will not start or an unclassified error STOP the box with the campaign left at
+the head (the next one would hit the same fault): fix it, `resume <name>`, then
+`sudo launchctl kickstart -k gui/$(id -u fuzz)/com.fuzz-campaign.box.runner`.
+`status` with no name shows the box. Never install a per-campaign agent next to
+the box agent: two jobs fight over `/dev/pishi`.
 
 A campaign's plan references hand-written configs; listing a config N times
 (or `--repeat N`) runs it N times from scratch as items `<config-id>-1..N`.
@@ -179,6 +190,6 @@ before any session starts. Anything written into it becomes the halt reason.
 ./scripts/sync-fuzz-run.sh
 cd /Users/Shared/fuzz-run
 sudo -u fuzz /usr/bin/python3 scripts/fuzz-campaign.py doctor <name>
-sudo ./scripts/fuzz-campaign.py install <name> --agent --user fuzz
+/usr/bin/python3 scripts/fuzz-campaign.py queue add <name>    # box agent installed once: install --box --agent --user fuzz
 tail -f campaigns/.state/<name>.coordinator.log
 ```

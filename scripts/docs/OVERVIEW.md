@@ -47,6 +47,7 @@ Pure helpers, no CLI, no repo-root anchoring — imported as `from lib import X`
 | `style.py` | tty-aware ANSI colour and glyphs shared by the status views. |
 | `schedule.py` | The campaign scheduler, pure: item ids, `next_step`, `stop_reason`. |
 | `requests.py` | The operator's request list (`next`, `skip`...), appended by verbs and taken by the runner. |
+| `boxqueue.py` | The box's campaign queue, `campaigns/queue.json`: what the box agent runs, in order, and the history of how each campaign ended. |
 | `plan.py` | Plans and effective configs: load/normalize a plan, render `box ⊕ config ⊕ runtime`, item folders. |
 
 ## Shell

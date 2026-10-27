@@ -265,8 +265,16 @@ invisible; a WARN on prunability means the disk fills.
 
 ```sh
 cd /Users/Shared/fuzz-run
-sudo ./scripts/fuzz-campaign.py install jpeg --agent --user fuzz
+sudo /usr/bin/python3 scripts/fuzz-campaign.py install --box --agent --user fuzz   # once per box
+/usr/bin/python3 scripts/fuzz-campaign.py queue add jpeg
 ```
+
+The box agent (`com.fuzz-campaign.box.runner`) runs `campaigns/queue.json` in
+order, starting the next campaign when one ends, and waits when the queue is
+empty. A campaign can still be installed on its own (`install jpeg --agent
+--user fuzz`, label `com.fuzz-campaign.jpeg`) -- but not next to the box agent:
+two jobs driving the box fight over `/dev/pishi`, and `install` warns about it.
+The notes below hold for either kind of agent.
 
 **Run `install` from `/Users/Shared/fuzz-run`, never from the repo.** The plist bakes
 in *the installing tree's* paths, so installing from `/Users/wan/Documents/syzkaller`
@@ -327,12 +335,17 @@ cat bugs/INDEX.md
 /usr/bin/python3 scripts/fuzz-campaign.py skip jpeg AppleJPEGDriver_260827_cov_gram_test-1
 /usr/bin/python3 scripts/fuzz-campaign.py unskip jpeg AppleJPEGDriver_260827_cov_gram_test-1
 
-# pause / resume (the driver polls state and stops the session)
+# end a campaign: the box moves on to the next queued one
 /usr/bin/python3 scripts/fuzz-campaign.py halt jpeg
+# put it back at the front of the queue (restart the agent if the box stopped)
 /usr/bin/python3 scripts/fuzz-campaign.py resume jpeg
+sudo launchctl kickstart -k gui/$(id -u fuzz)/com.fuzz-campaign.box.runner
 
-# stop the agent entirely (and prevent restart at next login)
-sudo ./scripts/fuzz-campaign.py uninstall jpeg --agent --user fuzz
+# the box: queue + current campaign
+/usr/bin/python3 scripts/fuzz-campaign.py status
+
+# take the box out of service (and prevent restart at next login)
+sudo /usr/bin/python3 scripts/fuzz-campaign.py uninstall --box --user fuzz
 ```
 
 ### Stopping a runaway box
