@@ -161,6 +161,35 @@ def job_dir(st):
     return Path(st["dir"])
 
 
+# syz-ring-repro's per-probe output. One minimization once wrote 33,267 lines of
+# it into the campaign's launchd log, burying the coordinator's decisions; it is
+# forensics for a job that went wrong, so it lives in the job, beside its state.
+# Rotated by rename (one generation kept), never truncated in place.
+PROBES_MAX_MB = 20
+
+
+def probes_out(st):
+    """<job>/probes.log opened for appending, rotated to probes.log.1 first
+    when it has outgrown PROBES_MAX_MB. Hand it to a probe as stdout/stderr."""
+    path = job_dir(st) / "probes.log"
+    try:
+        if path.stat().st_size > PROBES_MAX_MB * 1024 * 1024:
+            path.replace(path.with_name("probes.log.1"))
+    except OSError:
+        pass
+    return open(path, "a")
+
+
+def run_probe(st, cmd):
+    """Run one syz-ring-repro command in the job's scratch cwd, its output to
+    probes.log. Returns its exit code."""
+    with probes_out(st) as out:
+        out.write("\n%s  $ %s\n" % (timefmt.stamp(), " ".join(cmd)))
+        out.flush()
+        return subprocess.run(cmd, cwd=str(exec_scratch(st)), stdout=out,
+                              stderr=subprocess.STDOUT).returncode
+
+
 def is_path_addressed(st):
     """True when the job's state lives inside its own dir rather than under
     STATE_DIR. These jobs do not assume a globally-unique name, so anything
@@ -334,7 +363,7 @@ def run_merge(st):
                         "-from", str(st.get("from", -1)), "-to", str(st.get("to", 0)),
                         st["ring_buffer"])
     log("MERGE: %s" % " ".join(cmd))
-    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
+    rc = run_probe(st, cmd)
     if rc != 0 or not merged.exists():
         die("merge failed (rc=%d); see output above" % rc)
     log("MERGE done -> %s" % merged)
@@ -410,7 +439,7 @@ def run_minimize(st, stage, flag, prog_key, out_key, state_name):
                         "-culprit", str(culprit), *gate_args(st), str(prog))
     log("%s: %s" % (stage, " ".join(cmd)))
     started = time.time()
-    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
+    rc = run_probe(st, cmd)
     # Reconcile any panic this run produced (it may have rebooted us on a prior
     # invocation; on this one it returned, but earlier subsets still left logs).
     reconcile_panics(st)
@@ -504,7 +533,7 @@ def run_replay(st):
                         *gate_args(st), st["ring_buffer"])
     log("%s: %s" % (REPLAY, " ".join(cmd)))
     started = time.time()
-    rc = subprocess.run(cmd, cwd=str(exec_scratch(st))).returncode
+    rc = run_probe(st, cmd)
     reconcile_panics(st)
     if rc != 0:
         hung = hung_since(rstate, started)

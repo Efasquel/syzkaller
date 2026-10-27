@@ -1892,6 +1892,76 @@ class ExhaustedSignatureTest(unittest.TestCase):
                     self.assertEqual(s["exhausted_sigs"], [])
 
 
+class LogsTest(unittest.TestCase):
+    """campaign-planning.md §6: one decisions log per campaign, tagged with the
+    item; every subprocess writes its own file beside what it works on."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name).resolve()
+
+    def tearDown(self):
+        fc._close_coord_log()
+        fc.set_log_tag(None)
+        self._tmp.cleanup()
+
+    def test_under_launchd_a_decision_goes_to_the_decisions_log_only_tagged(self):
+        logf = self.dir / "campaign.log"
+        with mock.patch.object(fc, "coord_log_path", lambda n: logf):
+            fc.open_coord_log("c")
+        fc.set_log_tag("Fake_bsdA-2")
+        out = io.StringIO()                       # not a terminal, like launchd's file
+        with contextlib.redirect_stdout(out):
+            fc.log("crash -> triage t3")
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("[Fake_bsdA-2] crash -> triage t3", logf.read_text())
+
+    def test_without_a_decisions_log_a_line_still_prints(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fc.log("hello")
+        self.assertIn("hello", out.getvalue())
+
+    def test_session_output_goes_to_the_item_and_a_failure_tail_to_the_decisions_log(self):
+        fc.set_log_tag("a-1", self.dir / "item")
+        lines = []
+        fake = mock.Mock(returncode=1)
+
+        def run(cmd, stdout=None, stderr=None):
+            stdout.write("starting\n[FATAL] bad config syzkaller param\n")
+            return fake
+        with mock.patch.object(fc.subprocess, "run", run), \
+             mock.patch.object(fc, "log", lines.append):
+            self.assertEqual(fc.session("start", "x.cfg")[0], 1)
+        self.assertIn("[FATAL] bad config", (self.dir / "item" / "session.log").read_text())
+        self.assertTrue(any("FATAL" in ln for ln in lines), lines)
+
+    def test_log_files_picks_the_right_file(self):
+        item = {"id": "a-1", "config": "/c/A.cfg"}
+        d = {"layout": "plan", "items": [item]}
+        idir = self.dir / "campaigns" / "c" / "A" / "a-1"
+        res = idir / "workdir" / "results"
+        res.mkdir(parents=True)
+        for n in ("run-20261027-100000.log", "run-20261027-120000.log",
+                  "executor-20261027-100000-0.log", "executor-20261027-120000-0.log"):
+            (res / n).write_text("x")
+        job = idir / "triage" / "t2"
+        job.mkdir(parents=True)
+        with mock.patch.object(fc, "CAMPAIGN_DIR", self.dir / "campaigns"), \
+             mock.patch.object(fc, "REPO_ROOT", self.dir), \
+             mock.patch.object(fc, "load_def", lambda n: d), \
+             mock.patch.object(fc, "load_state", lambda n: {"current_item": "a-1"}), \
+             mock.patch.object(fc, "is_plan_layout", lambda n: True):
+            self.assertEqual(fc.log_files("c"), [self.dir / "campaigns" / "c" / "campaign.log"])
+            self.assertEqual(fc.log_files("c", kind="manager"), [res / "run-20261027-120000.log"])
+            self.assertEqual(fc.log_files("c", kind="executor"),
+                             [res / "executor-20261027-120000-0.log"])      # the last run's only
+            self.assertEqual(fc.log_files("c", item_id="a-1"), [idir / "session.log"])
+            self.assertEqual(fc.log_files("c", triage_job="t2", kind="probes"), [job / "probes.log"])
+            with self.assertRaises(ValueError):
+                fc.log_files("c", kind="probes")                            # needs --triage
+
+
 class BoxRunnerTest(unittest.TestCase):
     """The box runner runs the queue's head to its end, records it, takes the
     next; it stops the box only on a halt the next campaign would repeat."""

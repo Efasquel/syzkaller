@@ -1,7 +1,7 @@
 # Campaign planning — redesign
 
-Status: revision 5, 2026-10-22, being implemented. Phases 1, 2a, 2b and 3 are
-in the code (2026-10-23/27); phases 4 and 5 are not -- see §11 for what each
+Status: revision 5, 2026-10-22, being implemented. Phases 1 to 4 are in the
+code (2026-10-23/27); phase 5 (plateau) is not -- see §11 for what each
 covers and §12 for the decisions taken on the way. A simulator of the whole
 model lives in `playground/` (§13).
 
@@ -360,28 +360,30 @@ finish first.)
 | `workdir/…/results/executor-<n>.log` | executor stdout | **opened `"w"` on every start**: overwritten by the next run unless an incident happened to collect it |
 | `triage/.state/<job>.launchd.log` | standalone triage only | campaign-born jobs have no log of their own; they go into the catch-all |
 
-### Proposed
+### Now (implemented 2026-10-27)
 
 The rule is **every process writes to its own file, in the directory of what it
 is working on.** Nothing inherits the runner's stdout.
 
 | file | contents |
 |---|---|
-| `campaigns/<name>/campaign.log` | **The one log to read.** Every coordinator decision, one line each, tagged with the item: `14:02:11 [AppleFDEKeyStore_gram-2] crash → triage t3`. It holds the runner's lifecycle, item start/end with reason, incidents, triage start and outcome, operator requests applied, and a one-line result for each results commit (plus a tail on failure). Rotated by rename, never truncated. |
+| `campaigns/<name>/campaign.log` | **The one log to read.** Every coordinator decision, one line each, tagged with the item: `14:02:11  [AppleFDEKeyStore_gram-2] crash → triage t3`. It holds the runner's lifecycle, item start/end with reason, incidents, triage start and outcome, operator requests applied, one line per synchronous results commit, and the last lines of any fuzz-session, triage or results command that failed. Rotated by rename, never truncated. Under launchd `log()` writes here only; at a terminal it also prints. |
+| `<config>/<item>/session.log` | fuzz-session's output for that item (start, stop, collect). |
+| `<config>/<item>/results.log` | fuzz-results commit output for that item. Per item rather than folded into `campaign.log`: a detached commit finishes after the coordinator moved on, so only its own file can hold its result. |
 | `<config>/<item>/workdir/results/run-<ts>.log` | syz-manager, per run (unchanged) |
-| `<config>/<item>/workdir/results/executor-<ts>-<n>.log` | executor, **per run**, no longer overwritten |
+| `<config>/<item>/workdir/results/executor-<ts>-<n>.log` | executor, **per run** (named after the run's log, opened for append), no longer overwritten; `collect` takes the crashing run's |
 | `<config>/<item>/triage/t<N>/triage.log` | the job's own decisions (merge, minimize steps, outcome) |
-| `<config>/<item>/triage/t<N>/probes.log` | per-probe chatter, kept for forensics (you cannot know in advance which job ends STUCK); **capped per job**, rotated by rename at ~20 MB, and never anywhere else |
-| `run/box.out` | launchd's stdout/stderr for the runner. Expected to be **near-empty**: only an interpreter traceback or a launchd-level failure. |
+| `<config>/<item>/triage/t<N>/probes.log` | syz-ring-repro's per-probe output, kept for forensics (you cannot know in advance which job ends STUCK); rotated by rename at 20 MB (`probes.log.1`), and never anywhere else. A standalone `triage.py run` writes it too. |
+| `campaigns/.state/box.launchd.log` (or `<name>.launchd.log` for a per-campaign agent) | launchd's stdout/stderr: the box runner's few lines between campaigns, and otherwise **near-empty** -- a traceback here means the driver itself broke. (Kept in `.state/` rather than `run/`: launchd holds the descriptor, and `run/` is the folder you may delete.) |
 
-This removes the launchd catch-all, `results.log` and the duplicated decision
-stream: each campaign has **one** log file instead of three. Per-run and
-per-job files exist because their content belongs to that run or job.
+A legacy campaign keeps `.state/<name>.coordinator.log` and
+`.state/<name>.results.log`, and its subprocesses' output still goes to the
+launchd log.
 
-One reader for all of them: `fuzz-campaign.py log <name> [-f] [--item ID]
-[--triage tN] [--manager|--executor|--probes]` picks the right file or files.
-You never need to remember paths. `log <name> -f` is the `tail -f` you watch
-during a run.
+One reader for all of them: `fuzz-campaign.py log <name> [-f] [-n N] [--item
+ID] [--triage tN] [--manager|--executor|--session|--results|--probes]` picks
+the right file or files; `--item` defaults to the running item. You never need
+to remember paths. `log <name> -f` is the `tail -f` you watch during a run.
 
 All of our own logs use the same timestamp format (`timefmt.stamp()`).
 syz-manager's format is left alone.
@@ -515,9 +517,9 @@ Each phase ships alone and leaves the box working.
    meaning "the box moves on", `resume` re-queueing, and box-level `status`.
    (No `queue add --as`: a campaign is created by `new`, and run again with
    `new --copy`.)
-4. **Logs** -- pending: subprocess output redirected to the per-run and
-   per-job files, `campaign.log`, the `log` command, per-run executor logs,
-   and the capped `probes.log`.
+4. **Logs** -- done 2026-10-27: subprocess output redirected to the per-item
+   and per-job files, `campaign.log` tagged per item, the `log` command,
+   per-run executor logs, and the rotated `probes.log`.
 5. **Plateau** -- pending: opt-in `max_plateau_hours` (`new` already stores
    it; nothing enforces it yet).
 

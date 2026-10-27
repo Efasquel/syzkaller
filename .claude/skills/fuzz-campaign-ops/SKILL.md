@@ -92,8 +92,9 @@ how the brake works.
 ## Watching
 
 ```sh
-tail -f campaigns/.state/<name>.coordinator.log   # decisions only — use this
-tail -f campaigns/.state/<name>.launchd.log       # + minimizer probe chatter
+/usr/bin/python3 scripts/fuzz-campaign.py log <name> -f        # decisions, tagged per item (campaigns/<name>/campaign.log)
+/usr/bin/python3 scripts/fuzz-campaign.py log <name> --manager | --executor | --item <id> [--results]
+/usr/bin/python3 scripts/fuzz-campaign.py log <name> --triage tN [--probes]   # a job's decisions / probe output
 /usr/bin/python3 scripts/fuzz-campaign.py status <name> -w
 /usr/bin/python3 scripts/fuzz-campaign.py quarantine <name> [--all]   # what is benched, and why
 /usr/bin/python3 scripts/runstats.py curve <campaign>/<config-id>/<item-id> --field blocks|exec   # over fuzz-hours
@@ -191,5 +192,5 @@ before any session starts. Anything written into it becomes the halt reason.
 cd /Users/Shared/fuzz-run
 sudo -u fuzz /usr/bin/python3 scripts/fuzz-campaign.py doctor <name>
 /usr/bin/python3 scripts/fuzz-campaign.py queue add <name>    # box agent installed once: install --box --agent --user fuzz
-tail -f campaigns/.state/<name>.coordinator.log
+/usr/bin/python3 scripts/fuzz-campaign.py log <name> -f
 ```

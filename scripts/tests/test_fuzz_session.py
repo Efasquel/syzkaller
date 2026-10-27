@@ -166,6 +166,16 @@ class RetireScratchTest(unittest.TestCase):
         self.assertIsNone(fs.retire_scratch(self.dir / "absent"))
 
 
+class ExecutorLogNameTest(unittest.TestCase):
+    def test_executor_logs_are_named_after_their_run(self):
+        st = {"stdout": "/w/results/run-20261027-162756.log"}
+        self.assertEqual(fs.run_stamp_prefix(st), "20261027-162756-")
+        self.assertEqual(fs.run_stamp_prefix(Path("/w/results/run-20261027-162756.log")),
+                         "20261027-162756-")
+        # no run log: the old executor-<n>.log name
+        self.assertEqual(fs.run_stamp_prefix({}), "")
+
+
 class RpcPortTest(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())

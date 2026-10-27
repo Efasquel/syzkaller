@@ -223,19 +223,60 @@ def now_iso():
     return timefmt.now_iso()
 
 
-# The driver's own decisions, separated from the subprocess output launchd
-# captures. Everything log() writes goes to BOTH: stdout (interleaved with
-# syz-ring-repro's per-probe chatter, useful for forensics) and this file (the
-# coordinator's narrative alone, which is what you actually want to `tail -f`).
+# The driver's own decisions: campaigns/<name>/campaign.log, the one log to read
+# (campaign-planning.md §6). Every subprocess writes its own file beside what it
+# works on -- the session's in its item, triage's and the probes' in the job --
+# so this one holds the coordinator's narrative alone. Under launchd log() writes
+# only here; at a terminal it also prints, so a `run` started by hand is visible.
+# A legacy campaign keeps .state/<name>.coordinator.log.
 _coord_log = None
+# The item the coordinator is on, tagged onto every line: "[Fake_bsdA-2] crash".
+_log_tag = None
+# That item's folder, where the session's and the results commits' output go.
+_item_dir = None
+
+
+def coord_log_path(name):
+    if is_plan_layout(name):
+        return campaign_dir(name) / "campaign.log"
+    return STATE_DIR / ("%s.coordinator.log" % name)
+
+
+def set_log_tag(tag, item_dir=None):
+    """Tag log lines with the item `tag`, and send subprocess output to
+    `item_dir` (None: the item has no folder of its own -- legacy)."""
+    global _log_tag, _item_dir
+    _log_tag, _item_dir = tag, (Path(item_dir) if item_dir else None)
+
+
+def subprocess_out(path, cmd):
+    """`path` opened for appending, headed by the command about to write to it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = open(path, "a")
+    out.write("\n%s  $ %s\n" % (timefmt.stamp(), " ".join(str(c) for c in cmd)))
+    out.flush()
+    return out
+
+
+def log_tail(path, rc, what, lines=3):
+    """Put a failed subprocess's last lines into the decisions log, so the
+    reason is where you are already reading."""
+    try:
+        tail = [ln for ln in Path(path).read_text(errors="replace").splitlines() if ln.strip()]
+    except OSError:
+        tail = []
+    log("%s failed (rc=%d); see %s" % (what, rc, path))
+    for ln in tail[-lines:]:
+        log("  | %s" % ln[:300])
 
 
 def open_coord_log(name):
-    """Start mirroring log() into <name>.coordinator.log. Best effort."""
+    """Start writing log() into the campaign's decisions log. Best effort."""
     global _coord_log
-    path = STATE_DIR / ("%s.coordinator.log" % name)
+    path = coord_log_path(name)
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         rotate_log(path, DEFAULTS["max_log_mb"], own_fd=True)
         _coord_log = open(path, "a")
         atexit.register(_close_coord_log)
@@ -274,11 +315,22 @@ def rotate_log(path, max_mb, own_fd=False):
         return False
 
 
+def _stdout_is_terminal():
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def log(msg):
-    """Timestamped line to stdout -- launchd captures it to the campaign log."""
-    line = "%s  %s\n" % (timefmt.stamp(), msg)
-    sys.stdout.write(line)
-    sys.stdout.flush()
+    """One timestamped line, tagged with the item the coordinator is on: into
+    the decisions log when one is open, and to stdout when nothing is open or
+    stdout is a terminal. Under launchd stdout is the agent's own log, which so
+    no longer repeats every decision."""
+    line = "%s  %s%s\n" % (timefmt.stamp(), "[%s] " % _log_tag if _log_tag else "", msg)
+    if _coord_log is None or _stdout_is_terminal():
+        sys.stdout.write(line)
+        sys.stdout.flush()
     if _coord_log is not None:
         try:
             _coord_log.write(line)
@@ -615,7 +667,14 @@ def session(*args, capture=False):
                            stderr=subprocess.STDOUT, text=True)
         return p.returncode, p.stdout
     log("$ fuzz-session %s" % " ".join(str(a) for a in args))
-    return subprocess.run(cmd).returncode, ""
+    if _item_dir is None:
+        return subprocess.run(cmd).returncode, ""
+    path = _item_dir / "session.log"
+    with subprocess_out(path, cmd) as out:
+        rc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log_tail(path, rc, "fuzz-session %s" % args[0])
+    return rc, ""
 
 
 def inspect(sid):
@@ -1403,7 +1462,11 @@ def results_commit(s, d, event, cfg=None, detach=False):
            "--push", "detach" if event in ("restart", "corpus", "crash", "hang") else "wait"]
     if event in ("start", "restart"):
         cmd.append("--no-freq")         # fast path: the manager is waiting on us
-    out = open(STATE_DIR / ("%s.results.log" % s["name"]), "a")
+    # The commit's output goes to its item's results.log; a legacy campaign's
+    # to the old .state/<name>.results.log.
+    idir = effective_item_dir(s.get("current_config")) or _item_dir
+    path = (idir / "results.log") if idir else STATE_DIR / ("%s.results.log" % s["name"])
+    out = subprocess_out(path, cmd)
     try:
         if detach:
             subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out,
@@ -1411,8 +1474,11 @@ def results_commit(s, d, event, cfg=None, detach=False):
         else:
             rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT, timeout=600).returncode
+            out.flush()
             if rc != 0:
-                log("results commit (%s) failed; see %s" % (event, out.name))
+                log_tail(path, rc, "results commit (%s)" % event)
+            else:
+                log("results commit (%s) ok" % event)
     except (OSError, subprocess.SubprocessError) as e:
         log("results commit (%s) failed: %s" % (event, e))
     finally:
@@ -1439,7 +1505,17 @@ def triage(*args, capture=False):
                            stderr=subprocess.STDOUT, text=True)
         return p.returncode, p.stdout
     log("$ triage %s" % " ".join(str(a) for a in args))
-    return subprocess.run(cmd).returncode, ""
+    # Triage's own decisions go to its job's triage.log (its probes already
+    # write probes.log there); a job that cannot be found keeps stdout.
+    st = triage_state(args[1]) if len(args) > 1 else None
+    if not (st and st.get("dir")):
+        return subprocess.run(cmd).returncode, ""
+    path = Path(st["dir"]) / "triage.log"
+    with subprocess_out(path, cmd) as out:
+        rc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log_tail(path, rc, "triage %s" % args[0])
+    return rc, ""
 
 
 def evidence_root(s):
@@ -2707,6 +2783,8 @@ def cmd_run(name):
         # the culprit, or halts the campaign if triage cannot make progress.
         if s["phase"] == "triaging":
             item = current_item(s, d)
+            set_log_tag(item["id"] if item else None,
+                        item_paths(name, item)["dir"] if item and d.get("layout") == "plan" else None)
             if any(r["verb"] == "halt" for r in requests):
                 halt_by_operator(s, d, item)
                 return
@@ -2741,6 +2819,8 @@ def cmd_run(name):
             continue
 
         step = schedule.next_step(order, s["items"], requests)
+        if step.kind in ("halt", "done"):
+            set_log_tag(None)               # about the campaign, not an item
         if step.kind == "halt":
             halt_by_operator(s, d, current_item(s, d))
             return
@@ -2770,6 +2850,7 @@ def cmd_run(name):
             continue
 
         item = next(it for it in def_items(d) if it["id"] == step.item)
+        set_log_tag(item["id"], item_paths(name, item)["dir"] if d.get("layout") == "plan" else None)
         budget = budget_seconds(item)
         rec = s["items"][item["id"]]
         was_running = rec["status"] == "running"
@@ -2979,6 +3060,7 @@ def cmd_run_box(idle_seconds=10):
             return
         finally:
             _close_coord_log()              # the box's own lines are not that campaign's
+            set_log_tag(None)
         st = load_state(name)
         move, what = box_next_move(st.get("status"), st.get("halt_reason"))
         if move == "stop":
@@ -3044,6 +3126,63 @@ def cmd_queue(action, name=None, at=None):
         print("moved %s to position %d" % (name, pos))
         return 0
     die("unknown queue action %r" % action)
+
+
+LOG_KINDS = ("manager", "executor", "session", "results", "probes")
+
+
+def log_files(name, item_id=None, triage_job=None, kind=None):
+    """The file(s) `log` shows (campaign-planning.md §6): the decisions log by
+    default; an item's manager run log, executor logs, session or results
+    output; a triage job's triage.log or probes.log. Raises ValueError with
+    what is missing."""
+    if not (item_id or triage_job or kind):
+        return [coord_log_path(name)]
+    d = load_def(name)
+    if d.get("layout") != "plan":
+        raise ValueError("a legacy campaign has only its decisions log")
+    if triage_job:
+        jobs = sorted(campaign_dir(name).glob("*/*/triage/%s" % triage_job))
+        if not jobs:
+            raise ValueError("no triage job %s in campaign %s" % (triage_job, name))
+        return [jobs[0] / ("probes.log" if kind == "probes" else "triage.log")]
+    if kind == "probes":
+        raise ValueError("--probes belongs to a triage job: add --triage tN")
+    s = load_state(name)
+    item_id = item_id or s.get("current_item")
+    item = next((it for it in d["items"] if it["id"] == item_id), None)
+    if item is None:
+        raise ValueError("no item %r in campaign %s (ids: %s)"
+                         % (item_id, name, ", ".join(it["id"] for it in d["items"])))
+    paths = item_paths(name, item)
+    kind = kind or "session"
+    if kind in ("session", "results"):
+        return [paths["dir"] / ("%s.log" % kind)]
+    results = paths["workdir"] / "results"
+    runs = sorted(results.glob("run-*.log"))
+    if not runs:
+        raise ValueError("item %s has not run yet (no %s/run-*.log)" % (item_id, results))
+    if kind == "manager":
+        return [runs[-1]]
+    stamp = runs[-1].name[len("run-"):-len(".log")]
+    exes = sorted(results.glob("executor-%s-*.log" % stamp)) or sorted(results.glob("executor-*.log"))
+    if not exes:
+        raise ValueError("no executor log for item %s's last run" % item_id)
+    return exes
+
+
+def cmd_log(name, follow=False, lines=40, item=None, triage_job=None, kind=None):
+    """`log <name>`: tail the right file without remembering where it lives."""
+    try:
+        files = log_files(name, item, triage_job, kind)
+    except ValueError as e:
+        die(str(e))
+    present = [str(f) for f in files if Path(f).exists()]
+    if not present:
+        die("%s does not exist yet" % ", ".join(str(f) for f in files))
+    # -F follows across the rotation of the decisions log and probes.log
+    args = ["tail", "-n", str(lines)] + (["-F"] if follow else [])
+    os.execvp("tail", args + present)
 
 
 # --- authoring + control -----------------------------------------------------
@@ -3235,8 +3374,8 @@ def readme_block(name, p, box, s=None):
               "effective config (`%s.<item>.cfg`, what syz-manager ran), `quarantine.json`, "
               "`workdir/` (corpus, `results/progress.jsonl`, cover logs), `triage/t<N>/`." % (name, name),
               "",
-              "Watch: `fuzz-campaign.py status %s -w`; decisions in "
-              "`campaigns/.state/%s.coordinator.log`; what the quarantine benched: "
+              "Watch: `fuzz-campaign.py status %s -w`; decisions in `campaign.log` "
+              "(`fuzz-campaign.py log %s -f`); what the quarantine benched: "
               "`fuzz-campaign.py quarantine %s --all`; verification manifest: "
               "`fuzz-campaign.py replay %s`." % (name, name, name, name)]
     out = outcome_rows(name, p, s) if s else []
@@ -5674,6 +5813,17 @@ def main():
                                     "name, the box runner: campaigns/queue.json in order")
     sp.add_argument("name", nargs="?")
 
+    sp = sub.add_parser("log", help="tail a campaign's logs: its decisions by default; "
+                                    "--item / --triage and a kind pick the others")
+    sp.add_argument("name")
+    sp.add_argument("-f", "--follow", action="store_true")
+    sp.add_argument("-n", "--lines", type=int, default=40)
+    sp.add_argument("--item", help="an item id (default: the one running)")
+    sp.add_argument("--triage", metavar="tN", help="a triage job: its triage.log, or --probes")
+    kinds = sp.add_mutually_exclusive_group()
+    for k in LOG_KINDS:
+        kinds.add_argument("--%s" % k, dest="kind", action="store_const", const=k)
+
     sp = sub.add_parser("queue", help="what the box runs: ls | add <name> [--at N] | "
                                       "rm <name> | mv <name> N")
     sp.add_argument("action", choices=["ls", "add", "rm", "mv"])
@@ -5759,6 +5909,8 @@ def main():
             cmd_run(args.name)
         else:
             cmd_run_box()
+    elif args.cmd == "log":
+        cmd_log(args.name, args.follow, args.lines, args.item, args.triage, args.kind)
     elif args.cmd == "queue":
         if args.action != "ls" and not args.name:
             p.error("queue %s needs a campaign name" % args.action)

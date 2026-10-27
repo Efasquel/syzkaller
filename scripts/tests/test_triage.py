@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for triage.py: state machine, panic reconcile, dedup."""
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -9,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import triage  # noqa: E402
@@ -269,6 +272,32 @@ class ExecScratchPrune(unittest.TestCase):
     def test_missing_exec_dir_is_not_an_error(self):
         shutil.rmtree(self.exec_dir)
         self.assertEqual(triage.prune_exec_scratch(self.st), 0)
+
+
+class ProbesLogTest(unittest.TestCase):
+    """A probe's output goes to the job's probes.log, not to whoever runs
+    triage: one minimization once wrote 33k lines into the campaign's log."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.st = {"dir": str(self.tmp), "name": "t1"}
+
+    def test_a_probe_writes_to_probes_log(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = triage.run_probe(self.st, ["/bin/echo", "probe chatter"])
+        self.assertEqual(rc, 0)
+        text = (self.tmp / "probes.log").read_text()
+        self.assertIn("$ /bin/echo probe chatter", text)
+        self.assertIn("probe chatter\n", text)
+
+    def test_probes_log_rotates_past_its_cap(self):
+        (self.tmp / "probes.log").write_text("old\n")
+        with mock.patch.object(triage, "PROBES_MAX_MB", 0):
+            triage.run_probe(self.st, ["/bin/echo", "new"])
+        self.assertEqual((self.tmp / "probes.log.1").read_text(), "old\n")
+        self.assertNotIn("old", (self.tmp / "probes.log").read_text())
 
 
 class FakeRingRepro:

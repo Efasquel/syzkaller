@@ -304,12 +304,18 @@ sudo launchctl print gui/502/com.fuzz-campaign.jpeg | head -30
 ## Operating it
 
 ```sh
-# what the coordinator decided -- crashes, quarantine, triage, budget.
-# This is the one to `tail -f`: minimizer probe chatter does NOT go here.
-tail -f /Users/Shared/fuzz-run/campaigns/.state/jpeg.coordinator.log
+# what the coordinator decided -- crashes, quarantine, triage, budget -- each
+# line tagged with its item. campaigns/jpeg/campaign.log; this is the one to follow.
+/usr/bin/python3 scripts/fuzz-campaign.py log jpeg -f
 
-# everything, including syz-ring-repro's per-probe output (forensics; large)
-tail -f /Users/Shared/fuzz-run/campaigns/.state/jpeg.launchd.log
+# the rest, each beside what it belongs to (default item: the running one)
+/usr/bin/python3 scripts/fuzz-campaign.py log jpeg --manager            # syz-manager's run log
+/usr/bin/python3 scripts/fuzz-campaign.py log jpeg --executor           # this run's executors
+/usr/bin/python3 scripts/fuzz-campaign.py log jpeg --item jpeg_gram-2   # fuzz-session's output (--results: commits)
+/usr/bin/python3 scripts/fuzz-campaign.py log jpeg --triage t3 [--probes]   # a job's decisions / probe output
+
+# the agent's own stdout: near-empty -- a traceback means the driver itself broke
+cat /Users/Shared/fuzz-run/campaigns/.state/box.launchd.log
 
 # campaign state (phase: fuzzing | triaging, incidents, benched sigs)
 cd /Users/Shared/fuzz-run && /usr/bin/python3 scripts/fuzz-campaign.py status jpeg
@@ -699,5 +705,5 @@ recurrence while fuzzing is triaged as usual.
 `new` another campaign, then install its own agent (each campaign gets its own
 label). Only ever run **one** at a time — they share `/dev/pishi`. A campaign
 `migrate` moved from the legacy layout carries its old coordinator log inside
-`campaigns/<name>/`; a campaign that runs today still logs to
-`campaigns/.state/<name>.coordinator.log`, until the log phase moves it.
+`campaigns/<name>/`; a campaign that runs today logs to
+`campaigns/<name>/campaign.log` (`fuzz-campaign.py log <name>`).

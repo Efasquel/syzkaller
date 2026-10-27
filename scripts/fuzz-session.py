@@ -964,6 +964,14 @@ def executor_binary(state, scratch):
     return dest
 
 
+def run_stamp_prefix(state_or_log):
+    """'20261027-162756-' from a session state (its run log, `stdout`) or a run
+    log path; '' when there is none, which keeps the old executor-<n>.log name."""
+    logf = state_or_log.get("stdout") if isinstance(state_or_log, dict) else state_or_log
+    m = re.search(r"run-(\d{8}-\d{6})\.log$", str(logf or ""))
+    return "%s-" % m.group(1) if m else ""
+
+
 def launch_executor(state, index, port):
     """Start one 'syz-executor runner <index> 127.0.0.1 <port>' from a scratch dir."""
     if not EXECUTOR_BIN.exists() or not os.access(EXECUTOR_BIN, os.X_OK):
@@ -971,8 +979,12 @@ def launch_executor(state, index, port):
     scratch = exec_scratch(state["id"], index)
     scratch.mkdir(parents=True, exist_ok=True)
     binary = executor_binary(state, scratch)
-    logf = str(Path(state["workdir"]) / "results" / ("executor-%d.log" % index))
-    log_fh = open(logf, "w")
+    # One file per run and executor, named after the run's own log: opened "w"
+    # under a fixed name, every start overwrote the previous run's output unless
+    # an incident had happened to collect it first.
+    logf = str(Path(state["workdir"]) / "results" / ("executor-%s%d.log"
+                                                     % (run_stamp_prefix(state), index)))
+    log_fh = open(logf, "a")
     proc = subprocess.Popen(
         [str(binary), "runner", str(index), "127.0.0.1", str(port)],
         stdout=log_fh, stderr=subprocess.STDOUT,
@@ -2168,7 +2180,10 @@ def cmd_collect(target, kind="snapshot", out=None, pad=300, since=None,
     grab(state.get("config"))
     grab(latest_run_log(workdir), "logs")
     grab(results / "manager.log", "logs")
-    for exe in sorted(results.glob("executor-*.log")):
+    # The executors of the run being collected: executor-<run stamp>-<n>.log
+    # (older trees: executor-<n>.log, whose last run is the only one left).
+    stamp = run_stamp_prefix(latest_run_log(workdir))
+    for exe in sorted(results.glob("executor-%s*.log" % stamp if stamp else "executor-*.log")):
         grab(exe, "logs")
     grab(latest_bench(workdir), "logs")
     grab(state_file(sid))                       # the registry record
