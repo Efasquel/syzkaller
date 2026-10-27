@@ -190,6 +190,12 @@ class NormalizeTest(TreeTest):
             ("no config key",
              self.plan(items=[{"max_hours": 1}]),
              "config is missing"),
+            ("box.json as an item",
+             self.plan(items=[{"config": "config/box.json"}]),
+             "box.json holds the machine's keys"),
+            ("not a .cfg",
+             self.plan(items=[{"config": "config/a.json"}]),
+             "a.json is not a syz-manager config (.cfg)"),
             ("bad name",
              self.plan(name="fde eval"),
              "name 'fde eval'"),
@@ -329,6 +335,23 @@ class RenderTest(unittest.TestCase):
         eff["enable_syscalls"].append("extra")
         self.assertEqual(cfg, cfg_before)
         self.assertEqual(box, box_before)
+
+
+class ConfigProblemsTest(TreeTest):
+    def test_an_empty_enable_syscalls_is_a_problem_reported_once_per_config(self):
+        write(self.root / "config" / "e.cfg", dict(CLEAN_CFG, enable_syscalls=[]))
+        p = pl.normalize(self.plan(items=[{"config": "config/a.cfg"},
+                                          {"config": "config/e.cfg"},
+                                          {"config": "config/e.cfg"}]), self.root)
+        problems = pl.config_problems(p)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("e.cfg", problems[0])
+        self.assertIn("every syscall", problems[0])
+
+    def test_clean_configs_have_no_problem(self):
+        p = pl.normalize(self.plan(items=[{"config": "config/a.cfg"},
+                                          {"config": "config/b.cfg"}]), self.root)
+        self.assertEqual(pl.config_problems(p), [])
 
 
 class NormalizedShapeTest(TreeTest):

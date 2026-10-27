@@ -216,7 +216,12 @@ def normalize(plan, root):
             if not path.is_absolute():
                 path = root / path
             item["config"] = str(path)
-            if not path.exists():
+            if path.suffix != ".cfg":
+                problems.append("%s: %s is not a syz-manager config (.cfg)%s" % (
+                    where, path.name,
+                    "; box.json holds the machine's keys and is merged into every item"
+                    if path.name == "box.json" else ""))
+            elif not path.exists():
                 problems.append("%s: config not found: %s" % (where, path))
         item.setdefault("max_hours", defaults["max_hours"])
         item.setdefault("max_plateau_hours", defaults["max_plateau_hours"])
@@ -371,6 +376,27 @@ def drift(cfg, box):
 
 
 # --- for the driver and for `plan check` ----------------------------------------
+
+def config_problems(plan):
+    """What makes a normalized campaign's configs unfit to fuzz, read from the
+    configs themselves (normalize only checks that they exist). One line per
+    problem, [] when there is none.
+
+    An empty enable_syscalls is the one that matters: syz-manager reads it as
+    EVERY syscall in the descriptions, IOKit included -- the opposite of an
+    experiment, and on this box a stream of panics."""
+    problems = []
+    for cfg in dict.fromkeys(it["config"] for it in plan["items"]):
+        try:
+            conf = cfgutil.load(cfg)
+        except (OSError, ValueError) as e:
+            problems.append("config %s: %s" % (Path(cfg).name, e))
+            continue
+        if not conf.get("enable_syscalls"):
+            problems.append("config %s: enable_syscalls is empty, which syz-manager "
+                            "reads as every syscall" % Path(cfg).name)
+    return problems
+
 
 def _hours_text(hours):
     """6 rather than 6.0 in a table column, 1.5 when it is not whole."""

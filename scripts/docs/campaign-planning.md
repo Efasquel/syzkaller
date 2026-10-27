@@ -165,11 +165,18 @@ So:
   `trials` knob and no `order` knob: you choose both by writing the list.
   `new … --repeat 3` is sugar that writes the entries out, so the plan always
   shows them.
-- **`id`** is optional. Omitted, `new` derives it when it writes the plan:
-  `<config-id>-1`, `-2`, `-3` — always suffixed, so a config run once is
-  `AppleFDEKeyStore_gram-1`, and the first sample's folder never repeats the
-  config's name. Ids are `[A-Za-z0-9_-]` (they are folder names and part of
-  the session id) and unique within the plan.
+- **`id`** is optional. Omitted, `new` derives it and **writes it into
+  `campaign.json`**: `<config-id>-1`, `-2`, `-3` — always suffixed, so a config
+  run once is `AppleFDEKeyStore_gram-1`, and the first sample's folder never
+  repeats the config's name. Written down, an id stays put when entries are
+  inserted later; a derived one is the entry's position among those of its
+  config, so an insertion would hand a finished sample's record to another
+  entry. (An entry you add by hand without an id is still derived, the same
+  way, when the campaign is read.) Ids are `[A-Za-z0-9_-]` (they are folder
+  names and part of the session id) and unique within the campaign.
+- **An item's `config` must be a `.cfg`** whose `enable_syscalls` is not
+  empty: `new`, `plan check` and `doctor` refuse otherwise. `box.json` is not a
+  config, and an empty list is read by syz-manager as every syscall.
 - **`max_hours`** replaces `budget_hours`, with the same clocks (`wall` /
   `fuzz` / `real`; `real` by default, see §12). `new --item id=…,max=…` gives per-item values from the CLI.
 - **`reuse_known_culprits`** (default `false`): when a crash's signature maps
@@ -231,7 +238,10 @@ stored only so `status` can show it.
 An item's `status` is one of `pending | running | done | abandoned | skipped`.
 Its `reason` always says why it ended: `max_hours`, `plateau`, `next` (all
 `done` — an item cut short by `next` is still a sample, and the reason is
-visible), `max_crashes` (`abandoned`), or `skip`.
+visible), `max_crashes` (`abandoned`), or `skip` (`skipped`). An item that
+ran keeps its clocks, crash counts and bug ids whatever the reason, so a
+running item cut by `skip` is left out of the samples but not out of the
+record.
 
 ---
 
@@ -312,7 +322,7 @@ visible), `max_crashes` (`abandoned`), or `skip`.
 | verb | effect |
 |---|---|
 | `next <name>` | End the running item now (`reason: next`) and move to the next one. |
-| `skip <name> <item>` | Mark a pending item `skipped`. If the item is the one running, this is the same as `next`. `unskip` reverts it for items that haven't run yet. |
+| `skip <name> <item>` | Mark a pending item `skipped`. If the item is the one running, it ends now like `next`, but as `skipped` (reason `skip`) with its clocks and counts kept: the operator left it out of the samples. `unskip` reverts it for items that haven't run yet. |
 | `halt <name>` | Halt **this campaign**: stop its manager, keep its state, and let the box move to the next campaign in the queue. |
 | `resume <name>` | Put a halted campaign back at the **front** of the queue; it continues where it stopped. |
 | `stop` / `STOP` / brake | Box-level, unchanged: stop everything, and start nothing. |

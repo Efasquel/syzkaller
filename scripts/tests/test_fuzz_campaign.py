@@ -899,6 +899,31 @@ class ClockTest(unittest.TestCase):
         fc.roll_budget_clocks(s)
         self.assertEqual(s["run_active_base"], 0.0)
 
+    def test_a_halt_is_not_charged_as_rebooting(self):
+        # The run ended at 16:35:50, the campaign sat halted, `resume` ran at
+        # 16:41:40 and the driver at 16:41:53: only the 13s after the resume
+        # are relaunch overhead. Counting from the run's end charged 6 minutes.
+        end = time.time() - 363
+        s = fc.init_state("camp")
+        s["resumed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 13))
+        with mock.patch.object(fc, "boot_epoch", lambda: end - 3600):
+            fc.reconcile_gap(s, dict(fc.DEFAULTS), since=fc.gap_origin(s, end))
+        self.assertLess(s["overhead_seconds"], 20)
+        # no resume: the origin is what the caller had
+        self.assertEqual(fc.gap_origin(fc.init_state("camp"), end), end)
+        # a resume before the last run ended changes nothing
+        old = fc.init_state("camp")
+        old["resumed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end - 60))
+        self.assertEqual(fc.gap_origin(old, end), end)
+
+    def test_resume_stamps_the_end_of_the_halt(self):
+        s = fc.init_state("camp")
+        s["status"] = "halted"
+        with mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "save_state", lambda st: None):
+            fc._set_status("camp", "running")
+        self.assertLess(abs(fc.timefmt.to_epoch(s["resumed_at"]) - time.time()), 5)
+
     def test_reconcile_gap_charges_reboot_overhead(self):
         s = fc.init_state("camp")
         s["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -1913,6 +1938,20 @@ class NewPlanTest(unittest.TestCase):
         self.assertEqual(plan["limits"], {"max_crashes": 7})     # only what was given
         self.assertNotIn("triage", plan)
         self.assertFalse(plan["defaults"]["reuse_known_culprits"])
+        # ids are written out, so inserting an entry later cannot move them
+        self.assertEqual([it["id"] for it in plan["items"]], ["AppleX_gram-1", "AppleX_gram-2"])
+
+    def test_new_refuses_a_config_that_would_fuzz_every_syscall(self):
+        empty = self._cfg("AppleX_empty", enable_syscalls=[])
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            fc.cmd_new("c", [empty], 1.0)
+        self.assertIn("every syscall", err.getvalue())
+        self.assertFalse((self.dir / "campaigns" / "c").exists())     # nothing written
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            fc.cmd_new("c", [str(fc.BOX_PATH)], 1.0)
+        self.assertIn("box.json", err.getvalue())
 
     def test_load_def_is_the_campaign_itself_with_the_runner_settings_resolved(self):
         cfg = self._cfg("AppleX_gram")
@@ -3176,6 +3215,22 @@ class SchedulerLoopTest(unittest.TestCase):
         self.assertEqual((s["items"]["a-1"]["status"], s["items"]["a-1"]["reason"]),
                          ("done", "next"))
         self.assertEqual(s["cursor"], 1)
+
+    def test_a_skip_of_the_running_item_keeps_it_skipped_with_its_record(self):
+        s = fc.init_state("camp")
+        s["active_seconds"] = 600.0
+        s["incidents"] = [{"item": "a-1", "kind": "crash", "bug_ids": ["BUG-0001"]}]
+
+        def operator_skips_the_running_item():
+            fc.req.append(self.state_dir / "camp.requests.json", "skip", "a-1")
+            return "request"
+        started = self._run(s, ["/a.cfg", "/b.cfg"], supervise=[operator_skips_the_running_item])
+        self.assertEqual(started, ["/a.cfg", "/b.cfg"])
+        rec = s["items"]["a-1"]
+        self.assertEqual((rec["status"], rec["reason"]), ("skipped", "skip"))
+        # left out of the samples, but what it ran and found is on record
+        self.assertEqual(rec["clocks"]["active_seconds"], 600)
+        self.assertEqual((rec["crashes"], rec["bug_ids"]), (1, ["BUG-0001"]))
 
     def test_a_next_that_arrives_between_restarts_still_cuts_the_running_item(self):
         """A crash-restart passes through the loop top; a request taken there

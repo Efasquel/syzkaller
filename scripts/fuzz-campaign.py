@@ -1202,13 +1202,17 @@ def end_item(s, item_id, reason):
         rec["status"] = schedule.end_status(reason)
         rec["reason"] = reason
         rec["ended_at"] = now_iso()
-        if reason != "skip":
-            rec["clocks"] = {k: round(s.get(k) or 0.0) for k in
-                             ("prep_seconds", "active_seconds", "triage_seconds", "overhead_seconds")}
-            incs = [i for i in s.get("incidents") or [] if i.get("item") == item_id]
-            rec["crashes"] = sum(1 for i in incs if i.get("kind") == "crash")
-            rec["hangs"] = sum(1 for i in incs if i.get("kind") == "hang")
-            rec["bug_ids"] = sorted({b for i in incs for b in i.get("bug_ids") or []})
+        # Only an item that ran ends here (a pending skip never reaches
+        # end_item), so its record is kept whatever the reason. A running item
+        # cut by `skip` stays `skipped` -- the operator left it out, so an
+        # analysis counting `done` samples does not take a partial run for one
+        # -- but what it ran, crashed and found is still on record.
+        rec["clocks"] = {k: round(s.get(k) or 0.0) for k in
+                         ("prep_seconds", "active_seconds", "triage_seconds", "overhead_seconds")}
+        incs = [i for i in s.get("incidents") or [] if i.get("item") == item_id]
+        rec["crashes"] = sum(1 for i in incs if i.get("kind") == "crash")
+        rec["hangs"] = sum(1 for i in incs if i.get("kind") == "hang")
+        rec["bug_ids"] = sorted({b for i in incs for b in i.get("bug_ids") or []})
     advance_config(s)
     refresh_readme(s)
 
@@ -2116,6 +2120,18 @@ def handle_crash(s, d, info):
     return started
 
 
+def gap_origin(s, since):
+    """Where the gap a relaunch accounts for starts: `since` (the last run's end
+    or the last checkpoint), but never before the last `resume`. Until the
+    resume the campaign was halted -- the box idle by decision, not rebooting --
+    and the last run's end predates the halt, so counting from it charged a
+    whole halt as reboot overhead (a 6-minute halt read "rebooting 0h08m")."""
+    resumed = timefmt.to_epoch(s.get("resumed_at"))
+    if resumed and (since is None or resumed > since):
+        return resumed
+    return since
+
+
 def reconcile_gap(s, d, since=None, now=None):
     """Charge the interval from `since` to now to reboot overhead.
 
@@ -2599,11 +2615,12 @@ def cmd_run(name):
     if s["phase"] == "triaging":
         # No fuzzing session to reconcile; the box is (or was) running triage,
         # resumed by the phase branch below.
-        reconcile_triage_gap(s, d, last_save)
+        reconcile_triage_gap(s, d, gap_origin(s, last_save))
     else:
         end = reconcile_boot(s, d)
         if end != RUN_ALIVE:          # a live manager was fuzzing all along
-            reconcile_gap(s, d, since=end if end is not None else last_save)
+            reconcile_gap(s, d, since=gap_origin(s, end if end is not None else last_save))
+    s.pop("resumed_at", None)
 
     while True:
         # `fuzz-campaign.py halt` writes the status into the state FILE. Only
@@ -2906,6 +2923,14 @@ def cmd_new(name, configs, max_hours=None, repeat=1, clock=None, max_crashes=Non
         p = planlib.normalize(plan, REPO_ROOT)
     except ValueError as e:
         die("campaign %r: %s" % (name, e))
+    problems = planlib.config_problems(p)
+    if problems:
+        die("campaign %r:\n  %s" % (name, "\n  ".join(problems)))
+    # Write the ids out. A derived id is the entry's position among the entries
+    # of the same config, so inserting one in front would hand an earlier
+    # sample's record to a different entry; written down, an id stays put.
+    plan["items"] = [dict({"id": n["id"]}, **{k: v for k, v in it.items() if k != "id"})
+                     for it, n in zip(plan["items"], p["items"])]
     campaign_dir(name).mkdir(parents=True, exist_ok=True)
     write_json(campaign_path(name), plan)
     write_json(state_path(name), init_state(name))
@@ -2945,6 +2970,9 @@ def cmd_plan_check(name, strict=False):
     drifted = [r for r in rows if r[4] != "-"]
     if drifted and strict:
         die("%d item(s) drift from box.json (--strict)" % len(drifted))
+    problems = planlib.config_problems(p)
+    if problems:
+        die("campaign %r:\n  %s" % (name, "\n  ".join(problems)))
     for cfg in dict.fromkeys(it["config"] for it in p["items"]):   # once per config
         try:
             conf = cfgutil.load(cfg)
@@ -3722,7 +3750,11 @@ def cmd_doctor(name):
             add("WARN", "config %s has no \"target\"%s" % (
                 cfg.name, " (neither does box.json)" if view is not conf else ""))
         if not view.get("enable_syscalls"):
-            add("WARN", "config %s has empty enable_syscalls" % cfg.name)
+            # Empty means every syscall to syz-manager. A legacy campaign is
+            # read-only, so it only warns there.
+            add("FAIL" if d.get("layout") == "plan" else "WARN",
+                "config %s has empty enable_syscalls (syz-manager fuzzes every "
+                "syscall)" % cfg.name)
         if d.get("layout") == "plan":
             # Inputs are read-only: the quarantine goes into the rendered copy.
             # What has to be writable is the campaign folder, checked below.
@@ -3948,6 +3980,7 @@ def _set_status(name, status, reason=None):
         s["halt_reason"] = reason
     if status == "running":
         s["halt_reason"] = None
+        s["resumed_at"] = now_iso()     # the halt ends here; see gap_origin
         s["consec_fast_crashes"] = 0
         s["startup_failures"] = 0
         # Nothing runs until the agent relaunches the driver; say so rather than
