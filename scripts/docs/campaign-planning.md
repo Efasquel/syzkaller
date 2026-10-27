@@ -411,11 +411,15 @@ Implemented 2026-10-27 (`lib/boxqueue.py`, `cmd_run_box`).
   `history` with how it ended, and the next one starts with no login or reboot
   needed. After a panic-reboot the agent finds the same head and resumes it.
 - Commands: `queue add <name> [--at N]`, `queue rm <name>`, `queue mv <name>
-  N`, `queue ls`. `add` refuses a missing, legacy or `done` campaign and one
-  already queued; nothing goes in front of a running head (`--at 0` becomes
-  1); `rm`/`mv` refuse the running head (`halt` ends it). The runner reads the
-  queue only between campaigns. Changes are locked and atomic, like the
-  request file.
+  N`, `queue ls`. Positions count from 1, the head, as `queue ls` numbers
+  them. `add` refuses a missing, legacy or `done` campaign and one already
+  queued; nothing goes in front of a running head (`--at 1` becomes 2);
+  `rm`/`mv` refuse the running head (`halt` ends it). `queue ls` says what
+  happens to each campaign -- running now, next and starting within seconds,
+  next but waiting for a busy box (and for what), halted -- and lists the
+  campaigns that recently ended, with how and why. The runner reads the queue
+  only between campaigns. Changes are locked and atomic, like the request
+  file.
 - How a campaign's end affects the box (from the halt reason, `halt_kind`):
 
   | campaign ends because | box |

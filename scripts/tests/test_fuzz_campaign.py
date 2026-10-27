@@ -33,6 +33,25 @@ def _load_campaign():
 
 
 fc = _load_campaign()
+
+# No test may write into the real tree's campaigns/ or run/. A test that does not
+# patch them itself -- e.g. one calling cmd_resume, which now queues the
+# campaign -- wrote campaigns/queue.json there, and sync then published it over
+# the box's own queue. Tests that need these dirs still patch their own.
+_TREE_GUARD = tempfile.TemporaryDirectory()
+_TREE_PATCHES = [mock.patch.object(fc, "CAMPAIGN_DIR", Path(_TREE_GUARD.name) / "campaigns"),
+                 mock.patch.object(fc, "RUN_DIR", Path(_TREE_GUARD.name) / "run")]
+
+
+def setUpModule():
+    for p in _TREE_PATCHES:
+        p.start()
+
+
+def tearDownModule():
+    for p in _TREE_PATCHES:
+        p.stop()
+    _TREE_GUARD.cleanup()
 # Tests that drive cmd_run take the per-campaign lock and read requests; without
 # this they would write into the repo's own run/ directory.
 fc.RUN_DIR = Path(tempfile.mkdtemp(prefix="fc-run-")) / "run"
@@ -1053,7 +1072,7 @@ class ClockTest(unittest.TestCase):
              mock.patch.object(fc, "inspect", lambda sid: alive), \
              mock.patch.object(fc, "breaker", lambda *a: "low disk"), \
              mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
-             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd, sid=None: None), \
              mock.patch.object(fc, "results_commit", lambda *a, **k: None), \
              mock.patch.object(fc, "session", lambda *a, **k: calls.append(a) or (0, "")):
             self.assertEqual(fc.supervise(s, d, "sid", budget=10 ** 9), "halted")
@@ -1335,7 +1354,7 @@ class HangDetectionTest(unittest.TestCase):
              mock.patch.object(fc, "inspect", fake_inspect), \
              mock.patch.object(fc, "breaker", lambda *a: None), \
              mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
-             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: stuck), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd, sid=None: stuck), \
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             return fc.supervise(s, d, "sid", budget=10 ** 9)
 
@@ -1369,7 +1388,7 @@ class HangDetectionTest(unittest.TestCase):
                                lambda sid: seq.pop(0) if len(seq) > 1 else seq[0]), \
              mock.patch.object(fc, "breaker", lambda *a: None), \
              mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
-             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd, sid=None: None), \
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             self.assertEqual(fc.supervise(s, d, "sid", budget=0), "budget")
 
@@ -1397,7 +1416,7 @@ class HangDetectionTest(unittest.TestCase):
              mock.patch.object(fc, "inspect", lambda sid: alive), \
              mock.patch.object(fc, "breaker", lambda *a: None), \
              mock.patch.object(fc, "quarantine_rotate_due", lambda st: False), \
-             mock.patch.object(fc, "stuck_executor_seconds", lambda dd: None), \
+             mock.patch.object(fc, "stuck_executor_seconds", lambda dd, sid=None: None), \
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             self.assertEqual(fc.supervise(s, d, "sid", budget=3600), "budget")
         # The first wait is the short startup poll (supervise has not yet seen
@@ -1637,6 +1656,18 @@ class EtimeTest(unittest.TestCase):
         with mock.patch.object(fc.subprocess, "run",
                                lambda *a, **k: type("R", (), {"stdout": ps})()):
             self.assertEqual(fc.stuck_executor_seconds(dict(fc.DEFAULTS)), 2315)
+
+    def test_another_sessions_stuck_exec_is_not_this_runs_hang(self):
+        """smoke's leftover exec, stuck 38 minutes, made every logtest run read
+        as hung 18s after it started -- a restart loop."""
+        ps = ("ELAPSED COMMAND\n"
+              "    38:35 /tmp/syz-exec-smoke.Fake_bsdB-2-0/syz-executor exec\n"
+              "    00:03 /tmp/syz-exec-logtest.Fake_bsdB-1-0/syz-executor exec\n")
+        with mock.patch.object(fc.subprocess, "run",
+                               lambda *a, **k: type("R", (), {"stdout": ps})()):
+            self.assertIsNone(fc.stuck_executor_seconds(dict(fc.DEFAULTS), "logtest.Fake_bsdB-1"))
+            # ... while its own would count
+            self.assertEqual(fc.stuck_executor_seconds(dict(fc.DEFAULTS), "smoke.Fake_bsdB-2"), 2315)
 
     def test_the_runner_process_is_not_an_exec(self):
         """`syz-executor runner` is long-lived by design; only `exec` is per-program."""
@@ -1978,6 +2009,8 @@ class BoxRunnerTest(unittest.TestCase):
                          mock.patch.object(fc, "_load_def", lambda n: {"items": []}),
                          mock.patch.object(fc, "load_state",
                                            lambda n: dict(self.states.get(n, {"status": "new"}))),
+                         # the real one reads this machine's process table
+                         mock.patch.object(fc, "box_busy", lambda: []),
                          mock.patch.object(fc, "log", lambda m: None)]
         for p in self._patches:
             p.start()
@@ -2041,6 +2074,37 @@ class BoxRunnerTest(unittest.TestCase):
         with mock.patch.object(fc, "cmd_run", self._ends({"a": {"status": "running"}})):
             fc.cmd_run_box()
         self.assertEqual(self.ran, ["a"])                     # no spin on a
+
+    def test_the_box_waits_while_another_campaign_drives_it(self):
+        self._queue("a")
+        busy = [[("supervisor", 41, "python3 fuzz-campaign.py run smoke")],
+                [("syz-manager", 42, "syz-manager -config /t/campaigns/a/A/a-1/x.cfg")]]
+        with mock.patch.object(fc, "box_busy", lambda: busy.pop(0) if busy else []), \
+             mock.patch.object(fc.time, "sleep", lambda s: None), \
+             mock.patch.object(fc, "cmd_run", self._ends({"a": {"status": "done"}})) as run:
+            with mock.patch.object(fc.boxqueue, "head", side_effect=["a", "a", None]):
+                with self.assertRaises(StopIteration):     # 3rd head(): mock exhausted
+                    fc.cmd_run_box()
+        # waited once for smoke's supervisor; its own leftover manager did not block
+        self.assertEqual(self.ran, ["a"])
+        self.assertEqual(busy, [])
+
+    def test_queue_ls_says_what_happens_to_each_campaign(self):
+        self.assertTrue(fc.queue_lines({"queue": [], "history": []})[0].startswith("queue -- empty"))
+        self._queue("a", "b")
+        (self.dir / "campaigns" / "a").mkdir()
+        (self.dir / "campaigns" / "a" / "campaign.json").write_text("{}")
+        q = fc.boxqueue.load(fc.queue_path())
+        q["history"] = [{"name": "old", "ended": None, "status": "done", "reason": None}]
+        with mock.patch.object(fc, "box_busy",
+                               lambda: [("supervisor", 41, "python3 fuzz-campaign.py run smoke")]):
+            text = "\n".join(fc.queue_lines(q))
+        self.assertIn("next: waits for the box (busy: supervisor pid 41)", text)
+        self.assertIn("after a", text)                  # b's line
+        self.assertIn("missing", text)                  # b has no campaign folder
+        self.assertIn("recently ended", text)
+        self.states["a"] = {"status": "running"}
+        self.assertIn("running now", "\n".join(fc.queue_lines(q)))
 
     def test_the_global_brake_stops_the_box_before_anything_runs(self):
         self._queue("a")

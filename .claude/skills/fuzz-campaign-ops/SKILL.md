@@ -53,7 +53,7 @@ run as. Run as yourself they are noise — it says so in its own output.
 /usr/bin/python3 scripts/fuzz-campaign.py plan check <name> [--strict]
 sudo /usr/bin/python3 scripts/fuzz-campaign.py install --box --agent --user fuzz   # once per box
 /usr/bin/python3 scripts/fuzz-campaign.py queue add <name> [--at N]               # the box runs the queue in order
-/usr/bin/python3 scripts/fuzz-campaign.py queue ls | rm <name> | mv <name> N
+/usr/bin/python3 scripts/fuzz-campaign.py queue ls | rm <name> | mv <name> N   # positions from 1, as `queue ls` shows
 ```
 
 The box agent runs `campaigns/queue.json` head first and starts the next

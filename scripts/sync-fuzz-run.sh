@@ -240,6 +240,9 @@ step "campaign definitions"
 camp_n=0
 for j in "$SRC"/campaigns/*.json; do
   [ -e "$j" ] || break
+  # queue.json is the box's own queue, written by its runner: never published
+  # (a dev tree's copy overwrote it and re-queued whatever it held).
+  [ "$(basename "$j")" = "queue.json" ] && continue
   cp_atomic "$j" "$DST/campaigns/$(basename "$j")"
   camp_n=$((camp_n + 1))
 done

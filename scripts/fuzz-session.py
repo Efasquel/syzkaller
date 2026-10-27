@@ -1046,6 +1046,38 @@ def start_executors(state, count):
     save_state(state)
 
 
+def _staged_executor(cmd, scratch=None):
+    """True when `cmd` runs an executor copy staged in an exec scratch dir --
+    any session's, or the one `scratch` names."""
+    argv0 = cmd.split(None, 1)[0] if cmd.strip() else ""
+    if scratch is not None:
+        return argv0.startswith(str(scratch).rstrip("/") + "/")
+    return argv0.startswith(str(EXEC_SCRATCH_BASE).rstrip("/") + "/syz-exec-")
+
+
+def scratch_processes(scratch):
+    """[(pid, command)] of processes running the executor staged in `scratch`:
+    the runner and the per-program `exec` children it forked."""
+    try:
+        out = subprocess.run(["/bin/ps", "-Ao", "pid,command"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in (out or "").splitlines()[1:]:
+        pid_s, _, cmd = line.strip().partition(" ")
+        if not _staged_executor(cmd.strip(), scratch):
+            continue
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            found.append((pid, cmd.strip()))
+    return found
+
+
 def orphan_executors(state=None):
     """Our syz-executor processes NOT tracked by `state` -- leftovers from a
     wedged or half-stopped run.
@@ -1071,7 +1103,12 @@ def orphan_executors(state=None):
     found = []
     for line in (out or "").splitlines()[1:]:
         line = line.strip()
-        if "syz-executor" not in line or mine not in line:
+        if "syz-executor" not in line:
+            continue
+        # Ours: the built binary, or -- with executor_name -- the copy staged
+        # in an exec scratch dir. Matching the binary alone missed every staged
+        # executor, so their wedged `exec` children were never reaped.
+        if mine not in line and not _staged_executor(line.partition(" ")[2]):
             continue
         pid_s, _, cmd = line.partition(" ")
         try:
@@ -1241,6 +1278,15 @@ def stop_executors(state):
                 pass
         scratch = e.get("scratch")
         if scratch:
+            # The runner's per-program `exec` child is not in its process group
+            # and outlives it, re-parented to init -- one blocked in a syscall
+            # stays forever, holding the coverage device. Kill what still runs
+            # from this executor's scratch dir before the dir is retired.
+            for cpid, _ in scratch_processes(scratch):
+                try:
+                    os.kill(cpid, signal.SIGKILL)
+                except OSError:
+                    pass
             retire_scratch(scratch)   # rename now, delete out of band
     if execs:
         print("  stopped %d executor(s)" % len(execs))

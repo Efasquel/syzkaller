@@ -241,6 +241,19 @@ class OrphanExecutorTest(unittest.TestCase):
         with self._ps(["  900 /somewhere/else/syz-executor exec\n"]):
             self.assertEqual(fs.orphan_executors({}), [])
 
+    def test_an_executor_staged_under_executor_name_is_ours(self):
+        """With executor_name the executor runs from a copy in its scratch dir,
+        not the built binary: matching the binary alone never reaped these,
+        and a stuck `exec` of one outlived every stop."""
+        staged = "%s/syz-exec-smoke.Fake_bsdB-2-0/syz-executor" % fs.EXEC_SCRATCH_BASE
+        with self._ps(["  68890 %s exec\n" % staged,
+                       "  900 /elsewhere/syz-exec-x-0/syz-executor exec\n"]):
+            self.assertEqual([p for p, _ in fs.orphan_executors({})], [68890])
+            self.assertEqual([p for p, _ in fs.scratch_processes(
+                "%s/syz-exec-smoke.Fake_bsdB-2-0" % fs.EXEC_SCRATCH_BASE)], [68890])
+            self.assertEqual(fs.scratch_processes(
+                "%s/syz-exec-other-0" % fs.EXEC_SCRATCH_BASE), [])
+
     def test_nothing_running_is_no_orphans(self):
         with self._ps([]):
             self.assertEqual(fs.orphan_executors({}), [])

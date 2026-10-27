@@ -2417,12 +2417,19 @@ def _etime_seconds(text):
     return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
-def stuck_executor_seconds(d):
-    """Age of the longest-running `syz-executor exec`, if it exceeds the limit.
+def stuck_executor_seconds(d, sid=None):
+    """Age of the longest-running `syz-executor exec` of session `sid`, if it
+    exceeds the limit.
 
     syz-executor forks one short-lived `exec` process per program, so a normal one
     lives milliseconds. One alive for minutes means a syscall that never returned:
     the box is wedged, whatever the manager's counters say.
+
+    Only this session's: an executor staged in a scratch dir names its session
+    in its path (/tmp/syz-exec-<sid>-<n>/...), and another session's leftover --
+    a previous campaign's, say -- read as this run being hung, every restart, in
+    a loop. An executor run from the built binary cannot be attributed, so it
+    still counts.
     """
     limit = d.get("exec_stuck_seconds", DEFAULTS["exec_stuck_seconds"])
     if not limit:
@@ -2438,6 +2445,8 @@ def stuck_executor_seconds(d):
         line = line.strip()
         if "syz-executor exec" not in line:
             continue
+        if sid and "/syz-exec-" in line and "/syz-exec-%s-" % sid not in line:
+            continue                     # another session's executor
         secs = _etime_seconds(line.split(None, 1)[0])
         if secs and secs > worst:
             worst = secs
@@ -2560,7 +2569,7 @@ def supervise(s, d, sid, budget):
         # signal than a stalled counter: syz-executor forks one `exec` process per
         # program, so one alive for minutes is a syscall that never returned.
         # Catches in exec_stuck_seconds what the counter takes hang_after to infer.
-        stuck = stuck_executor_seconds(d)
+        stuck = stuck_executor_seconds(d, sid)
         if stuck:
             log("hang: syz-executor has been in one exec for %ds (limit %ds) -- "
                 "a program is wedged in the kernel"
@@ -3052,6 +3061,20 @@ def cmd_run_box(idle_seconds=10):
             log("box stops: %s is halted (%s); `resume %s` or `queue rm %s`"
                 % (name, st.get("halt_reason"), name, name))
             return
+        # Another campaign driving the box -- a per-campaign agent, a `run` by
+        # hand -- holds /dev/pishi: starting this one beside it collides. Wait.
+        # A manager of this very campaign (outlived its driver) is not in the
+        # way: `run` re-attaches to it.
+        others = [p for p in box_busy()
+                  if not (p[0] == "syz-manager" and "/campaigns/%s/" % name in p[2])]
+        if others:
+            if not waiting:
+                log("box busy, %s waits: %s" % (name, "; ".join(
+                    "%s pid %s" % (what, pid) for what, pid, _ in others)))
+                waiting = True
+            time.sleep(idle_seconds)
+            continue
+        waiting = False
         log("box: running %s" % name)
         try:
             cmd_run(name)
@@ -3070,6 +3093,45 @@ def cmd_run_box(idle_seconds=10):
         log("box: %s ended %s; next: %s" % (name, what, boxqueue.head(qp) or "nothing queued"))
 
 
+def queue_head_note(name, status):
+    """What the box is doing with the campaign at the head, in words."""
+    if status == "running":
+        return "running now"
+    if status == "halted":
+        return "HALTED: the box stopped on it -- `resume %s` or `queue rm %s`" % (name, name)
+    others = [p for p in box_busy()
+              if not (p[0] == "syz-manager" and "/campaigns/%s/" % name in p[2])]
+    if others:
+        return "next: waits for the box (busy: %s)" % ", ".join(
+            "%s pid %s" % (what, pid) for what, pid, _ in others)
+    return "next: the box runner starts it within seconds"
+
+
+def queue_lines(q, history=5):
+    """`queue ls`: what the box will run, in order, then what recently ended."""
+    lines = []
+    if q["queue"]:
+        lines.append("queue -- the box runs these in order, one at a time:")
+        rows = []
+        for i, n in enumerate(q["queue"]):
+            known = is_plan_layout(n) or (CAMPAIGN_DIR / ("%s.json" % n)).exists()
+            status = load_state(n).get("status", "?") if known else "missing"
+            rows.append((str(i + 1), n, status,
+                         queue_head_note(n, status) if i == 0 else "after %s" % q["queue"][i - 1]))
+        lines += ["  " + ln for ln in render(rows, ("#", "CAMPAIGN", "STATUS", "WHAT HAPPENS"))]
+    else:
+        lines.append("queue -- empty: the box is idle. "
+                     "`fuzz-campaign.py queue add <name>` gives it a campaign.")
+    ended = q["history"][-history:]
+    if ended:
+        lines += ["", "recently ended (newest last):"]
+        rows = [(timefmt.fmt(h.get("ended"), short=True) if h.get("ended") else "?",
+                 h.get("name") or "?", h.get("status") or "?", h.get("reason") or "-")
+                for h in ended]
+        lines += ["  " + ln for ln in render(rows, ("ENDED", "CAMPAIGN", "HOW", "WHY"))]
+    return lines
+
+
 def cmd_queue(action, name=None, at=None):
     """queue ls | add <name> [--at N] | rm <name> | mv <name> N."""
     qp = queue_path()
@@ -3080,19 +3142,7 @@ def cmd_queue(action, name=None, at=None):
             and load_state(first).get("status") == "running"):
         at = 1
     if action == "ls":
-        q = boxqueue.load(qp)
-        rows = []
-        for i, n in enumerate(q["queue"]):
-            st = load_state(n) if (is_plan_layout(n) or (CAMPAIGN_DIR / ("%s.json" % n)).exists()) else {}
-            rows.append((str(i), n, st.get("status", "?"), "running now" if i == 0 else ""))
-        if rows:
-            tabulate(rows, ("#", "CAMPAIGN", "STATUS", ""))
-        else:
-            print("queue empty")
-        for h in q["history"][-5:]:
-            print("  ended %s  %-24s %s%s" % (timefmt.fmt(h.get("ended"), short=True) if h.get("ended") else "?",
-                                             h.get("name"), h.get("status"),
-                                             " -- %s" % h["reason"] if h.get("reason") else ""))
+        print("\n".join(queue_lines(boxqueue.load(qp))))
         return 0
     if action == "add":
         if not is_plan_layout(name):
@@ -3107,7 +3157,12 @@ def cmd_queue(action, name=None, at=None):
             pos = boxqueue.add(qp, name, at)
         except ValueError as e:
             die(str(e))
-        print("queued %s at position %d%s" % (name, pos, " (next to run)" if pos == 0 else ""))
+        q = boxqueue.load(qp)
+        if pos == 0:
+            print("queued %s: %s" % (name, queue_head_note(name, load_state(name).get("status"))))
+        else:
+            print("queued %s: #%d, after %s" % (name, pos + 1, q["queue"][pos - 1]))
+        print("  `fuzz-campaign.py queue ls` shows the order; `status` shows the box")
         return 0
     if action == "rm":
         if boxqueue.head(qp) == name and load_state(name).get("status") == "running":
@@ -3123,7 +3178,7 @@ def cmd_queue(action, name=None, at=None):
             pos = boxqueue.move(qp, name, at)
         except ValueError as e:
             die(str(e))
-        print("moved %s to position %d" % (name, pos))
+        print("moved %s to #%d" % (name, pos + 1))
         return 0
     die("unknown queue action %r" % action)
 
@@ -5828,8 +5883,10 @@ def main():
                                       "rm <name> | mv <name> N")
     sp.add_argument("action", choices=["ls", "add", "rm", "mv"])
     sp.add_argument("name", nargs="?")
-    sp.add_argument("position", nargs="?", type=int, help="mv: the new position (0 is the head)")
-    sp.add_argument("--at", type=int, help="add: the position (default: the end)")
+    sp.add_argument("position", nargs="?", type=int,
+                    help="mv: the new position, as `queue ls` numbers it (1 is the head)")
+    sp.add_argument("--at", type=int, help="add: the position, as `queue ls` numbers it "
+                                           "(1 is the head; default: the end)")
 
     for _n, _h in (("doctor", "pre-flight checks before a run"),
                    ("halt", "soft-pause the campaign (leaves the daemon installed)"),
@@ -5916,8 +5973,9 @@ def main():
             p.error("queue %s needs a campaign name" % args.action)
         if args.action == "mv" and args.position is None:
             p.error("queue mv <name> <position>")
-        sys.exit(cmd_queue(args.action, args.name,
-                           args.position if args.action == "mv" else args.at))
+        pos = args.position if args.action == "mv" else args.at
+        # The CLI numbers from 1, like `queue ls`; cmd_queue takes 0-based.
+        sys.exit(cmd_queue(args.action, args.name, None if pos is None else max(0, pos - 1)))
     elif args.cmd == "status":
         cmd_status(args.name, args.watch, args.interval)
     elif args.cmd == "doctor":
