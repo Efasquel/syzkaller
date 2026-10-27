@@ -1984,6 +1984,36 @@ class NewPlanTest(unittest.TestCase):
         (self.dir / "bad.cfg").write_text("{not json")
         self.assertIsNone(fc.read_cfg(self.dir / "bad.cfg"))
 
+    def test_an_edit_is_picked_up_and_a_bad_one_keeps_the_last_good(self):
+        cfg = self._cfg("AppleX_gram")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fc.cmd_new("c", [cfg], 1.0, repeat=2)
+        path = self.dir / "campaigns" / "c" / "campaign.json"
+        d = fc.load_def("c")
+        s = {"items": {"AppleX_gram-1": {"status": "running"},
+                       "AppleX_gram-2": {"status": "pending"}}}
+        camp = json.loads(path.read_text())
+        # an appended item shows up
+        camp["items"].append({"config": cfg, "id": "AppleX_gram-3", "max_hours": 2})
+        path.write_text(json.dumps(camp))
+        d = fc.reload_def("c", d, s)
+        self.assertEqual([it["id"] for it in d["items"]],
+                         ["AppleX_gram-1", "AppleX_gram-2", "AppleX_gram-3"])
+        # a half-saved edit keeps the last good definition, and says so once
+        path.write_text('{"name": "c", "items": [')
+        self.assertIs(fc.reload_def("c", d, s), d)
+        self.assertIn("bad JSON", s["def_error"])
+        # dropping the running item is refused the same way
+        camp["items"] = camp["items"][1:]
+        path.write_text(json.dumps(camp))
+        self.assertIs(fc.reload_def("c", d, s), d)
+        self.assertIn("drops the running item AppleX_gram-1", s["def_error"])
+        # fixed: loads again, and the error is cleared
+        camp["items"].insert(0, {"config": cfg, "id": "AppleX_gram-1"})
+        path.write_text(json.dumps(camp))
+        self.assertEqual(len(fc.reload_def("c", d, s)["items"]), 3)
+        self.assertNotIn("def_error", s)
+
     def test_a_campaign_from_before_the_rename_is_read_from_plan_json(self):
         cfg = self._cfg("AppleX_gram")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -3281,6 +3311,19 @@ class SchedulerLoopTest(unittest.TestCase):
              mock.patch.object(fc, "session", lambda *a, **k: (0, "")):
             self.assertEqual(fc.supervise(s, dict(fc.DEFAULTS), "sid", 10 ** 9), "halted")
         self.assertEqual((s["status"], s["halt_reason"]), ("halted", "halted by user"))
+
+    def test_a_skip_of_a_later_item_does_not_wake_the_wait(self):
+        s = fc.init_state("camp")
+        s["current_item"] = "a-1"
+        fc.req.append(self.state_dir / "camp.requests.json", "skip", "b-1")
+        d = dict(fc.DEFAULTS, stop_check_seconds=0.01)
+        with mock.patch.object(fc, "STATE_DIR", self.state_dir), \
+             mock.patch.object(fc, "load_state", lambda n: s), \
+             mock.patch.object(fc, "brake_held", lambda n: None):
+            self.assertIsNone(fc.wait_for_stop(s, d, 0.1))
+            # ... while a skip of the running item does
+            fc.req.append(self.state_dir / "camp.requests.json", "skip", "a-1")
+            self.assertEqual(fc.wait_for_stop(s, d, 30), "request")
 
     def test_a_request_wakes_the_wait_within_a_stop_check(self):
         s = fc.init_state("camp")

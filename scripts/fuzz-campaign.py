@@ -656,26 +656,69 @@ def load_def(name):
     lib/plan (defaults filled, ids assigned, configs resolved), with the runner's
     settings resolved at the top level -- DEFAULTS overridden by the campaign's
     `limits`. There is one shape: items keep `max_hours` (budget_seconds()
-    converts), the clock stays `clock`, the defaults stay under `defaults`."""
+    converts), the clock stays `clock`, the defaults stay under `defaults`.
+    Dies on a campaign that cannot be read; the run loop re-reads through
+    reload_def, which keeps the last good one instead."""
+    try:
+        return _load_def(name)
+    except ValueError as e:
+        die(str(e))
+
+
+def _load_def(name):
+    """load_def, raising ValueError where load_def dies."""
     if is_plan_layout(name):
         try:
             raw = planlib.load_plan(campaign_path(name))
-        except ValueError as e:
-            die("campaign %r: %s" % (name, e))
+        except (OSError, ValueError) as e:
+            raise ValueError("campaign %r: %s" % (name, e))
     else:
         old = read_json(CAMPAIGN_DIR / ("%s.json" % name))
         if old is None:
-            die("no campaign %r (looked in %s)" % (name, campaign_path(name)))
+            raise ValueError("no campaign %r (looked in %s)" % (name, campaign_path(name)))
         raw = legacy_campaign(name, old)
     try:
         camp = planlib.normalize(raw, REPO_ROOT)
     except ValueError as e:
-        die("campaign %r: %s" % (name, e))
+        raise ValueError("campaign %r: %s" % (name, e))
     d = dict(DEFAULTS)
     d.update(camp["limits"])
     d.update(camp)
     d["layout"] = "legacy" if camp.get("legacy") else "plan"
     return d
+
+
+def reload_def(name, d, s):
+    """campaign.json as it is now, re-read once per pass of the run loop, so an
+    edit -- an item appended or removed while pending, a limit changed -- takes
+    effect without restarting the driver.
+
+    The last good definition `d` is kept, and the reason logged once, when the
+    file no longer loads (a half-saved edit must not halt a campaign mid-run) or
+    when it drops the item that is running (its manager is up; `next` ends it).
+    """
+    try:
+        new = _load_def(name)
+    except ValueError as e:
+        why = str(e)
+    else:
+        ids = {it["id"] for it in new["items"]}
+        running = [i for i, r in (s.get("items") or {}).items()
+                   if r.get("status") == "running" and i not in ids]
+        why = ("campaign.json drops the running item %s; end it with `next` first"
+               % running[0]) if running else None
+    if why:
+        if s.get("def_error") != why:
+            log("campaign.json not reloaded, running on the last good one: %s" % why)
+            s["def_error"] = why
+        return d
+    if s.pop("def_error", None):
+        log("campaign.json loads again")
+    old_ids = [it["id"] for it in d["items"]]
+    new_ids = [it["id"] for it in new["items"]]
+    if new_ids != old_ids:
+        log("campaign.json changed: items %s" % ", ".join(new_ids))
+    return new
 
 
 def budget_seconds(item):
@@ -2343,9 +2386,13 @@ def wait_for_stop(s, d, seconds):
             s["halt_reason"] = "brake: %s" % (why or path)
             save_state(s)
             return "brake"
-        # An operator request (next, skip, halt) is applied by the loop, not
-        # here, but it must not wait out a 10-minute poll to be seen.
-        if req.pending(requests_path(s["name"])):
+        # An operator request is applied by the loop, not here, but one that
+        # concerns the running item (next, halt, a skip of it) must not wait
+        # out a 10-minute poll to be seen. Any other -- a skip or unskip of a
+        # later item -- waits for the loop's next pass, which is where it
+        # matters: waking for it re-attached the supervisor and restarted the
+        # hang detector and the rotation clock for nothing.
+        if schedule.requests_for(req.pending(requests_path(s["name"])), s.get("current_item")):
             return "request"
 
 
@@ -2645,6 +2692,7 @@ def cmd_run(name):
         # The definition is re-read every pass (an item appended to it shows
         # up pending), and the operator's requests are taken once per pass:
         # whatever verbs were issued since, in order.
+        d = reload_def(name, d, s)
         order = ensure_items(s, d)
         requests = take_requests(s)
         # Coordinator: while a bug is being triaged, drive triage instead of
@@ -3800,15 +3848,22 @@ def cmd_doctor(name):
     # Each config's own kext id wins over the campaign's, so a multi-driver
     # campaign triages every crash against the right kext. Show what each will
     # use, and say plainly when a config cannot supply one.
+    # Once per config: a config listed three times is one kext id, not three.
     seen = []
-    for it in d["items"]:
-        kc = config_triage_flags(it["config"])
-        seen.append((config_id(it["config"]), kc.get("kext_id"), kc.get("kcov_device")))
-    if len({k for _, k, _ in seen if k is not None}) > 1:
+    for cfg in dict.fromkeys(it["config"] for it in d["items"]):
+        kc = config_triage_flags(cfg)
+        seen.append((config_id(cfg), kc.get("kext_id"), kc.get("kcov_device"), cfg))
+    if len({k for _, k, _, _ in seen if k is not None}) > 1:
         add("OK", "multi-driver campaign: kext_id taken per config (%s)"
-            % ", ".join("%s=%s" % (n.split("_")[0], k) for n, k, _ in seen))
-    for n, k, _ in seen:
-        if k is None:
+            % ", ".join("%s=%s" % (n.split("_")[0], k) for n, k, _, _ in seen))
+    for n, k, _, cfg in seen:
+        if k is not None:
+            continue
+        if (read_cfg(cfg) or {}).get("cover") is False:
+            # No coverage, so no kext under it: there is no id to get wrong.
+            add("INFO", "%s has no kext_coverage.kext_id (cover is off: it fuzzes "
+                        "no kext)" % n)
+        else:
             add("WARN", "%s has no kext_coverage.kext_id -- triage falls back to "
                         "the campaign default, which is wrong for a multi-driver "
                         "run" % n)
